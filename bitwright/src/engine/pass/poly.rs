@@ -36,16 +36,10 @@ type Poly = Vec<(Mono, BitVec)>;
 enum LeafKey {
     /// An unexpanded node (mod `2^mod_w`).
     Node(u32),
-    /// `base & mask` (mod `2^mod_w`), with `0 < mask < (1 << mod_w) - 1`, unifying `x | c`
-    /// (`(x & ~c) + c`) with `x & ~c`.
-    Masked(u32, u64),
-    /// `(base & mask) ^ c_canon` (mod `2^mod_w`), with `0 < c_canon < mask` and the top set bit
-    /// of `mask` cleared in `c_canon` so complementary masked constant XORs (`(x & m) ^ c` vs
-    /// `(x & m) ^ (m ^ c)`) canonicalize to `leaf` and `m - leaf`.
-    XorConst(u32, u64, u64),
-    /// `base >>u shift` (at full width), unifying `rotl(x, s) = (x << s) + (x >>u (W - s))`
-    /// with explicit logical right shifts `x >>u (W - s)`.
-    LShr(u32, u16),
+    /// Contiguous bit slice `extract<lo, len>(src)` (`len > 0`), zero-extended to `mod_w`.
+    Slice { src: u32, lo: u16, len: u16 },
+    /// `base & mask` (mod `2^mod_w`) for multi-run masks, with `0 < mask < 2^mod_w - 1`.
+    Masked(u32, BitVec),
     /// A zero-extended narrow polynomial `zext(p)` of width `k < mod_w`, unifying
     /// `zext<W>(P_k)` with `P_W & ((1 << k) - 1)` when both have the same mod-`2^k` polynomial.
     LowPoly(u16, Poly),
@@ -77,13 +71,11 @@ impl LeafTables {
     }
 }
 
-fn mod_mask_u64(bits: u16) -> u64 {
-    if bits >= 64 {
-        u64::MAX
-    } else if bits == 0 {
-        0
-    } else {
-        (1u64 << bits) - 1
+fn resize_bv(v: &BitVec, w: Width) -> BitVec {
+    match v.width().bits().cmp(&w.bits()) {
+        core::cmp::Ordering::Equal => *v,
+        core::cmp::Ordering::Less => v.zext(w).unwrap_or_else(|_| BitVec::zero(w)),
+        core::cmp::Ordering::Greater => v.trunc(w).unwrap_or_else(|_| BitVec::zero(w)),
     }
 }
 
@@ -96,42 +88,36 @@ fn leaf_poly(tables: &mut LeafTables, mod_w: Width, key: LeafKey) -> Option<Poly
 
 /// Guaranteed 2-adic valuation (trailing zero bits) of every value represented by `key`.
 fn leaf_tz(cx: &Context, mod_w: Width, key: &LeafKey) -> u32 {
-    let bits = mod_w.bits();
+    let bits = u32::from(mod_w.bits());
     match key {
-        LeafKey::Masked(_, mask) | LeafKey::XorConst(_, mask, _) => {
-            if *mask == 0 {
-                u32::from(bits)
+        LeafKey::Masked(_, mask) => {
+            if mask.is_zero() {
+                bits
             } else {
-                mask.trailing_zeros()
+                crate::facts::known::trailing_zeros(mask).min(bits)
             }
         }
         LeafKey::LowPoly(_, sub) => sub
             .iter()
             .map(|(_, c)| crate::facts::known::trailing_zeros(c))
             .min()
-            .unwrap_or(u32::from(bits)),
+            .unwrap_or(bits),
         LeafKey::Node(id) => {
-            if bits <= 64 {
-                let m = possible_ones(cx, *id, 3) & mod_mask_u64(bits);
-                if m == 0 {
-                    u32::from(bits)
-                } else {
-                    m.trailing_zeros()
-                }
+            let m = resize_bv(&possible_ones_bv(cx, *id, 3), mod_w);
+            if m.is_zero() {
+                bits
             } else {
-                0
+                crate::facts::known::trailing_zeros(&m).min(bits)
             }
         }
-        LeafKey::LShr(base, s) => {
-            if bits <= 64 {
-                let m = (possible_ones(cx, *base, 3) >> s) & mod_mask_u64(bits);
-                if m == 0 {
-                    u32::from(bits)
-                } else {
-                    m.trailing_zeros()
-                }
+        LeafKey::Slice { src, lo, len } => {
+            let p = crate::facts::known::bv_lshr(&possible_ones_bv(cx, *src, 3), u32::from(*lo));
+            let keep = crate::facts::known::low_mask(p.width(), u32::from(*len));
+            let m = crate::facts::known::bv_and(&p, &keep);
+            if m.is_zero() {
+                bits
             } else {
-                0
+                crate::facts::known::trailing_zeros(&m).min(bits)
             }
         }
     }
@@ -211,81 +197,84 @@ fn mul(a: &Poly, b: &Poly) -> Option<Poly> {
     Some(out)
 }
 
-/// Sound over-approximation of bits that may be 1 in `x` (width <= 64).
-fn possible_ones(cx: &Context, x: u32, depth: u8) -> u64 {
-    let w = cx.wid(x);
-    if w == 0 || w > 64 {
-        return u64::MAX;
-    }
-    let full = mod_mask_u64(w);
+/// Sound over-approximation of bits that may be 1 in `x` across all widths `1..=512`.
+fn possible_ones_bv(cx: &Context, x: u32, depth: u8) -> BitVec {
+    let w = cx.width_of(x);
+    let full = BitVec::ones(w);
     if depth == 0 {
         return full;
     }
     let n = cx.node(x);
-    let m = match n.op {
-        OpCode::Const => cx.const_val(x).and_then(|v| v.to_u64()).unwrap_or(full),
-        OpCode::Zext => possible_ones(cx, n.a, depth - 1),
-        OpCode::Extract if cx.wid(n.a) <= 64 => {
-            if n.b < 64 {
-                possible_ones(cx, n.a, depth - 1) >> n.b
-            } else {
-                0
-            }
+    match n.op {
+        OpCode::Const => cx.const_val(x).unwrap_or(full),
+        OpCode::Zext => resize_bv(&possible_ones_bv(cx, n.a, depth - 1), w),
+        OpCode::Extract => {
+            let p = crate::facts::known::bv_lshr(&possible_ones_bv(cx, n.a, depth - 1), n.b);
+            resize_bv(&p, w)
         }
         OpCode::Concat => {
-            let lo_w = cx.wid(n.b);
-            let hi = if lo_w < 64 {
-                (possible_ones(cx, n.a, depth - 1) << lo_w) & full
-            } else {
-                0
-            };
-            hi | possible_ones(cx, n.b, depth - 1)
+            let lo_w = u32::from(cx.wid(n.b));
+            let hi = crate::facts::known::bv_shl(
+                &resize_bv(&possible_ones_bv(cx, n.a, depth - 1), w),
+                lo_w,
+            );
+            let lo = resize_bv(&possible_ones_bv(cx, n.b, depth - 1), w);
+            crate::facts::known::bv_or(&hi, &lo)
         }
-        OpCode::And => possible_ones(cx, n.a, depth - 1) & possible_ones(cx, n.b, depth - 1),
-        OpCode::Or | OpCode::Xor => {
-            possible_ones(cx, n.a, depth - 1) | possible_ones(cx, n.b, depth - 1)
-        }
+        OpCode::And => crate::facts::known::bv_and(
+            &possible_ones_bv(cx, n.a, depth - 1),
+            &possible_ones_bv(cx, n.b, depth - 1),
+        ),
+        OpCode::Or | OpCode::Xor => crate::facts::known::bv_or(
+            &possible_ones_bv(cx, n.a, depth - 1),
+            &possible_ones_bv(cx, n.b, depth - 1),
+        ),
         OpCode::Shl => match cx.const_val(n.b).and_then(|v| v.to_u64()) {
-            Some(s) if s < 64 => (possible_ones(cx, n.a, depth - 1) << s) & full,
-            Some(_) => 0,
+            Some(s) if s < u64::from(w.bits()) => {
+                crate::facts::known::bv_shl(&possible_ones_bv(cx, n.a, depth - 1), s as u32)
+            }
+            Some(_) => BitVec::zero(w),
             None => full,
         },
         OpCode::LShr => match cx.const_val(n.b).and_then(|v| v.to_u64()) {
-            Some(s) if s < 64 => possible_ones(cx, n.a, depth - 1) >> s,
-            Some(_) => 0,
+            Some(s) if s < u64::from(w.bits()) => {
+                crate::facts::known::bv_lshr(&possible_ones_bv(cx, n.a, depth - 1), s as u32)
+            }
+            Some(_) => BitVec::zero(w),
             None => full,
         },
         OpCode::Add => {
-            let ma = possible_ones(cx, n.a, depth - 1);
-            let mb = possible_ones(cx, n.b, depth - 1);
-            if ma & mb == 0 {
-                ma | mb
-            } else if let Some(c) = cx.const_val(n.a).and_then(|v| v.to_u64())
-                && mb.is_power_of_two()
+            let ma = possible_ones_bv(cx, n.a, depth - 1);
+            let mb = possible_ones_bv(cx, n.b, depth - 1);
+            if crate::facts::known::bv_and(&ma, &mb).is_zero() {
+                crate::facts::known::bv_or(&ma, &mb)
+            } else if let Some(c) = cx.const_val(n.a)
+                && crate::facts::known::count_ones(&mb) == 1
             {
-                c | c.wrapping_add(mb)
-            } else if let Some(c) = cx.const_val(n.b).and_then(|v| v.to_u64())
-                && ma.is_power_of_two()
+                crate::facts::known::bv_or(&c, &BitVec::bin_unchecked(BinOp::Add, &c, &mb))
+            } else if let Some(c) = cx.const_val(n.b)
+                && crate::facts::known::count_ones(&ma) == 1
             {
-                c | c.wrapping_add(ma)
+                crate::facts::known::bv_or(&c, &BitVec::bin_unchecked(BinOp::Add, &c, &ma))
             } else {
                 full
             }
         }
         OpCode::Sub => {
-            if let Some(c) = cx.const_val(n.a).and_then(|v| v.to_u64()) {
-                let mb = possible_ones(cx, n.b, depth - 1);
-                if mb & !c == 0 {
+            if let Some(c) = cx.const_val(n.a) {
+                let mb = possible_ones_bv(cx, n.b, depth - 1);
+                if crate::facts::known::bv_and(&mb, &crate::facts::known::bv_not(&c)).is_zero() {
                     c
-                } else if mb.is_power_of_two() {
-                    c | c.wrapping_sub(mb)
+                } else if crate::facts::known::count_ones(&mb) == 1 {
+                    crate::facts::known::bv_or(&c, &BitVec::bin_unchecked(BinOp::Sub, &c, &mb))
                 } else {
                     full
                 }
-            } else if let Some(c) = cx.const_val(n.b).and_then(|v| v.to_u64()) {
-                let ma = possible_ones(cx, n.a, depth - 1);
-                if ma.is_power_of_two() {
-                    c.wrapping_neg() | ma.wrapping_sub(c)
+            } else if let Some(c) = cx.const_val(n.b) {
+                let ma = possible_ones_bv(cx, n.a, depth - 1);
+                if crate::facts::known::count_ones(&ma) == 1 {
+                    let neg_c = BitVec::un_unchecked(crate::UnOp::Neg, &c);
+                    crate::facts::known::bv_or(&neg_c, &BitVec::bin_unchecked(BinOp::Sub, &ma, &c))
                 } else {
                     full
                 }
@@ -294,74 +283,369 @@ fn possible_ones(cx: &Context, x: u32, depth: u8) -> u64 {
             }
         }
         _ => full,
-    };
-    m & full
+    }
 }
 
-/// Sound under-approximation of bits that are guaranteed to be 1 in `x` (width <= 64).
-fn guaranteed_ones(cx: &Context, x: u32, depth: u8) -> u64 {
-    let w = cx.wid(x);
-    if w == 0 || w > 64 || depth == 0 {
-        return 0;
+/// Sound under-approximation of bits guaranteed to be 1 in `x` across all widths `1..=512`.
+fn guaranteed_ones_bv(cx: &Context, x: u32, depth: u8) -> BitVec {
+    let w = cx.width_of(x);
+    if depth == 0 {
+        return BitVec::zero(w);
     }
-    let full = mod_mask_u64(w);
     let n = cx.node(x);
-    let m = match n.op {
-        OpCode::Const => cx.const_val(x).and_then(|v| v.to_u64()).unwrap_or(0),
-        OpCode::Not => !possible_ones(cx, n.a, depth - 1) & full,
-        OpCode::Zext => guaranteed_ones(cx, n.a, depth - 1),
-        OpCode::Extract if cx.wid(n.a) <= 64 => {
-            if n.b < 64 {
-                guaranteed_ones(cx, n.a, depth - 1) >> n.b
-            } else {
-                0
-            }
+    match n.op {
+        OpCode::Const => cx.const_val(x).unwrap_or_else(|| BitVec::zero(w)),
+        OpCode::Not => crate::facts::known::bv_not(&possible_ones_bv(cx, n.a, depth - 1)),
+        OpCode::Zext => resize_bv(&guaranteed_ones_bv(cx, n.a, depth - 1), w),
+        OpCode::Extract => {
+            let g = crate::facts::known::bv_lshr(&guaranteed_ones_bv(cx, n.a, depth - 1), n.b);
+            resize_bv(&g, w)
         }
         OpCode::Concat => {
-            let lo_w = cx.wid(n.b);
-            let hi = if lo_w < 64 {
-                (guaranteed_ones(cx, n.a, depth - 1) << lo_w) & full
-            } else {
-                0
-            };
-            hi | guaranteed_ones(cx, n.b, depth - 1)
+            let lo_w = u32::from(cx.wid(n.b));
+            let hi = crate::facts::known::bv_shl(
+                &resize_bv(&guaranteed_ones_bv(cx, n.a, depth - 1), w),
+                lo_w,
+            );
+            let lo = resize_bv(&guaranteed_ones_bv(cx, n.b, depth - 1), w);
+            crate::facts::known::bv_or(&hi, &lo)
         }
-        OpCode::Or => guaranteed_ones(cx, n.a, depth - 1) | guaranteed_ones(cx, n.b, depth - 1),
-        OpCode::And => guaranteed_ones(cx, n.a, depth - 1) & guaranteed_ones(cx, n.b, depth - 1),
-        _ => 0,
-    };
-    m & full
+        OpCode::Or => crate::facts::known::bv_or(
+            &guaranteed_ones_bv(cx, n.a, depth - 1),
+            &guaranteed_ones_bv(cx, n.b, depth - 1),
+        ),
+        OpCode::And => crate::facts::known::bv_and(
+            &guaranteed_ones_bv(cx, n.a, depth - 1),
+            &guaranteed_ones_bv(cx, n.b, depth - 1),
+        ),
+        _ => BitVec::zero(w),
+    }
 }
 
-/// Peel `trunc<w'>` (`w' >= mod_w`), `zext` (`wid(inner) >= mod_w`), and `And` with constant masks
-/// that preserve all bits of `mask`, returning canonical `(base, combined_mask)`.
-fn peel_masked(cx: &Context, mut x: u32, mut mask: u64, mod_w: u16) -> (u32, u64) {
-    let mm = mod_mask_u64(mod_w);
-    mask &= mm;
-    for _ in 0..8 {
-        let n = cx.node(x);
-        match n.op {
-            OpCode::Extract if n.b == 0 && n.width >= mod_w && cx.wid(n.a) <= 64 => {
-                x = n.a;
-            }
-            OpCode::Zext if cx.wid(n.a) >= mod_w && cx.wid(n.a) <= 64 => {
-                x = n.a;
-            }
-            OpCode::And => {
-                if let Some(m) = cx.const_val(n.b).and_then(|v| v.to_u64()) {
-                    mask &= m;
-                    x = n.a;
-                } else if let Some(m) = cx.const_val(n.a).and_then(|v| v.to_u64()) {
-                    mask &= m;
-                    x = n.b;
-                } else {
-                    break;
-                }
-            }
-            _ => break,
+fn is_self_leaf(tables: &LeafTables, mod_bits: u16, p: &Poly, id: u32) -> bool {
+    if p.len() != 1 || p[0].1 != BitVec::one(p[0].1.width()) {
+        return false;
+    }
+    let Some((_, keys)) = tables.by_width.iter().find(|(w, _)| *w == mod_bits) else {
+        return false;
+    };
+    let mut active = None;
+    for (idx, &exp) in p[0].0.iter().enumerate() {
+        if exp == 1 && active.is_none() {
+            active = Some(idx);
+        } else if exp != 0 {
+            return false;
         }
     }
-    (x, mask)
+    active
+        .and_then(|idx| keys.get(idx))
+        .is_some_and(|k| matches!(*k, LeafKey::Node(n) if n == id))
+}
+
+fn lift_sub_poly(sub: Poly, sub_bits: u16, mod_w: Width, tables: &mut LeafTables) -> Option<Poly> {
+    if sub.is_empty() {
+        Some(Vec::new())
+    } else if sub.len() == 1 && sub[0].0 == [0u8; MAX_LEAVES] {
+        let c = resize_bv(&sub[0].1, mod_w);
+        Some(vec![([0u8; MAX_LEAVES], c)])
+    } else {
+        leaf_poly(tables, mod_w, LeafKey::LowPoly(sub_bits, sub))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slice_poly(
+    cx: &Context,
+    src: u32,
+    lo: u16,
+    len: u16,
+    mod_w: Width,
+    tables: &mut LeafTables,
+    memo: &mut IdMap<(u32, u16), Poly>,
+    steps: &mut u32,
+) -> Option<Poly> {
+    let bits = mod_w.bits();
+    let src_w = cx.wid(src);
+    if lo == 0 && len >= bits && src_w >= bits {
+        return poly_of(cx, src, mod_w, tables, memo, steps);
+    }
+    if lo == 0
+        && len <= src_w
+        && matches!(
+            cx.node(src).op,
+            OpCode::Add
+                | OpCode::Sub
+                | OpCode::Neg
+                | OpCode::Not
+                | OpCode::Mul
+                | OpCode::Shl
+                | OpCode::Or
+                | OpCode::Xor
+                | OpCode::Concat
+        )
+        && let Ok(sub_w) = Width::new(len)
+        && let Some(sub) = poly_of(cx, src, sub_w, tables, memo, steps)
+        && !is_self_leaf(tables, len, &sub, src)
+    {
+        return lift_sub_poly(sub, len, mod_w, tables);
+    }
+    if lo == 0 && len == bits && src_w == bits {
+        return leaf_poly(tables, mod_w, LeafKey::Node(src));
+    }
+    leaf_poly(tables, mod_w, LeafKey::Slice { src, lo, len })
+}
+
+fn set_mask_range(limbs: &mut [u64; 8], off: u16, len: u16) {
+    let start = usize::from(off);
+    let end = start + usize::from(len);
+    let mut pos = start;
+    while pos < end {
+        let word = pos / 64;
+        let bit = pos % 64;
+        let chunk = (end - pos).min(64 - bit);
+        let m = if chunk == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << chunk) - 1) << bit
+        };
+        limbs[word] |= m;
+        pos += chunk;
+    }
+}
+
+/// Decomposes a bit-shaping node `x` modulo `2^mod_w` via canonical bit-provenance runs.
+fn try_bit_runs_poly(
+    cx: &Context,
+    x: u32,
+    mod_w: Width,
+    tables: &mut LeafTables,
+    memo: &mut IdMap<(u32, u16), Poly>,
+    steps: &mut u32,
+) -> Option<Poly> {
+    use super::shuffle::BitRun;
+    let bits = mod_w.bits();
+    let raw = super::shuffle::bit_runs_of(cx, x, 32)?;
+    let mut trunc_runs: Vec<BitRun> = Vec::with_capacity(raw.len());
+    let mut rem = bits;
+    for r in raw {
+        if rem == 0 {
+            break;
+        }
+        match r {
+            BitRun::Const { val, len } => {
+                let take = len.min(rem);
+                trunc_runs.push(BitRun::Const { val, len: take });
+                rem -= take;
+            }
+            BitRun::Slice { src, lo, len, inv } => {
+                let take = len.min(rem);
+                trunc_runs.push(BitRun::Slice {
+                    src,
+                    lo,
+                    len: take,
+                    inv,
+                });
+                rem -= take;
+            }
+        }
+    }
+    if matches!(
+        trunc_runs.as_slice(),
+        &[BitRun::Slice {
+            src,
+            lo: 0,
+            len,
+            inv: false
+        }] if src == x && len == bits
+    ) {
+        return None;
+    }
+
+    // Group consecutive repeated 1-bit slices (from `Sext` / `AShr` sign-bit replication) into
+    // `(off, weight_runs, BitRun)` entries so replicated sign bits take 1 term instead of `W`.
+    enum Piece {
+        ConstOne {
+            off: u16,
+            len: u16,
+        },
+        Slice {
+            off: u16,
+            rep: u16,
+            src: u32,
+            lo: u16,
+            len: u16,
+            inv: bool,
+        },
+    }
+    let mut pieces: Vec<Piece> = Vec::with_capacity(trunc_runs.len());
+    let mut off = 0u16;
+    for r in &trunc_runs {
+        match *r {
+            BitRun::Const { val: false, len } => off += len,
+            BitRun::Const { val: true, len } => {
+                pieces.push(Piece::ConstOne { off, len });
+                off += len;
+            }
+            BitRun::Slice { src, lo, len, inv } => {
+                if len == 1
+                    && let Some(Piece::Slice {
+                        off: prev_off,
+                        rep,
+                        src: ps,
+                        lo: plo,
+                        len: 1,
+                        inv: pinv,
+                    }) = pieces.last_mut()
+                    && *ps == src
+                    && *plo == lo
+                    && *pinv == inv
+                    && *prev_off + *rep == off
+                {
+                    *rep += 1;
+                } else {
+                    pieces.push(Piece::Slice {
+                        off,
+                        rep: 1,
+                        src,
+                        lo,
+                        len,
+                        inv,
+                    });
+                }
+                off += len;
+            }
+        }
+    }
+
+    let slice_count = pieces
+        .iter()
+        .filter(|p| matches!(p, Piece::Slice { .. }))
+        .count();
+
+    if slice_count <= 8 {
+        let mut acc: Poly = Vec::new();
+        let mut const_limbs = [0u64; 8];
+        for p in pieces {
+            match p {
+                Piece::ConstOne { off, len } => set_mask_range(&mut const_limbs, off, len),
+                Piece::Slice {
+                    off,
+                    rep,
+                    src,
+                    lo,
+                    len,
+                    inv,
+                } => {
+                    if rep == 1 && !inv && lo == 0 && off + len == bits && cx.wid(src) >= bits {
+                        let sub = poly_of(cx, src, mod_w, tables, memo, steps)?;
+                        let scale =
+                            crate::facts::known::bv_shl(&BitVec::one(mod_w), u32::from(off));
+                        let scaled = mul(&sub, &vec![([0u8; MAX_LEAVES], scale)])?;
+                        acc = add(&acc, &scaled, false);
+                        if acc.len() > MAX_TERMS {
+                            return None;
+                        }
+                        continue;
+                    }
+                    let base = slice_poly(cx, src, lo, len, mod_w, tables, memo, steps)?;
+                    let weight = if rep > 1 {
+                        // `rep` copies of 1-bit slice starting at `off` have weight `(2^rep - 1) << off`.
+                        crate::facts::known::bv_shl(
+                            &crate::facts::known::low_mask(mod_w, u32::from(rep)),
+                            u32::from(off),
+                        )
+                    } else {
+                        crate::facts::known::bv_shl(&BitVec::one(mod_w), u32::from(off))
+                    };
+                    if inv {
+                        let span_bits = if rep > 1 { rep } else { len };
+                        set_mask_range(&mut const_limbs, off, span_bits);
+                        let scaled = mul(&base, &vec![([0u8; MAX_LEAVES], weight)])?;
+                        acc = add(&acc, &scaled, true);
+                    } else {
+                        let scaled = mul(&base, &vec![([0u8; MAX_LEAVES], weight)])?;
+                        acc = add(&acc, &scaled, false);
+                    }
+                    if acc.len() > MAX_TERMS {
+                        return None;
+                    }
+                }
+            }
+        }
+        let c_bv = BitVec::wrapping_from_limbs(mod_w, &const_limbs);
+        if !c_bv.is_zero() {
+            acc = add(&acc, &vec![([0u8; MAX_LEAVES], c_bv)], false);
+        }
+        return (acc.len() <= MAX_TERMS).then_some(acc);
+    }
+
+    // Multi-run single-source in-place mask/XOR (`(s & m) ^ c`):
+    // `((~s) & neg_mask) == neg_mask - (s & neg_mask)`, so value is
+    // `(ones_mask + neg_mask) + Masked(s, pos_mask) - Masked(s, neg_mask)`.
+    let mut single_src: Option<u32> = None;
+    let mut pos_limbs = [0u64; 8];
+    let mut neg_limbs = [0u64; 8];
+    let mut one_limbs = [0u64; 8];
+    let mut cur_off = 0u16;
+    for r in &trunc_runs {
+        match *r {
+            BitRun::Const { val: false, len } => cur_off += len,
+            BitRun::Const { val: true, len } => {
+                set_mask_range(&mut one_limbs, cur_off, len);
+                cur_off += len;
+            }
+            BitRun::Slice { src, lo, len, inv } => {
+                if lo != cur_off {
+                    return None;
+                }
+                if let Some(prev) = single_src {
+                    if prev != src {
+                        return None;
+                    }
+                } else {
+                    single_src = Some(src);
+                }
+                if inv {
+                    set_mask_range(&mut neg_limbs, cur_off, len);
+                } else {
+                    set_mask_range(&mut pos_limbs, cur_off, len);
+                }
+                cur_off += len;
+            }
+        }
+    }
+    let s = single_src?;
+    let pos_mask = BitVec::wrapping_from_limbs(mod_w, &pos_limbs);
+    let neg_mask = BitVec::wrapping_from_limbs(mod_w, &neg_limbs);
+    let one_mask = BitVec::wrapping_from_limbs(mod_w, &one_limbs);
+    let bias = BitVec::bin_unchecked(BinOp::Add, &one_mask, &neg_mask);
+    let mut acc = if bias.is_zero() {
+        Vec::new()
+    } else {
+        vec![([0u8; MAX_LEAVES], bias)]
+    };
+    let s_bits = cx.wid(s);
+    let mask_term = |m: BitVec,
+                     tables: &mut LeafTables,
+                     memo: &mut IdMap<(u32, u16), Poly>,
+                     steps: &mut u32|
+     -> Option<Poly> {
+        if m.is_zero() {
+            return Some(Vec::new());
+        }
+        if m.is_ones() && s_bits >= bits {
+            return poly_of(cx, s, mod_w, tables, memo, steps);
+        }
+        if s_bits < bits && m == crate::facts::known::low_mask(mod_w, u32::from(s_bits)) {
+            return slice_poly(cx, s, 0, s_bits, mod_w, tables, memo, steps);
+        }
+        leaf_poly(tables, mod_w, LeafKey::Masked(s, m))
+    };
+    let pos_p = mask_term(pos_mask, tables, memo, steps)?;
+    acc = add(&acc, &pos_p, false);
+    let neg_p = mask_term(neg_mask, tables, memo, steps)?;
+    acc = add(&acc, &neg_p, true);
+    (acc.len() <= MAX_TERMS).then_some(acc)
 }
 
 /// The polynomial of `x` modulo `2^mod_w` over `tables`, if it is one within the caps.
@@ -382,13 +666,8 @@ fn poly_of(
         return None;
     }
     let node = cx.node(x);
-    let w = cx.width_of(x);
     let p = if let Some(v) = cx.const_val(x) {
-        let v = if bits == w.bits() {
-            v
-        } else {
-            v.trunc(mod_w).ok()?
-        };
+        let v = resize_bv(&v, mod_w);
         if v.is_zero() {
             Vec::new()
         } else {
@@ -422,171 +701,31 @@ fn poly_of(
             OpCode::Shl if cx.const_val(node.b).is_some() => {
                 let a = poly_of(cx, node.a, mod_w, tables, memo, steps)?;
                 let s = cx.const_val(node.b)?;
-                let s_mod = if bits == w.bits() {
-                    s
-                } else if s.to_u64().is_some_and(|v| v >= u64::from(bits)) {
+                let Some(sv) = s.to_u64().filter(|&v| v < u64::from(bits)) else {
                     return Some(Vec::new());
-                } else {
-                    s.trunc(mod_w).ok()?
                 };
-                let k = BitVec::apply_bin(BinOp::Shl, &BitVec::one(mod_w), &s_mod).ok()?;
+                let k = crate::facts::known::bv_shl(&BitVec::one(mod_w), sv as u32);
                 mul(&a, &vec![([0u8; MAX_LEAVES], k)])?
             }
-            OpCode::Extract if node.b == 0 && node.width >= bits && cx.wid(node.a) <= 64 => {
+            OpCode::Extract if node.b == 0 && node.width >= bits => {
                 poly_of(cx, node.a, mod_w, tables, memo, steps)?
             }
-            OpCode::Zext if cx.wid(node.a) >= bits && cx.wid(node.a) <= 64 => {
+            OpCode::Zext if cx.wid(node.a) >= bits => {
                 poly_of(cx, node.a, mod_w, tables, memo, steps)?
             }
-            OpCode::Zext if bits <= 64 && cx.wid(node.a) < bits => {
-                let sub_w = cx.width_of(node.a);
-                let sub_bits = sub_w.bits();
-                let sub_mm = mod_mask_u64(sub_bits);
-                let inner = cx.node(node.a);
-                // When `node.a` is a bitwise complement (`~u` or `u ^ c` with top bit set at
-                // `sub_bits`), `zext<mod_w>(~u) == ((1 << sub_bits) - 1) - zext<mod_w>(u)` with
-                // zero borrow, unifying `zext(u ^ c)` and `zext(u ^ ~c)` on the same `LowPoly`.
-                let comp_sub: Option<Poly> = if inner.op == OpCode::Not {
-                    poly_of(cx, inner.a, sub_w, tables, memo, steps)
-                } else if inner.op == OpCode::Xor && sub_bits >= 1 {
-                    let xor_const = match (cx.const_val(inner.a), cx.const_val(inner.b)) {
-                        (None, Some(k)) => k.to_u64().map(|c| (inner.a, c & sub_mm)),
-                        (Some(k), None) => k.to_u64().map(|c| (inner.b, c & sub_mm)),
-                        _ => None,
-                    };
-                    if let Some((base, cv)) = xor_const
-                        && (cv & (1u64 << (sub_bits - 1))) != 0
-                    {
-                        xor_const_poly(cx, base, (!cv) & sub_mm, sub_w, tables, memo, steps)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some(mut pos_sub) = comp_sub {
-                    reduce_2adic(cx, tables, sub_w, &mut pos_sub);
-                    let max_val =
-                        vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, sub_mm))];
-                    if pos_sub.is_empty() {
-                        max_val
-                    } else if pos_sub.len() == 1 && pos_sub[0].0 == [0u8; MAX_LEAVES] {
-                        let c = pos_sub[0].1.zext(mod_w).ok()?;
-                        add(&max_val, &vec![([0u8; MAX_LEAVES], c)], true)
-                    } else {
-                        let lp = leaf_poly(tables, mod_w, LeafKey::LowPoly(sub_bits, pos_sub))?;
-                        add(&max_val, &lp, true)
-                    }
-                } else if let Some(sub) = poly_of(cx, node.a, sub_w, tables, memo, steps) {
-                    if sub.is_empty() {
-                        Vec::new()
-                    } else if sub.len() == 1 && sub[0].0 == [0u8; MAX_LEAVES] {
-                        let c = sub[0].1.zext(mod_w).ok()?;
-                        vec![([0u8; MAX_LEAVES], c)]
-                    } else {
-                        leaf_poly(tables, mod_w, LeafKey::LowPoly(sub_bits, sub))?
-                    }
-                } else {
-                    leaf_poly(tables, mod_w, LeafKey::Node(x))?
-                }
-            }
-            OpCode::Concat if bits <= 64 => {
-                let lo_bits = cx.wid(node.b);
-                if lo_bits >= bits {
-                    poly_of(cx, node.b, mod_w, tables, memo, steps)?
-                } else {
-                    let hi_bits = bits - lo_bits;
-                    let hi_w = Width::new(hi_bits).ok()?;
-                    let lo_w = Width::new(lo_bits).ok()?;
-                    let lift = |sub: Poly, sb: u16, tables: &mut LeafTables| -> Option<Poly> {
-                        if sub.is_empty() {
-                            Some(Vec::new())
-                        } else if sub.len() == 1 && sub[0].0 == [0u8; MAX_LEAVES] {
-                            let c = sub[0].1.zext(mod_w).ok()?;
-                            Some(vec![([0u8; MAX_LEAVES], c)])
-                        } else {
-                            leaf_poly(tables, mod_w, LeafKey::LowPoly(sb, sub))
-                        }
-                    };
-                    if let (Some(hi_sub), Some(lo_sub)) = (
-                        poly_of(cx, node.a, hi_w, tables, memo, steps),
-                        poly_of(cx, node.b, lo_w, tables, memo, steps),
-                    ) && let (Some(hi_lifted), Some(lo_lifted)) =
-                        (lift(hi_sub, hi_bits, tables), lift(lo_sub, lo_bits, tables))
-                        && let Ok(scale) = BitVec::apply_bin(
-                            BinOp::Shl,
-                            &BitVec::one(mod_w),
-                            &BitVec::wrapping_from_u64(mod_w, u64::from(lo_bits)),
-                        )
-                        && let Some(hi_scaled) = mul(&hi_lifted, &vec![([0u8; MAX_LEAVES], scale)])
-                    {
-                        let p = add(&hi_scaled, &lo_lifted, false);
-                        if p.len() <= MAX_TERMS {
-                            p
-                        } else {
-                            leaf_poly(tables, mod_w, LeafKey::Node(x))?
-                        }
-                    } else {
-                        leaf_poly(tables, mod_w, LeafKey::Node(x))?
-                    }
-                }
-            }
-            OpCode::Xor
-                if (1..=64).contains(&bits)
-                    && (cx.const_val(node.b).is_some() || cx.const_val(node.a).is_some()) =>
-            {
-                let (other, cv) = match cx.const_val(node.b).and_then(|v| v.to_u64()) {
-                    Some(c) => (node.a, c),
-                    None => (node.b, cx.const_val(node.a).and_then(|v| v.to_u64())?),
-                };
-                xor_const_poly(cx, other, cv, mod_w, tables, memo, steps)?
-            }
-            OpCode::Or
-                if bits <= 64
-                    && (cx.const_val(node.b).is_some() || cx.const_val(node.a).is_some()) =>
-            {
-                // x | c == (x & ~c) + c (exact: disjoint bit masks, zero carry)
-                let (other, cv) = match cx.const_val(node.b).and_then(|v| v.to_u64()) {
-                    Some(c) => (node.a, c),
-                    None => (node.b, cx.const_val(node.a).and_then(|v| v.to_u64())?),
-                };
-                let mm = mod_mask_u64(bits);
-                let c_mod = cv & mm;
-                let keep = (!c_mod) & mm;
-                let base_poly = if keep == 0 {
-                    Vec::new()
-                } else if keep == mm {
-                    poly_of(cx, other, mod_w, tables, memo, steps)?
-                } else {
-                    let (base, m) = peel_masked(cx, other, keep, bits);
-                    if m == 0 {
-                        Vec::new()
-                    } else if m == mm {
-                        poly_of(cx, base, mod_w, tables, memo, steps)?
-                    } else {
-                        leaf_poly(tables, mod_w, LeafKey::Masked(base, m))?
-                    }
-                };
-                if c_mod == 0 {
-                    base_poly
-                } else {
-                    let c_term = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_mod))];
-                    let p = add(&base_poly, &c_term, false);
-                    (p.len() <= MAX_TERMS).then_some(p)?
-                }
-            }
-            OpCode::Or if bits <= 64 => {
-                let mm = mod_mask_u64(bits);
-                let pa_may = possible_ones(cx, node.a, 4) & mm;
-                let pb_may = possible_ones(cx, node.b, 4) & mm;
-                let ga = guaranteed_ones(cx, node.a, 4) & mm;
-                let gb = guaranteed_ones(cx, node.b, 4) & mm;
-                if pb_may & !ga == 0 {
+            OpCode::Or if cx.const_val(node.a).is_none() && cx.const_val(node.b).is_none() => {
+                let pa_may = resize_bv(&possible_ones_bv(cx, node.a, 4), mod_w);
+                let pb_may = resize_bv(&possible_ones_bv(cx, node.b, 4), mod_w);
+                let ga = resize_bv(&guaranteed_ones_bv(cx, node.a, 4), mod_w);
+                let gb = resize_bv(&guaranteed_ones_bv(cx, node.b, 4), mod_w);
+                if crate::facts::known::bv_and(&pb_may, &crate::facts::known::bv_not(&ga)).is_zero()
+                {
                     poly_of(cx, node.a, mod_w, tables, memo, steps)?
-                } else if pa_may & !gb == 0 {
+                } else if crate::facts::known::bv_and(&pa_may, &crate::facts::known::bv_not(&gb))
+                    .is_zero()
+                {
                     poly_of(cx, node.b, mod_w, tables, memo, steps)?
-                } else if pa_may & pb_may == 0 {
-                    // Disjoint bit masks: a | b == a + b (mod 2^mod_w).
+                } else if crate::facts::known::bv_and(&pa_may, &pb_may).is_zero() {
                     if let (Some(a), Some(b)) = (
                         poly_of(cx, node.a, mod_w, tables, memo, steps),
                         poly_of(cx, node.b, mod_w, tables, memo, steps),
@@ -594,118 +733,119 @@ fn poly_of(
                         let p = add(&a, &b, false);
                         if p.len() <= MAX_TERMS {
                             p
+                        } else if let Some(rp) =
+                            try_bit_runs_poly(cx, x, mod_w, tables, memo, steps)
+                        {
+                            rp
                         } else {
                             leaf_poly(tables, mod_w, LeafKey::Node(x))?
                         }
+                    } else if let Some(rp) = try_bit_runs_poly(cx, x, mod_w, tables, memo, steps) {
+                        rp
                     } else {
                         leaf_poly(tables, mod_w, LeafKey::Node(x))?
                     }
+                } else if let Some(rp) = try_bit_runs_poly(cx, x, mod_w, tables, memo, steps) {
+                    rp
                 } else {
                     leaf_poly(tables, mod_w, LeafKey::Node(x))?
                 }
             }
-            OpCode::And
-                if bits <= 64
-                    && (cx.const_val(node.b).is_some() || cx.const_val(node.a).is_some()) =>
-            {
-                let (other, mv) = match cx.const_val(node.b).and_then(|v| v.to_u64()) {
-                    Some(m) => (node.a, m),
-                    None => (node.b, cx.const_val(node.a).and_then(|v| v.to_u64())?),
+            OpCode::Xor if cx.const_val(node.a).is_some() || cx.const_val(node.b).is_some() => {
+                let (other, cv) = match cx.const_val(node.b) {
+                    Some(c) => (node.a, resize_bv(&c, mod_w)),
+                    None => (node.b, resize_bv(&cx.const_val(node.a)?, mod_w)),
                 };
-                let mm = mod_mask_u64(bits);
-                let m = mv & mm;
-                if m == 0 {
-                    Vec::new()
-                } else if m == mm {
-                    poly_of(cx, other, mod_w, tables, memo, steps)?
-                } else if m.wrapping_add(1).is_power_of_two() && m < mm {
-                    // Low k-bit mask `x & ((1 << k) - 1)` == `zext<mod_w>(trunc<k>(x))`.
-                    // Also recognize `rotl(a, k) & ((1 << k) - 1) == a >>u (W - k)` directly.
-                    let k = m.count_ones() as u16;
-                    let on = cx.node(other);
-                    let rot_lshr = if matches!(on.op, OpCode::RotL | OpCode::RotR)
-                        && on.width <= 64
-                        && let Some(s) = cx.const_val(on.b).and_then(|v| v.to_u64())
-                    {
-                        let ow = on.width;
-                        let lsh = if on.op == OpCode::RotL {
-                            (s % u64::from(ow)) as u16
-                        } else {
-                            ((u64::from(ow) - s % u64::from(ow)) % u64::from(ow)) as u16
-                        };
-                        (lsh == k && k < ow).then_some((on.a, ow - k))
-                    } else {
-                        None
+                let p_may = resize_bv(&possible_ones_bv(cx, other, 4), mod_w);
+                if crate::facts::known::bv_and(&p_may, &cv).is_zero() {
+                    let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
+                    let p = add(&base_p, &vec![([0u8; MAX_LEAVES], cv)], false);
+                    (p.len() <= MAX_TERMS).then_some(p)?
+                } else if crate::facts::known::bv_and(&p_may, &crate::facts::known::bv_not(&cv))
+                    .is_zero()
+                {
+                    let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
+                    let p = add(&vec![([0u8; MAX_LEAVES], cv)], &base_p, true);
+                    (p.len() <= MAX_TERMS).then_some(p)?
+                } else if let Some(rp) = try_bit_runs_poly(cx, x, mod_w, tables, memo, steps) {
+                    rp
+                } else {
+                    leaf_poly(tables, mod_w, LeafKey::Node(x))?
+                }
+            }
+            OpCode::Or if cx.const_val(node.a).is_some() || cx.const_val(node.b).is_some() => {
+                if let Some(rp) = try_bit_runs_poly(cx, x, mod_w, tables, memo, steps) {
+                    rp
+                } else {
+                    let (other, cv) = match cx.const_val(node.b) {
+                        Some(c) => (node.a, resize_bv(&c, mod_w)),
+                        None => (node.b, resize_bv(&cx.const_val(node.a)?, mod_w)),
                     };
-                    if let Some((base, rshift)) = rot_lshr {
-                        leaf_poly(tables, mod_w, LeafKey::LShr(base, rshift))?
+                    let keep = crate::facts::known::bv_not(&cv);
+                    let base_poly = if keep.is_zero() {
+                        Vec::new()
+                    } else if keep.is_ones() {
+                        poly_of(cx, other, mod_w, tables, memo, steps)?
                     } else {
-                        let sub_w = Width::new(k).ok()?;
-                        if let Some(sub) = poly_of(cx, other, sub_w, tables, memo, steps) {
-                            if sub.is_empty() {
-                                Vec::new()
-                            } else if sub.len() == 1 && sub[0].0 == [0u8; MAX_LEAVES] {
-                                let c = sub[0].1.zext(mod_w).ok()?;
-                                vec![([0u8; MAX_LEAVES], c)]
+                        leaf_poly(tables, mod_w, LeafKey::Masked(other, keep))?
+                    };
+                    let p = add(&base_poly, &vec![([0u8; MAX_LEAVES], cv)], false);
+                    (p.len() <= MAX_TERMS).then_some(p)?
+                }
+            }
+            OpCode::Concat => {
+                if let Some(rp) = try_bit_runs_poly(cx, x, mod_w, tables, memo, steps) {
+                    rp
+                } else {
+                    let lo_bits = cx.wid(node.b);
+                    if lo_bits >= bits {
+                        poly_of(cx, node.b, mod_w, tables, memo, steps)?
+                    } else {
+                        let hi_bits = bits - lo_bits;
+                        let hi_w = Width::new(hi_bits).ok()?;
+                        let lo_w = Width::new(lo_bits).ok()?;
+                        if let (Some(hi_sub), Some(lo_sub)) = (
+                            poly_of(cx, node.a, hi_w, tables, memo, steps),
+                            poly_of(cx, node.b, lo_w, tables, memo, steps),
+                        ) && let (Some(hi_lifted), Some(lo_lifted)) = (
+                            lift_sub_poly(hi_sub, hi_bits, mod_w, tables),
+                            lift_sub_poly(lo_sub, lo_bits, mod_w, tables),
+                        ) {
+                            let scale = crate::facts::known::bv_shl(
+                                &BitVec::one(mod_w),
+                                u32::from(lo_bits),
+                            );
+                            if let Some(hi_scaled) =
+                                mul(&hi_lifted, &vec![([0u8; MAX_LEAVES], scale)])
+                            {
+                                let p = add(&hi_scaled, &lo_lifted, false);
+                                if p.len() <= MAX_TERMS {
+                                    p
+                                } else {
+                                    leaf_poly(tables, mod_w, LeafKey::Node(x))?
+                                }
                             } else {
-                                leaf_poly(tables, mod_w, LeafKey::LowPoly(k, sub))?
+                                leaf_poly(tables, mod_w, LeafKey::Node(x))?
                             }
                         } else {
-                            let (base, bm) = peel_masked(cx, other, m, bits);
-                            leaf_poly(tables, mod_w, LeafKey::Masked(base, bm))?
+                            leaf_poly(tables, mod_w, LeafKey::Node(x))?
                         }
-                    }
-                } else {
-                    let (base, bm) = peel_masked(cx, other, m, bits);
-                    if bm == 0 {
-                        Vec::new()
-                    } else if bm == mm {
-                        poly_of(cx, base, mod_w, tables, memo, steps)?
-                    } else {
-                        leaf_poly(tables, mod_w, LeafKey::Masked(base, bm))?
                     }
                 }
             }
-            OpCode::LShr
-                if w.bits() <= 64
-                    && cx
-                        .const_val(node.b)
-                        .and_then(|v| v.to_u64())
-                        .is_some_and(|s| s > 0 && s < u64::from(w.bits())) =>
-            {
-                let s = cx.const_val(node.b)?.to_u64()? as u16;
-                leaf_poly(tables, mod_w, LeafKey::LShr(node.a, s))?
-            }
-            OpCode::RotL | OpCode::RotR
-                if w.bits() <= 64 && cx.const_val(node.b).and_then(|v| v.to_u64()).is_some() =>
-            {
-                // rotl(a, lsh) == (a << lsh) + (a >>u (W - lsh)) (mod 2^W, hence mod 2^mod_w).
-                let ow = w.bits();
-                let raw = cx.const_val(node.b)?.to_u64()? % u64::from(ow);
-                let lsh = if node.op == OpCode::RotL {
-                    raw as u16
-                } else {
-                    ((u64::from(ow) - raw) % u64::from(ow)) as u16
-                };
-                if lsh == 0 {
-                    poly_of(cx, node.a, mod_w, tables, memo, steps)?
-                } else if lsh >= bits {
-                    leaf_poly(tables, mod_w, LeafKey::LShr(node.a, ow - lsh))?
-                } else if let Some(a) = poly_of(cx, node.a, mod_w, tables, memo, steps)
-                    && let Ok(k) = BitVec::apply_bin(
-                        BinOp::Shl,
-                        &BitVec::one(mod_w),
-                        &BitVec::wrapping_from_u64(mod_w, u64::from(lsh)),
-                    )
-                    && let Some(hi) = mul(&a, &vec![([0u8; MAX_LEAVES], k)])
-                    && let Some(lo) = leaf_poly(tables, mod_w, LeafKey::LShr(node.a, ow - lsh))
-                {
-                    let p = add(&hi, &lo, false);
-                    if p.len() <= MAX_TERMS {
-                        p
-                    } else {
-                        leaf_poly(tables, mod_w, LeafKey::Node(x))?
-                    }
+            OpCode::Zext
+            | OpCode::Sext
+            | OpCode::Extract
+            | OpCode::And
+            | OpCode::Xor
+            | OpCode::LShr
+            | OpCode::AShr
+            | OpCode::RotL
+            | OpCode::RotR
+            | OpCode::Bswap
+            | OpCode::BitRev => {
+                if let Some(rp) = try_bit_runs_poly(cx, x, mod_w, tables, memo, steps) {
+                    rp
                 } else {
                     leaf_poly(tables, mod_w, LeafKey::Node(x))?
                 }
@@ -719,71 +859,211 @@ fn poly_of(
     Some(p)
 }
 
-/// Polynomial of `other ^ cv` modulo `2^mod_w`, exploiting known-zero/subset structure and
-/// canonicalizing complementary masked constant XORs `(x & m) ^ c` vs `(x & m) ^ (m ^ c)`.
-fn xor_const_poly(
+/// Refines overlapping `Slice` intervals (via cut-points) and overlapping `Masked` bitsets (via
+/// Venn-diagram disjoint basis refinement) per shared `src` so split/merged masks and slices unify.
+fn refine_equal(
     cx: &Context,
-    other: u32,
-    cv: u64,
     mod_w: Width,
-    tables: &mut LeafTables,
-    memo: &mut IdMap<(u32, u16), Poly>,
-    steps: &mut u32,
-) -> Option<Poly> {
+    tables: &LeafTables,
+    pa: &Poly,
+    pb: &Poly,
+) -> Option<bool> {
     let bits = mod_w.bits();
-    let mm = mod_mask_u64(bits);
-    let c_mod = cv & mm;
-    if c_mod == 0 {
-        return poly_of(cx, other, mod_w, tables, memo, steps);
+    let (_, keys) = tables.by_width.iter().find(|(w, _)| *w == bits)?;
+    if keys.len() < 2 {
+        return None;
     }
-    let p_may = possible_ones(cx, other, 4) & mm;
-    if (p_may & c_mod) == 0 {
-        // Disjoint bits: `other ^ c_mod == other + c_mod`.
-        let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
-        let c_term = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_mod))];
-        let p = add(&base_p, &c_term, false);
-        return (p.len() <= MAX_TERMS).then_some(p);
+
+    // Collect sources that appear in >= 2 Slice/Masked/Node keys.
+    let src_of = |k: &LeafKey| -> Option<u32> {
+        match *k {
+            LeafKey::Slice { src, .. } | LeafKey::Masked(src, _) => Some(src),
+            LeafKey::Node(id) => Some(id),
+            LeafKey::LowPoly(..) => None,
+        }
+    };
+    let mut shared_srcs: Vec<u32> = Vec::new();
+    for (i, ki) in keys.iter().enumerate() {
+        let Some(s) = src_of(ki) else { continue };
+        let has_slice_or_mask = matches!(ki, LeafKey::Slice { .. } | LeafKey::Masked(..));
+        for kj in &keys[i + 1..] {
+            if src_of(kj) == Some(s)
+                && (has_slice_or_mask || matches!(kj, LeafKey::Slice { .. } | LeafKey::Masked(..)))
+                && !shared_srcs.contains(&s)
+            {
+                shared_srcs.push(s);
+            }
+        }
     }
-    if (p_may & !c_mod) == 0 {
-        // Every possible 1-bit of `other` is set in `c_mod`: `other ^ c_mod == c_mod - other`.
-        let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
-        let c_term = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_mod))];
-        let p = add(&c_term, &base_p, true);
-        return (p.len() <= MAX_TERMS).then_some(p);
+    if shared_srcs.is_empty() {
+        return None;
     }
-    let (b_peeled, m) = peel_masked(cx, other, mm, bits);
-    let c_out = c_mod & !m;
-    let c_in = c_mod & m;
-    if c_in == 0 {
-        let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
-        let c_term = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_out))];
-        let p = add(&base_p, &c_term, false);
-        return (p.len() <= MAX_TERMS).then_some(p);
+
+    let mut new_tables = LeafTables::default();
+    let mut subst: Vec<Poly> = vec![Vec::new(); keys.len()];
+    let mut refined_any = false;
+
+    for &s in &shared_srcs {
+        let s_bits = cx.wid(s);
+        let has_masked = keys
+            .iter()
+            .any(|k| matches!(k, LeafKey::Masked(src, _) if *src == s));
+        let all_aligned = keys.iter().all(|k| match *k {
+            LeafKey::Masked(src, _) if src == s => true,
+            LeafKey::Slice { src, lo, .. } if src == s => lo == 0,
+            LeafKey::Node(id) if id == s => s_bits <= bits,
+            _ => true,
+        });
+
+        if has_masked && all_aligned {
+            // Venn-diagram disjoint bitmask refinement on `s`.
+            let mask_of_key = |k: &LeafKey| -> Option<BitVec> {
+                match k {
+                    LeafKey::Masked(src, m) if *src == s => Some(*m),
+                    LeafKey::Slice { src, lo: 0, len } if *src == s => {
+                        Some(crate::facts::known::low_mask(mod_w, u32::from(*len)))
+                    }
+                    LeafKey::Node(id) if *id == s && s_bits <= bits => {
+                        Some(crate::facts::known::low_mask(mod_w, u32::from(s_bits)))
+                    }
+                    _ => None,
+                }
+            };
+            let mut basis: Vec<BitVec> = Vec::new();
+            for k in keys {
+                let Some(mut rem) = mask_of_key(k) else {
+                    continue;
+                };
+                let mut next_basis: Vec<BitVec> = Vec::with_capacity(basis.len() + 2);
+                for b in basis {
+                    let inter = crate::facts::known::bv_and(&b, &rem);
+                    if inter.is_zero() {
+                        next_basis.push(b);
+                    } else {
+                        let b_only =
+                            crate::facts::known::bv_and(&b, &crate::facts::known::bv_not(&rem));
+                        if !b_only.is_zero() {
+                            next_basis.push(b_only);
+                        }
+                        next_basis.push(inter);
+                        rem = crate::facts::known::bv_and(&rem, &crate::facts::known::bv_not(&b));
+                    }
+                }
+                if !rem.is_zero() {
+                    next_basis.push(rem);
+                }
+                if next_basis.len() > MAX_LEAVES {
+                    return None;
+                }
+                basis = next_basis;
+            }
+            for (idx, k) in keys.iter().enumerate() {
+                let Some(km) = mask_of_key(k) else { continue };
+                let mut sum: Poly = Vec::new();
+                let mut parts = 0usize;
+                for b in &basis {
+                    if !crate::facts::known::bv_and(&km, b).is_zero() {
+                        let lp = leaf_poly(&mut new_tables, mod_w, LeafKey::Masked(s, *b))?;
+                        sum = add(&sum, &lp, false);
+                        parts += 1;
+                    }
+                }
+                refined_any |= parts > 1;
+                subst[idx] = sum;
+            }
+            continue;
+        }
+
+        // Interval cut-point refinement on `Slice` / `Node` of `s`.
+        let iv_of_key = |k: &LeafKey| -> Option<(u16, u16)> {
+            match *k {
+                LeafKey::Slice { src, lo, len } if src == s => Some((lo, lo + len)),
+                LeafKey::Node(id) if id == s => Some((0, s_bits.min(bits))),
+                _ => None,
+            }
+        };
+        let mut cuts: Vec<u16> = Vec::new();
+        for k in keys {
+            if let Some((a, b)) = iv_of_key(k) {
+                cuts.push(a);
+                cuts.push(b);
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        if cuts.len() < 3 || cuts.len() - 1 > MAX_LEAVES {
+            continue;
+        }
+        for (idx, k) in keys.iter().enumerate() {
+            let Some((lo, hi)) = iv_of_key(k) else {
+                continue;
+            };
+            let mut sum: Poly = Vec::new();
+            let mut parts = 0usize;
+            for win in cuts.windows(2) {
+                let (c0, c1) = (win[0], win[1]);
+                if c0 >= lo && c1 <= hi && c1 > c0 {
+                    let lp = leaf_poly(
+                        &mut new_tables,
+                        mod_w,
+                        LeafKey::Slice {
+                            src: s,
+                            lo: c0,
+                            len: c1 - c0,
+                        },
+                    )?;
+                    let shift = u32::from(c0 - lo);
+                    let scaled = if shift == 0 {
+                        lp
+                    } else if shift >= u32::from(bits) {
+                        Vec::new()
+                    } else {
+                        let wv = crate::facts::known::bv_shl(&BitVec::one(mod_w), shift);
+                        mul(&lp, &vec![([0u8; MAX_LEAVES], wv)])?
+                    };
+                    sum = add(&sum, &scaled, false);
+                    parts += 1;
+                }
+            }
+            refined_any |= parts > 1;
+            subst[idx] = sum;
+        }
     }
-    if c_in == m {
-        let base_p = poly_of(cx, other, mod_w, tables, memo, steps)?;
-        let c_term = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_mod))];
-        let p = add(&c_term, &base_p, true);
-        return (p.len() <= MAX_TERMS).then_some(p);
+
+    if !refined_any {
+        return None;
     }
-    let top_bit = 1u64 << (63 - m.leading_zeros());
-    let neg_comp = (c_in & top_bit) != 0;
-    let c_canon = if neg_comp { m ^ c_in } else { c_in };
-    let leaf = leaf_poly(tables, mod_w, LeafKey::XorConst(b_peeled, m, c_canon))?;
-    if neg_comp {
-        let bias = vec![(
-            [0u8; MAX_LEAVES],
-            BitVec::wrapping_from_u64(mod_w, c_out | m),
-        )];
-        let p = add(&bias, &leaf, true);
-        (p.len() <= MAX_TERMS).then_some(p)
-    } else if c_out == 0 {
-        Some(leaf)
-    } else {
-        let bias = vec![([0u8; MAX_LEAVES], BitVec::wrapping_from_u64(mod_w, c_out))];
-        let p = add(&bias, &leaf, false);
-        (p.len() <= MAX_TERMS).then_some(p)
+    for (idx, k) in keys.iter().enumerate() {
+        if subst[idx].is_empty() {
+            subst[idx] = leaf_poly(&mut new_tables, mod_w, k.clone())?;
+        }
     }
+
+    let eval_subst = |p: &Poly| -> Option<Poly> {
+        let mut out: Poly = Vec::new();
+        for (mono, coef) in p {
+            let mut term: Poly = vec![([0u8; MAX_LEAVES], *coef)];
+            for (i, &exp) in mono.iter().enumerate() {
+                if exp == 0 {
+                    continue;
+                }
+                let base = subst.get(i)?;
+                for _ in 0..exp {
+                    term = mul(&term, base)?;
+                }
+            }
+            out = add(&out, &term, false);
+            if out.len() > MAX_TERMS {
+                return None;
+            }
+        }
+        reduce_2adic(cx, &new_tables, mod_w, &mut out);
+        Some(out)
+    };
+
+    let ra = eval_subst(pa)?;
+    let rb = eval_subst(pb)?;
+    Some(ra == rb)
 }
 
 /// Whether `a` and `b` expand to the same polynomial modulo `2^bits` (and at least one has a
@@ -835,7 +1115,43 @@ pub(super) fn equal_mod(
         false
     };
     if !has_mul(a) && !has_mul(b) {
-        return Ok(false);
+        // Also decide pure linear + bit-shuffle/slice/sext identities that `linear` leaves as
+        // distinct atoms (e.g. `(zext<64>(x:8) ^ 0x80) - 0x80 == sext<64>(x:8)` or limb sums).
+        let has_bit_view = |x: u32| {
+            matches!(
+                cx.node(x).op,
+                OpCode::Zext
+                    | OpCode::Sext
+                    | OpCode::Extract
+                    | OpCode::Concat
+                    | OpCode::Bswap
+                    | OpCode::BitRev
+                    | OpCode::RotL
+                    | OpCode::RotR
+                    | OpCode::AShr
+                    | OpCode::LShr
+            ) || cx.node(x).children().any(|c| {
+                matches!(
+                    cx.node(c).op,
+                    OpCode::Zext
+                        | OpCode::Sext
+                        | OpCode::Extract
+                        | OpCode::Concat
+                        | OpCode::Bswap
+                        | OpCode::BitRev
+                        | OpCode::RotL
+                        | OpCode::RotR
+                        | OpCode::AShr
+                        | OpCode::LShr
+                        | OpCode::Xor
+                        | OpCode::And
+                        | OpCode::Or
+                )
+            })
+        };
+        if !has_bit_view(a) && !has_bit_view(b) {
+            return Ok(false);
+        }
     }
     let Ok(w) = Width::new(bits) else {
         return Ok(false);
@@ -846,7 +1162,17 @@ pub(super) fn equal_mod(
     let pa = poly_of(cx, a, w, &mut tables, &mut memo, &mut steps);
     let pb = poly_of(cx, b, w, &mut tables, &mut memo, &mut steps);
     r.meter.charge(Counter::PassWork, u64::from(steps))?;
-    Ok(matches!((pa, pb), (Some(pa), Some(pb)) if pa == pb))
+    let (Some(pa), Some(pb)) = (pa, pb) else {
+        return Ok(false);
+    };
+    if pa == pb {
+        return Ok(true);
+    }
+    if let Some(eq) = refine_equal(cx, w, &tables, &pa, &pb) {
+        r.meter.charge(Counter::PassWork, 16)?;
+        return Ok(eq);
+    }
+    Ok(false)
 }
 
 /// Whether `a` and `b` expand to the same polynomial (and at least one has a product, which is
@@ -959,7 +1285,7 @@ pub(super) fn canonicalize_dag(
                     | OpCode::RotR
             );
         if indexable
-            && (2..=64).contains(&w)
+            && w >= 2
             && cx.const_val(cur).is_none()
             && let Ok(wt) = Width::new(w)
         {
@@ -971,7 +1297,8 @@ pub(super) fn canonicalize_dag(
             }
             if let Some(p) = p_opt {
                 if poly_cone && p.is_empty() {
-                    cur = r.build(cx, |cx| cx.mk_const_u64(w, 0))?;
+                    let zv = BitVec::zero(wt);
+                    cur = r.build(cx, |cx| cx.mk_const(&zv))?;
                     merged_any = true;
                 } else if poly_cone && p.len() == 1 && p[0].0 == [0u8; MAX_LEAVES] {
                     let kv = p[0].1;

@@ -134,6 +134,8 @@ pub(crate) struct State {
     /// 47 constants and four of 16 proofs the opaque-constant sweep finds in a later round
     /// were lost, at half again the time.
     pub(crate) turn: bool,
+    /// Memoized verdicts of [`prove_equal`] across rounds for `(lo_id, hi_id, bits)`.
+    proved: IdMap<(u32, u32, u16), Option<Fin>>,
 }
 
 impl State {
@@ -144,6 +146,181 @@ impl State {
         self.large = 0;
         self.sums_at = None;
     }
+}
+
+/// Non-destructive integer-floor (`Z`-floor) equality lens across widths `1..=128`: checks whether
+/// `a` and `b` lift to congruent integer forms modulo `2^bits` without synthesizing or shrinking a
+/// replacement DAG. Soundly propagates any fact reliance accumulated during lifting.
+pub(in crate::engine::pass) fn prove_equal(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    a: u32,
+    b: u32,
+    bits: u16,
+) -> Result<Option<Fin>, Stop> {
+    let max_lens_nodes: usize = if r.words.turn { 192 } else { 64 };
+    let wa = cx.wid(a);
+    if bits == 0 || wa != cx.wid(b) || bits > wa || u32::from(wa) > lift::WORD {
+        return Ok(None);
+    }
+    if a == b {
+        return Ok(Some(Fin::FINAL));
+    }
+    let key = (a.min(b), a.max(b), bits);
+    if let Some(&cached) = r.words.proved.get(&key) {
+        return Ok(cached);
+    }
+    let floor_ops = crate::engine::dispatch::bit(OpCode::Extract)
+        | crate::engine::dispatch::bit(OpCode::Zext)
+        | crate::engine::dispatch::bit(OpCode::Sext)
+        | crate::engine::dispatch::bit(OpCode::Concat)
+        | crate::engine::dispatch::bit(OpCode::LShr)
+        | crate::engine::dispatch::bit(OpCode::AShr)
+        | crate::engine::dispatch::bit(OpCode::Ult)
+        | crate::engine::dispatch::bit(OpCode::Ule)
+        | crate::engine::dispatch::bit(OpCode::Slt)
+        | crate::engine::dispatch::bit(OpCode::Sle)
+        | crate::engine::dispatch::bit(OpCode::Eq)
+        | crate::engine::dispatch::bit(OpCode::Ne)
+        | crate::engine::dispatch::bit(OpCode::Select);
+    if ((cx.meta[a as usize].ops | cx.meta[b as usize].ops) & floor_ops) == 0 {
+        return Ok(None);
+    }
+    if r.meter.left_in(|m| m.pass_work) < 1024 {
+        return Ok(None);
+    }
+    let mut nodes: Vec<u32> = Vec::with_capacity(64);
+    let mut seen: IdMap<u32, ()> = IdMap::default();
+    let mut stack: Vec<(u32, bool)> = vec![(b, false), (a, false)];
+    while let Some((i, expanded)) = stack.pop() {
+        if expanded {
+            nodes.push(i);
+            continue;
+        }
+        if seen.contains_key(&i) {
+            continue;
+        }
+        if seen.len() >= max_lens_nodes {
+            return Ok(None);
+        }
+        seen.insert(i, ());
+        let n = cx.node(i);
+        if u32::from(n.width) > lift::WORD {
+            nodes.push(i);
+            continue;
+        }
+        stack.push((i, true));
+        for c in n.children() {
+            if !seen.contains_key(&c) {
+                stack.push((c, false));
+            }
+        }
+    }
+    r.meter.charge(Counter::PassWork, nodes.len() as u64)?;
+    // Fast 2-point concrete counterexample filter when no external assumptions restrict inputs.
+    if r.assumptions.is_none()
+        && ((cx.meta[a as usize].ops | cx.meta[b as usize].ops)
+            < crate::engine::dispatch::bit(OpCode::Ext1o0))
+    {
+        let w_ty = cx.width_of(a);
+        let low = crate::facts::known::low_mask(w_ty, u32::from(bits));
+        let mut vals: IdMap<u32, [crate::BitVec; 2]> = IdMap::default();
+        let splitmix = |mut z: u64| -> u64 {
+            z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let mut ok_eval = true;
+        for &i in &nodes {
+            let w_i = cx.width_of(i);
+            let seed = cx.meta[i as usize].shash;
+            let declared = cx.declared_at(i);
+            let mut out = [crate::BitVec::zero(w_i); 2];
+            for (k, slot) in out.iter_mut().enumerate() {
+                let at = |j: u32| {
+                    vals.get(&j)
+                        .map_or_else(|| crate::BitVec::zero(cx.width_of(j)), |arr| arr[k])
+                };
+                let sym = |_: &crate::SymbolKey, sw: crate::Width| {
+                    let s0 = splitmix(seed ^ (k as u64).wrapping_mul(0x517c_c1b7_2722_0a95));
+                    let s1 = splitmix(s0);
+                    let mut limbs = [0u64; 8];
+                    limbs[0] = s0;
+                    limbs[1] = s1;
+                    let v = crate::BitVec::wrapping_from_limbs(sw, &limbs);
+                    Some(declared.map_or(v, |d| d.fit(&v)))
+                };
+                match cx.eval_node(i, at, sym) {
+                    Ok(v) => *slot = v,
+                    Err(_) => {
+                        ok_eval = false;
+                        break;
+                    }
+                }
+            }
+            if !ok_eval {
+                break;
+            }
+            vals.insert(i, out);
+        }
+        if ok_eval
+            && let (Some(va), Some(vb)) = (vals.get(&a), vals.get(&b))
+            && (0..2).any(|k| {
+                let diff = crate::BitVec::bin_unchecked(crate::BinOp::Xor, &va[k], &vb[k]);
+                !crate::facts::known::bv_and(&diff, &low).is_zero()
+            })
+        {
+            r.words.proved.insert(key, None);
+            return Ok(None);
+        }
+    }
+    let _wide = form::Wide::set(nodes.iter().any(|&i| cx.wid(i) > 64));
+
+    let run_lift = |r: &mut Runner<'_, '_>,
+                    cx: &mut Context,
+                    mut lift: lift::Lift|
+     -> Result<(Option<Fin>, bool, bool), Stop> {
+        for &i in &nodes {
+            lift.learn(r, cx, i)?;
+        }
+        for &i in &nodes {
+            lift.read(cx, i);
+        }
+        r.meter.charge(Counter::PassWork, lift.alg.work)?;
+        let (Ok(fa), Ok(fb)) = (lift.value(cx, a), lift.value(cx, b)) else {
+            return Ok((None, lift.alg.forked(), lift.alg.wordy()));
+        };
+        if let Ok(d) = lift.alg.add(&fa, &fb, int::Int::from(-1)) {
+            let rem = lift.alg.reduce(&d, u32::from(bits));
+            if rem.is_const() && rem.c == 0 {
+                return Ok((Some(lift.fin.unwrap_or(Fin::FINAL)), false, false));
+            }
+        }
+        Ok((None, lift.alg.forked(), lift.alg.wordy()))
+    };
+
+    let (ans, forked, wordy) = run_lift(r, cx, lift::Lift::default())?;
+    if ans.is_some() {
+        r.words.proved.insert(key, ans);
+        return Ok(ans);
+    }
+    if wordy && r.meter.left_in(|m| m.pass_work) >= 1024 {
+        let (ans_v, _, _) = run_lift(r, cx, lift::Lift::values())?;
+        if ans_v.is_some() {
+            r.words.proved.insert(key, ans_v);
+            return Ok(ans_v);
+        }
+    }
+    if forked && r.meter.left_in(|m| m.pass_work) >= 1024 {
+        let (ans_p, _, _) = run_lift(r, cx, lift::Lift::plain())?;
+        if ans_p.is_some() {
+            r.words.proved.insert(key, ans_p);
+            return Ok(ans_p);
+        }
+    }
+    r.words.proved.insert(key, None);
+    Ok(None)
 }
 
 /// What the questions at a root found (see `answers`).

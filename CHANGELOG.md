@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.32.26
+
+- Generalized bit-provenance canonicalization (`shuffle`) across widths `1..=512`: added complement-aware canonical bit-provenance runs (`BitRun`, `bit_runs_of`, `runs_invert`, `runs_xor_diff`, `runs_masked_sub`, `runs_is_or`, `decide_cmp_by_bits`), `BitRev` tracing, `Source::NotBit` explanations, and `8..=512` variable-count rotation recognition; extended `linear_mba` rotation-union and complement atom merging and `mba::lower` peer atom deduplication across `1..=512`.
+- Lifted `poly` width caps from `64` to `512` bits, added `try_bit_runs_poly` bit-run decomposition with replicated sign-bit coalescing (unifying `sext<W>(x:K)` with `(zext<W>(x:K) ^ 2^(K-1)) - 2^(K-1)`), and added overlapping slice interval cut-point and Venn-diagram mask basis refinement (`refine_equal`).
+- Upgraded `views` and `demanded::dedup_root` to a 6-tier equivalence ladder (`shuffle`, `poly`, `bitwise`, `linear_mba`, non-destructive `words::prove_equal`, bounded `circuit_equality`) across `1..=512` with memoized `PassWork`-only `BitVec` signatures, complement (`~a == b`) candidate detection, refutation caching, multi-root live-subterm pinning and multi-root `dag_size` shrinkage, and unreferenced-intermediate retirement (`discard_but`) in `demanded::step`.
+- Ungated `pass::context` across all feature sets and generalized `Fact` to `1..=512` `BitVec`, adding full-width affine/XOR equalities (`x == y + k`, `x == k - y`, `x == y ^ k`) and site-scoped partial-mask congruences (`trunc<k>(x) == trunc<k>(y)`, `(x & m) == (y & m)`) across `Select` arms, `And`/`Or` spines in `compares`, `Assumptions`, and `Phase::FactFold`.
+- Extended `eqsat` (`Fragment::extended`, `SaturateConfig::extended`, `PublishPolicy::AtIterationCap`) to mixed-width e-classes (`1..=512`) with per-class reduced-product `Facts` e-graph analysis, mixed-width casts/shifts/rotates/bit-ops/comparisons/`select`, and proven `eqsat.casts`, `eqsat.shifts`, `eqsat.select`, and `eqsat.facts` rule groups while keeping `SaturateConfig::default()` conservative.
+
 ## 0.32.25
 
 - Extended `cse::share_sums` with width-polymorphic (`1..=512`) linear recurrence pivot recovery (`supp(piv) ⊆ supp(cur_terms)` with synthetic disjoint-`Or` mux remapping), disjoint-mux pair folding across linear forms and `Add` bags, compact linear form emission, and constant-multiplier factoring; added compact 9-gate/bit AIG ripple adders (`add_compact` / `sub_compact` via `maj_with_xor`) and compact majority clause emission in `prove`.

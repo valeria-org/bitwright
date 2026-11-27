@@ -159,6 +159,13 @@ pub enum Source {
         /// The bit.
         bit: u16,
     },
+    /// Bitwise complement of bit `bit` of `of`.
+    NotBit {
+        /// The value.
+        of: Expr,
+        /// The bit.
+        bit: u16,
+    },
 }
 
 /// One layer the invert pass undid.
@@ -194,7 +201,7 @@ pub(super) fn exprs(why: &Explanation, f: &mut dyn FnMut(Expr)) {
         Explanation::Intervals { x, .. } => f(*x),
         Explanation::Shuffle { bits } => {
             for b in bits {
-                if let Source::Bit { of, .. } = b {
+                if let Source::Bit { of, .. } | Source::NotBit { of, .. } = b {
                     f(*of);
                 }
             }
@@ -327,6 +334,13 @@ pub(super) fn write(out: &mut String, why: &Explanation, id: &dyn Fn(Expr) -> u6
                         o.out.push(',');
                         num(o.out, u64::from(*bit));
                         o.out.push(']');
+                    }
+                    Source::NotBit { of, bit } => {
+                        o.out.push('[');
+                        num(o.out, id(*of));
+                        o.out.push(',');
+                        num(o.out, u64::from(*bit));
+                        o.out.push_str(",true]");
                     }
                 }
             }

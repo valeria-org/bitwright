@@ -56,13 +56,12 @@ pub(crate) fn costs(
     }
 }
 
-/// Builds the selection rooted at class `root` in the arena.
+/// Builds the selection rooted at class `root` in the arena across mixed widths (`1..=512`).
 pub(crate) fn build(
     eg: &mut EGraph,
     best: &IdMap<ClassId, (u64, u32)>,
     root: ClassId,
     cx: &mut Context,
-    w: crate::Width,
 ) -> Result<Option<u32>, Error> {
     let mut built: IdMap<ClassId, u32> = IdMap::default();
     let mut stack: Vec<(ClassId, bool)> = vec![(eg.find(root), false)];
@@ -85,16 +84,24 @@ pub(crate) fn build(
             continue;
         }
         let at = |k: ClassId| built[&k];
+        let cw = eg.classes[c as usize].width;
         let id = match n.op {
-            EOp::ConstSmall(_) | EOp::ConstWide(_) => {
-                let v = eg.const_val(n.op).unwrap_or_else(|| crate::BitVec::zero(w));
+            EOp::ConstSmall { .. } | EOp::ConstWide(_) => {
+                let v = eg
+                    .const_val(n.op)
+                    .unwrap_or_else(|| crate::BitVec::zero(cw));
                 cx.mk_const(&v)?
             }
-            EOp::Leaf(a) => a,
+            EOp::Leaf { node, .. } => node,
             EOp::Un(op) => cx.c_un(op, at(kids[0]))?,
             EOp::Bin(op) => cx.c_bin(op, at(kids[0]), at(kids[1]))?,
+            EOp::Cmp(op) => cx.c_cmp(op, at(kids[0]), at(kids[1]))?,
+            EOp::Zext(to) => cx.c_zext(at(kids[0]), to)?,
+            EOp::Sext(to) => cx.c_sext(at(kids[0]), to)?,
+            EOp::Extract { lo, width } => cx.c_extract(at(kids[0]), lo, width)?,
+            EOp::Concat => cx.c_concat(at(kids[0]), at(kids[1]))?,
+            EOp::Select => cx.c_select(at(kids[0]), at(kids[1]), at(kids[2]))?,
         };
-        let _ = w;
         built.insert(c, id);
     }
     Ok(built.get(&eg.find(root)).copied())

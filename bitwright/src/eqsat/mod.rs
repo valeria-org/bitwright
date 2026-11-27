@@ -3,10 +3,12 @@
 //!
 //! A bounded *alternative-expression search* over immutable graphs, not a phase: the host
 //! decides when (output or checkpoint boundaries, never routine maintenance), which roots, and
-//! which allowance. Admitted equations are proven, unconditional, of one width, and in the
-//! conservative fragment `+ − * & | ^ neg ~`: identities are used in both directions, guard-free
-//! rules in their authored direction. An extracted expression is a **candidate** the host's own
-//! profitability and verification gates decide to use.
+//! which allowance. By default ([`Fragment::conservative`]), admitted equations are proven,
+//! unconditional, of one width, and in the conservative fragment `+ − * & | ^ neg ~`; opting into
+//! [`Fragment::extended`] admits widths `1..=512`, mixed-width casts (`extract`, `zext`, `sext`,
+//! `concat`), shifts, rotates, bit-ops, comparisons, `select`, and [`Facts`]-guarded
+//! rules. An extracted expression is a **candidate** the host's own profitability and verification
+//! gates decide to use.
 //!
 //! ```
 //! use bitwright::eqsat::{SaturateConfig, Saturator, SearchRun};
@@ -32,12 +34,13 @@ mod tests;
 use std::sync::{Arc, OnceLock};
 
 use egraph::{ClassId, EGraph, ENode, EOp, Halt};
-use pattern::Identity;
+use pattern::{Identity, MatchOut};
 
 use crate::engine::budget::Meter;
 use crate::engine::{Admission, Allowance, Budget, BuildError, Cap, Deadline, Exhausted};
 use crate::error::Error;
 use crate::expr::{Context, Expr, FnEnv, OpCode};
+use crate::facts::Facts;
 use crate::hash::{IdMap, combine};
 use crate::rules::{Ledger, RuleProgram};
 use crate::{BitVec, SymbolKey, Width};
@@ -46,20 +49,36 @@ use crate::{BitVec, SymbolKey, Width};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Fragment {
-    /// The widest root.
+    /// The widest expression node admitted.
     pub max_width: u16,
+    /// Whether mixed-width casts, shifts/rotates, bit-ops, comparisons, `select`, multi-width
+    /// equations, and [`Facts`]-guarded rules are admitted.
+    pub extended_ops: bool,
 }
 
 impl Fragment {
     /// Widths 1..=128, one width per root, `+ − * & | ^`, unary `−` and `~`, constants and
     /// symbols.
     pub fn conservative() -> Fragment {
-        Fragment { max_width: 128 }
+        Fragment {
+            max_width: 128,
+            extended_ops: false,
+        }
+    }
+
+    /// Widths 1..=512, mixed-width casts (`extract`, `zext`, `sext`, `concat`), shifts, rotates,
+    /// bit-ops, comparisons, `select`, multi-width equations, and [`Facts`]-guarded rules.
+    pub fn extended() -> Fragment {
+        Fragment {
+            max_width: Width::MAX_BITS,
+            extended_ops: true,
+        }
     }
 }
 
 setters!(Fragment {
     with_max_width: max_width: u16,
+    with_extended_ops: extended_ops: bool,
 });
 
 /// What to do with subterms outside the fragment.
@@ -70,6 +89,17 @@ pub enum UnsupportedPolicy {
     Decline,
     /// Treat maximal outside subterms as opaque atoms (sound under total semantics; opt-in).
     Atomize,
+}
+
+/// When a batch's extracted candidates are published.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PublishPolicy {
+    /// Publish only when every searched root saturated within its bounds (the default).
+    SaturatedOnly,
+    /// Publish strictly cheaper verified candidates even when a root stopped at its iteration cap
+    /// ([`RootEnd::IterationCap`]). Budget and deadline stops still withhold the batch.
+    AtIterationCap,
 }
 
 /// Search configuration.
@@ -86,6 +116,8 @@ pub struct SaturateConfig {
     pub admission: Admission,
     /// Outside subterms.
     pub unsupported: UnsupportedPolicy,
+    /// When candidates are published.
+    pub publish: PublishPolicy,
     /// The most distinct nodes a root may have.
     pub max_root_nodes: u32,
 }
@@ -100,6 +132,7 @@ impl Default for SaturateConfig {
             matches_per_rule_iter: 16,
             admission: Admission::default(),
             unsupported: UnsupportedPolicy::Decline,
+            publish: PublishPolicy::SaturatedOnly,
             max_root_nodes: 4096,
         }
     }
@@ -111,12 +144,13 @@ setters!(SaturateConfig {
     with_matches_per_rule_iter: matches_per_rule_iter: u32,
     with_admission: admission: Admission,
     with_unsupported: unsupported: UnsupportedPolicy,
+    with_publish: publish: PublishPolicy,
     with_max_root_nodes: max_root_nodes: u32,
 });
 
 impl SaturateConfig {
     /// A larger search: 16 iterations of at most 64 new matches per equation and direction.
-    /// Pair it with a larger budget ([`SearchRun::per_call`]). Like every configuration, it
+    /// Pair it with a larger budget ([`SearchRun::per_call`]). Like the default configuration, it
     /// publishes only searches that saturate: an iteration cap, a budget or a deadline
     /// withholds the batch. Associativity and distributivity together rarely saturate, so
     /// choose the equation groups per search ([`Saturator::new`]).
@@ -124,6 +158,19 @@ impl SaturateConfig {
         SaturateConfig {
             iterations: 16,
             matches_per_rule_iter: 64,
+            ..SaturateConfig::default()
+        }
+    }
+
+    /// Extended multi-width search (`1..=512` bits, casts, shifts, rotates, comparisons, `select`,
+    /// and [`Facts`]-guarded rules) that also publishes strictly cheaper verified candidates when
+    /// a search stops at [`RootEnd::IterationCap`].
+    pub fn extended() -> SaturateConfig {
+        SaturateConfig {
+            fragment: Fragment::extended(),
+            iterations: 12,
+            matches_per_rule_iter: 32,
+            publish: PublishPolicy::AtIterationCap,
             ..SaturateConfig::default()
         }
     }
@@ -308,6 +355,25 @@ fn builtin_program() -> &'static (RuleProgram, Ledger) {
     })
 }
 
+fn node_in_fragment(op: OpCode, extended: bool) -> bool {
+    match op {
+        OpCode::Const | OpCode::Sym => true,
+        _ if extended => {
+            op.as_un().is_some()
+                || op.as_bin().is_some()
+                || op.as_cmp().is_some()
+                || matches!(
+                    op,
+                    OpCode::Zext | OpCode::Sext | OpCode::Extract | OpCode::Concat | OpCode::Select
+                )
+        }
+        _ => {
+            op.as_bin().is_some_and(pattern::admitted_bin_conservative)
+                || op.as_un().is_some_and(pattern::admitted_un_conservative)
+        }
+    }
+}
+
 impl Saturator {
     /// A saturator over the admitted identities of `programs` (each with the ledger that
     /// vouches for it), restricted to `groups` (all groups when empty).
@@ -319,6 +385,7 @@ impl Saturator {
         let mut report = AdmissionReport::default();
         let mut rules = Vec::new();
         let mut epoch = combine(0x65_7173_6174, u64::from(cfg.iterations));
+        let extended = cfg.fragment.extended_ops;
         for (p, ledger) in programs {
             for g in p.groups() {
                 if !groups.is_empty() && !groups.contains(&g.name.as_str()) {
@@ -326,7 +393,7 @@ impl Saturator {
                 }
                 for &ri in &g.rules {
                     let rule = &p.rules()[ri];
-                    match pattern::admit(rule, ledger.vouches_for(&rule.name, rule.id)) {
+                    match pattern::admit(rule, ledger.vouches_for(&rule.name, rule.id), extended) {
                         Ok(id) => {
                             epoch = combine(combine(epoch, rule.id.0[0]), rule.id.0[1]);
                             report.admitted.push(rule.name.clone());
@@ -368,7 +435,8 @@ impl Saturator {
 
     /// A saturator over the named built-in groups (every group when `groups` is empty):
     /// `eqsat.assoc`, `eqsat.distrib` (`*` over `+`), `eqsat.distrib_and` (`&` over `|` and
-    /// `^`), `eqsat.distrib_or` (`|` over `&`), `eqsat.negation` and `eqsat.cancel`.
+    /// `^`), `eqsat.distrib_or` (`|` over `&`), `eqsat.negation`, `eqsat.cancel`, and (under
+    /// [`Fragment::extended`]) `eqsat.casts`, `eqsat.shifts`, `eqsat.select`, and `eqsat.facts`.
     pub fn builtin_groups(groups: &[&str], cfg: SaturateConfig) -> (Saturator, AdmissionReport) {
         let (p, l) = builtin_program();
         Saturator::new(&[(p, l)], groups, cfg)
@@ -436,7 +504,7 @@ impl Saturator {
             };
             match end {
                 RootEnd::Stopped(_) => cause = Some(end),
-                RootEnd::IterationCap => {
+                RootEnd::IterationCap if inner.cfg.publish == PublishPolicy::SaturatedOnly => {
                     cause.get_or_insert(end);
                 }
                 _ => {}
@@ -529,7 +597,7 @@ impl Saturator {
                 ));
             }
         };
-        let end = match self.saturate(&mut eg, w, meter, stats) {
+        let end = match self.saturate(&mut eg, meter, stats) {
             Ok(end) => end,
             Err(Halt::Budget(e)) => {
                 stats.budget_terminated += 1;
@@ -555,13 +623,14 @@ impl Saturator {
             RootEnd::IterationCap => stats.iteration_capped += 1,
             _ => {}
         }
-        let Some(e) = cx.as_engine(|cx| extract::build(&mut eg, &best, rootc, cx, w))? else {
+        let Some(e) = cx.as_engine(|cx| extract::build(&mut eg, &best, rootc, cx))? else {
             return Ok((None, end));
         };
         if e == root {
             return Ok((None, end));
         }
-        // Strictly cheaper as a tree, no larger as a DAG.
+        // Strictly cheaper as a tree (and no larger as a DAG), or strictly smaller as a DAG (and
+        // no larger as a tree).
         let (te, tr) = (cx.meta[e as usize].tree, cx.meta[root as usize].tree);
         let dag = |cx: &mut Context, i: u32| match cx
             .dag_size(&[cx.handle(i)], cfg.max_root_nodes.saturating_mul(4))
@@ -570,7 +639,8 @@ impl Saturator {
             _ => None,
         };
         let (de, dr) = (dag(cx, e), dag(cx, root));
-        let cheaper = te < tr && matches!((de, dr), (Some(a), Some(b)) if a <= b);
+        let cheaper = (te < tr && matches!((de, dr), (Some(a), Some(b)) if a <= b))
+            || (te <= tr && matches!((de, dr), (Some(a), Some(b)) if a < b));
         if !cheaper {
             return Ok((None, end));
         }
@@ -587,7 +657,9 @@ impl Saturator {
     /// root is declined.
     fn fragment(&self, cx: &Context, root: u32, w: Width) -> Result<Vec<u32>, RootEnd> {
         let cfg = &self.inner.cfg;
-        if w.bits() > cfg.fragment.max_width {
+        let max_w = cfg.fragment.max_width.min(Width::MAX_BITS);
+        let extended = cfg.fragment.extended_ops;
+        if w.bits() > max_w {
             return Err(RootEnd::DeclinedUnsupported);
         }
         // `Admission::max_root_dag_size` and `max_root_nodes` both bound the distinct nodes.
@@ -610,22 +682,13 @@ impl Saturator {
                 return Err(RootEnd::DeclinedAdmission(Cap::DagSize));
             }
             let n = cx.node(i);
-            if n.width != w.bits() {
-                if cfg.unsupported == UnsupportedPolicy::Atomize && i != root {
-                    order.push(i);
-                    continue;
-                }
-                return Err(RootEnd::DeclinedUnsupported);
-            }
-            let inside = match n.op {
-                OpCode::Const | OpCode::Sym => true,
-                op => {
-                    op.as_bin().is_some_and(pattern::admitted_bin)
-                        || op.as_un().is_some_and(pattern::admitted_un)
-                }
+            let width_ok = if extended {
+                n.width <= max_w
+            } else {
+                n.width == w.bits()
             };
-            if !inside {
-                if cfg.unsupported == UnsupportedPolicy::Atomize && i != root {
+            if !width_ok || !node_in_fragment(n.op, extended) {
+                if cfg.unsupported == UnsupportedPolicy::Atomize && i != root && n.width <= max_w {
                     order.push(i);
                     continue;
                 }
@@ -641,37 +704,82 @@ impl Saturator {
 
     fn import(
         &self,
-        cx: &Context,
+        cx: &mut Context,
         eg: &mut EGraph,
         order: &[u32],
         m: &mut Meter<'_>,
     ) -> Result<ClassId, Halt> {
+        let extended = self.inner.cfg.fragment.extended_ops;
         let mut at: IdMap<u32, ClassId> = IdMap::default();
         for &i in order {
             let n = cx.node(i);
-            let inside = n.op == OpCode::Const
-                || n.op.as_bin().is_some_and(pattern::admitted_bin)
-                || n.op.as_un().is_some_and(pattern::admitted_un);
+            let inside = node_in_fragment(n.op, extended);
+            let mut leaf_facts: Option<Facts> = None;
             let e = if let Some(v) = cx.const_val(i) {
                 eg.const_node(v)
             } else if !inside || n.op == OpCode::Sym || !n.children().all(|c| at.contains_key(&c)) {
+                leaf_facts = if n.op == OpCode::Sym {
+                    cx.declared_at(i).map(Facts::from_known)
+                } else {
+                    cx.try_facts_cap(cx.handle(i), 64).ok().flatten()
+                };
                 ENode {
-                    op: EOp::Leaf(i),
-                    kids: [0, 0],
+                    op: EOp::Leaf {
+                        node: i,
+                        width: n.width,
+                    },
+                    kids: [0, 0, 0],
                 }
             } else if let Some(u) = n.op.as_un() {
                 ENode {
                     op: EOp::Un(u),
-                    kids: [at[&n.a], 0],
+                    kids: [at[&n.a], 0, 0],
                 }
-            } else {
-                let b = n.op.as_bin().unwrap_or(crate::BinOp::Add);
+            } else if let Some(b) = n.op.as_bin() {
                 ENode {
                     op: EOp::Bin(b),
-                    kids: [at[&n.a], at[&n.b]],
+                    kids: [at[&n.a], at[&n.b], 0],
+                }
+            } else if let Some(c) = n.op.as_cmp() {
+                ENode {
+                    op: EOp::Cmp(c),
+                    kids: [at[&n.a], at[&n.b], 0],
+                }
+            } else {
+                match n.op {
+                    OpCode::Zext => ENode {
+                        op: EOp::Zext(n.width),
+                        kids: [at[&n.a], 0, 0],
+                    },
+                    OpCode::Sext => ENode {
+                        op: EOp::Sext(n.width),
+                        kids: [at[&n.a], 0, 0],
+                    },
+                    OpCode::Extract => ENode {
+                        op: EOp::Extract {
+                            lo: n.b as u16,
+                            width: n.width,
+                        },
+                        kids: [at[&n.a], 0, 0],
+                    },
+                    OpCode::Concat => ENode {
+                        op: EOp::Concat,
+                        kids: [at[&n.a], at[&n.b], 0],
+                    },
+                    OpCode::Select => ENode {
+                        op: EOp::Select,
+                        kids: [at[&n.a], at[&n.b], at[&n.c]],
+                    },
+                    _ => ENode {
+                        op: EOp::Leaf {
+                            node: i,
+                            width: n.width,
+                        },
+                        kids: [0, 0, 0],
+                    },
                 }
             };
-            let c = eg.add(e, true, m)?;
+            let c = eg.add_with_facts(e, true, leaf_facts, m)?;
             at.insert(i, c);
         }
         order
@@ -683,23 +791,26 @@ impl Saturator {
     fn saturate(
         &self,
         eg: &mut EGraph,
-        w: Width,
         m: &mut Meter<'_>,
         stats: &mut EqsatStats,
     ) -> Result<RootEnd, Halt> {
         let cfg = &self.inner.cfg;
+        let max_w = cfg.fragment.max_width.min(Width::MAX_BITS);
+        let extended = cfg.fragment.extended_ops;
+        if extended {
+            eg.materialize_constants(m)?;
+        }
+        type AppliedKey = (usize, usize, ClassId, MatchOut);
         // Matches already applied (canonicalized when checked): they do not count toward the
         // per-equation cap, or an early redex could starve every later one.
-        let mut applied: std::collections::HashSet<
-            (usize, usize, ClassId, Vec<ClassId>),
-            crate::hash::IdBuild,
-        > = std::collections::HashSet::default();
+        let mut applied: std::collections::HashSet<AppliedKey, crate::hash::IdBuild> =
+            std::collections::HashSet::default();
         for _ in 0..cfg.iterations {
             stats.iterations += 1;
             let (n0, u0) = (eg.nodes.len(), eg.unions);
             // Collect every identity's matches in both directions over the canonical classes,
             // then apply them in collection order.
-            let mut apps: Vec<(usize, usize, ClassId, Vec<ClassId>)> = Vec::new();
+            let mut apps: Vec<AppliedKey> = Vec::new();
             let classes = eg.canonical_classes();
             // Saturation can only be claimed when no equation had more matches than it took.
             let mut capped = false;
@@ -711,40 +822,34 @@ impl Saturator {
                             // Nothing more can be taken, and saturation is already ruled out.
                             break;
                         }
-                        let mut found: Vec<Vec<ClassId>> = Vec::new();
+                        let mut found: Vec<MatchOut> = Vec::new();
                         // One more than can be taken shows whether matches were left over.
                         // Matches already applied are skipped before they count.
                         let window = left + 1;
-                        let mut skip = |eg: &mut EGraph, b: &[ClassId]| {
+                        let mut skip = |eg: &mut EGraph, ws: &[u16], b: &[ClassId]| {
                             let key = (
                                 ri,
                                 dir,
                                 eg.find(c),
-                                b.iter().map(|&x| eg.find(x)).collect::<Vec<_>>(),
+                                MatchOut {
+                                    widths: ws.to_vec(),
+                                    vars: b.iter().map(|&x| eg.find(x)).collect(),
+                                },
                             );
                             applied.contains(&key)
                         };
-                        pattern::ematch(
-                            eg,
-                            &rule.sides[dir],
-                            rule.vars,
-                            c,
-                            w,
-                            &mut found,
-                            window,
-                            &mut skip,
-                            m,
+                        pattern::ematch_identity(
+                            eg, rule, dir, c, max_w, &mut found, window, &mut skip, m,
                         )?;
                         if found.len() >= window {
                             capped = true;
                         }
-                        for b in found {
-                            let key = (
-                                ri,
-                                dir,
-                                eg.find(c),
-                                b.iter().map(|&x| eg.find(x)).collect::<Vec<_>>(),
-                            );
+                        for mo in found {
+                            let canon_mo = MatchOut {
+                                widths: mo.widths.clone(),
+                                vars: mo.vars.iter().map(|&x| eg.find(x)).collect(),
+                            };
+                            let key = (ri, dir, eg.find(c), canon_mo);
                             if applied.contains(&key) {
                                 continue;
                             }
@@ -754,18 +859,23 @@ impl Saturator {
                             }
                             left -= 1;
                             applied.insert(key);
-                            apps.push((ri, dir, c, b));
+                            apps.push((ri, dir, c, mo));
                         }
                     }
                 }
             }
-            for (ri, dir, c, b) in apps {
+            for (ri, dir, c, mo) in apps {
                 let rule = &self.inner.rules[ri];
-                if let Some(r) = pattern::instantiate(eg, &rule.sides[1 - dir], &b, w, m)? {
+                if let Some(r) =
+                    pattern::instantiate(eg, rule, 1 - dir, &mo.widths, &mo.vars, max_w, m)?
+                {
                     eg.union(c, r, m)?;
                 }
             }
             eg.rebuild(m)?;
+            if extended {
+                eg.materialize_constants(m)?;
+            }
             if eg.nodes.len() == n0 && eg.unions == u0 && !capped {
                 return Ok(RootEnd::Saturated);
             }

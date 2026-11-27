@@ -4339,3 +4339,253 @@ rule mul_zero<W>(x: W) { x * 0 => 0 }
 rule add_zero<W>(x: W) { x + 0 => x }
 ```
 
+### eqsat.casts
+
+#### `zext_and` — identity (directed and search)
+
+```text
+identity zext_and<W, U>(x: W, y: W) where W < U { zext<U>(x) & zext<U>(y) <=> zext<U>(x & y) }
+```
+
+- `zext<16>(p) & zext<16>(q)` → `zext<16>(p & q)`
+
+#### `zext_or` — identity (directed and search)
+
+```text
+identity zext_or<W, U>(x: W, y: W) where W < U { zext<U>(x) | zext<U>(y) <=> zext<U>(x | y) }
+```
+
+- `zext<16>(p) | zext<16>(q)` → `zext<16>(p | q)`
+
+#### `zext_xor` — identity (directed and search)
+
+```text
+identity zext_xor<W, U>(x: W, y: W) where W < U { zext<U>(x) ^ zext<U>(y) <=> zext<U>(x ^ y) }
+```
+
+- `zext<16>(p) ^ zext<16>(q)` → `zext<16>(p ^ q)`
+
+#### `sext_and` — identity (directed and search)
+
+```text
+identity sext_and<W, U>(x: W, y: W) where W < U { sext<U>(x) & sext<U>(y) <=> sext<U>(x & y) }
+```
+
+- `sext<16>(p) & sext<16>(q)` → `sext<16>(p & q)`
+
+#### `sext_or` — identity (directed and search)
+
+```text
+identity sext_or<W, U>(x: W, y: W) where W < U { sext<U>(x) | sext<U>(y) <=> sext<U>(x | y) }
+```
+
+- `sext<16>(p) | sext<16>(q)` → `sext<16>(p | q)`
+
+#### `sext_xor` — identity (directed and search)
+
+```text
+identity sext_xor<W, U>(x: W, y: W) where W < U { sext<U>(x) ^ sext<U>(y) <=> sext<U>(x ^ y) }
+```
+
+- `sext<16>(p) ^ sext<16>(q)` → `sext<16>(p ^ q)`
+
+#### `concat_xor` — identity (directed and search)
+
+```text
+identity concat_xor<W, U>(x: W, y: U, z: W, t: U) {
+        concat(x ^ z, y ^ t) <=> concat(x, y) ^ concat(z, t)
+    }
+```
+
+- `concat(p ^ r, q ^ s)` → `concat(p, q) ^ concat(r, s)`
+
+#### `concat_and` — identity (directed and search)
+
+```text
+identity concat_and<W, U>(x: W, y: U, z: W, t: U) {
+        concat(x & z, y & t) <=> concat(x, y) & concat(z, t)
+    }
+```
+
+- `concat(p & r, q & s)` → `concat(p, q) & concat(r, s)`
+
+#### `concat_or` — identity (directed and search)
+
+```text
+identity concat_or<W, U>(x: W, y: U, z: W, t: U) {
+        concat(x | z, y | t) <=> concat(x, y) | concat(z, t)
+    }
+```
+
+- `concat(p | r, q | s)` → `concat(p, q) | concat(r, s)`
+
+#### `trunc_zext` — rule
+
+```text
+rule trunc_zext<W, U>(x: W) where W < U { extract<0, W>(zext<U>(x)) => x }
+```
+
+#### `trunc_sext` — rule
+
+```text
+rule trunc_sext<W, U>(x: W) where W < U { extract<0, W>(sext<U>(x)) => x }
+```
+
+#### `lo_concat` — rule
+
+```text
+rule lo_concat<W, U>(h: W, l: U) { extract<0, U>(concat(h, l)) => l }
+```
+
+#### `hi_concat` — rule
+
+```text
+rule hi_concat<W, U>(h: W, l: U) { extract<U, W>(concat(h, l)) => h }
+```
+
+### eqsat.shifts
+
+#### `shl_add` — identity (search only)
+
+```text
+identity shl_add<W>(x: W, y: W, s: W) { (x + y) << s <=> (x << s) + (y << s) }
+```
+
+- `(p + q) << r` → `(p << r) + (q << r)`
+
+#### `shl_and` — identity (search only)
+
+```text
+identity shl_and<W>(x: W, y: W, s: W) { (x & y) << s <=> (x << s) & (y << s) }
+```
+
+- `(p & q) << r` → `(p << r) & (q << r)`
+
+#### `shl_or` — identity (search only)
+
+```text
+identity shl_or<W>(x: W, y: W, s: W) { (x | y) << s <=> (x << s) | (y << s) }
+```
+
+- `(p | q) << r` → `(p << r) | (q << r)`
+
+#### `shl_xor` — identity (search only)
+
+```text
+identity shl_xor<W>(x: W, y: W, s: W) { (x ^ y) << s <=> (x << s) ^ (y << s) }
+```
+
+- `(p ^ q) << r` → `(p << r) ^ (q << r)`
+
+#### `lshr_and` — identity (search only)
+
+```text
+identity lshr_and<W>(x: W, y: W, s: W) { (x & y) >>u s <=> (x >>u s) & (y >>u s) }
+```
+
+- `(p & q) >>u r` → `(p >>u r) & (q >>u r)`
+
+#### `lshr_or` — identity (search only)
+
+```text
+identity lshr_or<W>(x: W, y: W, s: W) { (x | y) >>u s <=> (x >>u s) | (y >>u s) }
+```
+
+- `(p | q) >>u r` → `(p >>u r) | (q >>u r)`
+
+#### `lshr_xor` — identity (search only)
+
+```text
+identity lshr_xor<W>(x: W, y: W, s: W) { (x ^ y) >>u s <=> (x >>u s) ^ (y >>u s) }
+```
+
+- `(p ^ q) >>u r` → `(p >>u r) ^ (q >>u r)`
+
+#### `rotl_xor` — identity (search only)
+
+```text
+identity rotl_xor<W>(x: W, y: W, s: W) { rotl(x ^ y, s) <=> rotl(x, s) ^ rotl(y, s) }
+```
+
+- `rotl(p ^ q, r)` → `rotl(p, r) ^ rotl(q, r)`
+
+### eqsat.select
+
+#### `select_add` — identity (search only)
+
+```text
+identity select_add<W>(c: 1, x: W, y: W, z: W) {
+        select(c, x, y) + z <=> select(c, x + z, y + z)
+    }
+```
+
+- `select(c:1, p, q) + r` → `select(c:1, p + r, q + r)`
+
+#### `select_xor` — identity (search only)
+
+```text
+identity select_xor<W>(c: 1, x: W, y: W, z: W) {
+        select(c, x, y) ^ z <=> select(c, x ^ z, y ^ z)
+    }
+```
+
+- `select(c:1, p, q) ^ r` → `select(c:1, p ^ r, q ^ r)`
+
+#### `select_and` — identity (search only)
+
+```text
+identity select_and<W>(c: 1, x: W, y: W, z: W) {
+        select(c, x, y) & z <=> select(c, x & z, y & z)
+    }
+```
+
+- `select(c:1, p, q) & r` → `select(c:1, p & r, q & r)`
+
+#### `select_same` — rule
+
+```text
+rule select_same<W>(c: 1, x: W) { select(c, x, x) => x }
+```
+
+### eqsat.facts
+
+#### `add_disjoint` — rule
+
+```text
+rule add_disjoint<W>(x: W, y: W) { x + y => x | y if disjoint(x, y) }
+```
+
+- `(p & 0xf0) + (q & 0x0f)` → `(p & 0xf0) | (q & 0x0f)`
+
+#### `xor_disjoint` — rule
+
+```text
+rule xor_disjoint<W>(x: W, y: W) { x ^ y => x | y if disjoint(x, y) }
+```
+
+- `(p & 0xf0) ^ (q & 0x0f)` → `(p & 0xf0) | (q & 0x0f)`
+
+#### `and_redundant` — rule
+
+```text
+rule and_redundant<W>(x: W, c: const W) { x & c => x if zero_bits(x, ~c) }
+```
+
+- `(p & 0x0f) & 0x3f` → `p & 0x0f`
+
+#### `and_disjoint` — rule
+
+```text
+rule and_disjoint<W>(x: W, y: W) { x & y => 0 if disjoint(x, y) }
+```
+
+- `(p & 0x0f) & 0xf0` → `0`
+
+#### `udiv_self_nonzero` — rule
+
+```text
+rule udiv_self_nonzero<W>(x: W) { udiv(x, x) => 1 if nonzero(x) }
+```
+
+- `udiv(p | 1, p | 1)` → `1`
+

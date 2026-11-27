@@ -643,6 +643,13 @@ fn leaf(cx: &Context, i: u32) -> Info {
     if float_cmp(n.op) {
         return float_leaf(cx, i);
     }
+    if n.width == 1 && n.op == OpCode::Extract && n.b == 0 {
+        return Info::Values(
+            i,
+            vec![(BitVec::one(Width::W1), BitVec::one(Width::W1))],
+            None,
+        );
+    }
     let Some(op) = n.op.as_cmp() else {
         return Info::Opaque;
     };
@@ -652,7 +659,7 @@ fn leaf(cx: &Context, i: u32) -> Info {
         matches!(op, CmpOp::Eq | CmpOp::Ne)
             .then(|| difference(cx, t))
             .flatten()
-            .filter(|(_, _, k)| *k == c.limbs()[0])
+            .filter(|(_, _, k)| k == c)
             .map(|(a, b, _)| Info::Pair(a.min(b), a.max(b), pred_set(op)))
     };
     match (cx.const_val(n.a), cx.const_val(n.b)) {
@@ -669,26 +676,21 @@ fn leaf(cx: &Context, i: u32) -> Info {
     }
 }
 
-/// `(a, b, k)` when `t` (of at most 64 bits) is `a - b + k`: a difference of two values, a
+/// `(a, b, k)` when `t` is `a - b + k` at any width `1..=512`: a difference of two values, a
 /// constant added to it or to either of them (`a - (b + k)`; the constructors keep constants
 /// on the right of a sum).
-fn difference(cx: &Context, t: u32) -> Option<(u32, u32, u64)> {
-    let w = cx.wid(t);
-    if w > 64 {
-        return None;
-    }
-    // `x` without the constants added to it, and their sum.
+fn difference(cx: &Context, t: u32) -> Option<(u32, u32, BitVec)> {
+    let w = cx.width_of(t);
     let bare = |mut x: u32| {
-        let mut k = 0u64;
+        let mut k = BitVec::zero(w);
         loop {
             let node = cx.node(x);
-            // (Only a sum's second field is an operand.)
             let added = (node.op == OpCode::Add)
                 .then(|| cx.const_val(node.b))
                 .flatten();
             match added {
                 Some(c) => {
-                    k = k.wrapping_add(c.limbs()[0]);
+                    k = BitVec::bin_unchecked(BinOp::Add, &k, &c);
                     x = node.a;
                 }
                 None => return (x, k),
@@ -701,7 +703,7 @@ fn difference(cx: &Context, t: u32) -> Option<(u32, u32, u64)> {
         return None;
     }
     let ((a, ka), (b, kb)) = (bare(node.a), bare(node.b));
-    let k = k.wrapping_add(ka).wrapping_sub(kb) & (u64::MAX >> (64 - w));
+    let k = BitVec::bin_unchecked(BinOp::Sub, &BitVec::bin_unchecked(BinOp::Add, &k, &ka), &kb);
     (a != b && !cx.is_const(a) && !cx.is_const(b)).then_some((a, b, k))
 }
 
@@ -1720,15 +1722,6 @@ fn signed_overflow_sign_test(
 /// only: equal arguments under a shared operation imply equal outputs, never the converse.
 fn peel_congruence(cx: &Context, mut a: u32, mut b: u32) -> (u32, u32, u16) {
     let mut bits = cx.wid(a);
-    let mask = |k: u16| {
-        if k == 0 {
-            0
-        } else if k >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << k) - 1
-        }
-    };
     for _ in 0..MAX_PEEL {
         if a == b || bits == 0 {
             break;
@@ -1825,33 +1818,43 @@ fn peel_congruence(cx: &Context, mut a: u32, mut b: u32) -> (u32, u32, u16) {
                     break;
                 }
                 bits = match x.op {
-                    OpCode::Mul if bits <= 64 => {
-                        if let Some(k) = cx.const_val(shared).and_then(|v| v.to_u64()) {
-                            bits.saturating_sub(k.trailing_zeros().min(64) as u16)
+                    OpCode::Mul => {
+                        if let Some(k) = cx.const_val(shared) {
+                            let tz = crate::facts::known::trailing_zeros(&k).min(u32::from(bits));
+                            bits.saturating_sub(tz as u16)
                         } else {
                             bits
                         }
                     }
-                    OpCode::And if bits <= 64 => {
-                        if let Some(m) = cx.const_val(shared).and_then(|v| v.to_u64()) {
-                            (64 - (m & mask(bits)).leading_zeros()) as u16
+                    OpCode::And => {
+                        if let Some(m) = cx.const_val(shared) {
+                            let keep = crate::facts::known::low_mask(m.width(), u32::from(bits));
+                            let active = crate::facts::known::bv_and(&m, &keep);
+                            (u32::from(m.width().bits())
+                                - crate::facts::known::leading_zeros(&active))
+                                as u16
                         } else {
                             bits
                         }
                     }
-                    OpCode::Or if bits <= 64 => {
-                        if let Some(m) = cx.const_val(shared).and_then(|v| v.to_u64()) {
-                            (64 - (!m & mask(bits)).leading_zeros()) as u16
+                    OpCode::Or => {
+                        if let Some(m) = cx.const_val(shared) {
+                            let keep = crate::facts::known::low_mask(m.width(), u32::from(bits));
+                            let active = crate::facts::known::bv_and(
+                                &crate::facts::known::bv_not(&m),
+                                &keep,
+                            );
+                            (u32::from(m.width().bits())
+                                - crate::facts::known::leading_zeros(&active))
+                                as u16
                         } else {
                             bits
                         }
                     }
-                    OpCode::Mul | OpCode::And | OpCode::Or | OpCode::Xor => bits,
+                    OpCode::Xor => bits,
                     OpCode::Shl if is_lhs => {
-                        if bits <= 64
-                            && let Some(c) = cx.const_val(shared).and_then(|v| v.to_u64())
-                        {
-                            bits.saturating_sub(c.min(64) as u16)
+                        if let Some(c) = cx.const_val(shared).and_then(|v| v.to_u64()) {
+                            bits.saturating_sub(c.min(u64::from(bits)) as u16)
                         } else {
                             bits
                         }
@@ -1879,12 +1882,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let node = cx.node(n);
     #[cfg(feature = "prove")]
     if matches!(node.op, OpCode::Eq | OpCode::Ne)
-        && super::views::known(r, node.a, node.b)
+        && let Some(vfin) = super::views::known(r, node.a, node.b)
         && r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
     {
         let before = cx.len() as u32;
         let c = bool_const(r, cx, node.op == OpCode::Eq)?;
-        return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+        return finish(r, cx, PassKind::Compares, n, c, before, &[], vfin);
     }
     if node.op == OpCode::Select {
         let (c, t, f) = (node.a, node.b, node.c);
@@ -2049,6 +2052,13 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     // x != 0`, `popcnt(x) <=u 0 -> x == 0`, `0 <u popcnt(x) -> x != 0`, and all-ones counterparts
     // `popcnt(x) == W -> x == -1`, `popcnt(x) != W -> x != -1` across casts of `popcnt(x)`).
     if let Some(cmp) = node.op.as_cmp() {
+        if r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
+            && let Some(decided) = super::shuffle::decide_cmp_by_bits(r, cx, cmp, node.a, node.b)?
+        {
+            let before = cx.len() as u32;
+            let c = bool_const(r, cx, decided)?;
+            return finish(r, cx, PassKind::Compares, n, c, before, &[], Fin::FINAL);
+        }
         let popcnt_arg = |cx: &Context, id: u32| -> Option<u32> {
             let mut cur = id;
             for _ in 0..3 {
@@ -2474,6 +2484,16 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
             }
             if matches!(node.op, OpCode::Eq | OpCode::Ne)
                 && cx.wid(node.a) > 1
+                && r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
+                && let Some(wfin) =
+                    super::words::prove_equal(r, cx, node.a, node.b, cx.wid(node.a))?
+            {
+                let before = cx.len() as u32;
+                let c = bool_const(r, cx, node.op == OpCode::Eq)?;
+                return finish(r, cx, PassKind::Compares, n, c, before, &[], wfin);
+            }
+            if matches!(node.op, OpCode::Eq | OpCode::Ne)
+                && cx.wid(node.a) > 1
                 && !cx.is_const(node.a)
                 && !cx.is_const(node.b)
                 && (matches!(
@@ -2540,6 +2560,13 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                         if !proved {
                             proved = super::linear_mba::equal(r, cx, pa, pb)?;
                         }
+                    }
+                    if !proved
+                        && r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
+                        && let Some(wfin) = super::words::prove_equal(r, cx, pa, pb, bits)?
+                    {
+                        proved = true;
+                        fin = wfin;
                     }
                 }
                 #[cfg(feature = "mba")]
@@ -2723,6 +2750,38 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     }
                 }
             }
+            let mut spec_fin = Fin::FINAL;
+            if matches!(node.op, OpCode::And | OpCode::Or)
+                && cx.wid(n) == 1
+                && cx.meta[n as usize].tree <= 192
+                && r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
+            {
+                let before = cx.len() as u32;
+                if let Some(e_spec) =
+                    r.build(cx, |cx| super::context::specialize_bool_bin(cx, n))?
+                    && e_spec != n
+                {
+                    let stops = stops_below(cx, n, e_spec);
+                    let tie = cx.meta[n as usize].tree != u32::MAX
+                        && cx.meta[e_spec as usize].tree < cx.meta[n as usize].tree;
+                    match super::finish_with(
+                        r,
+                        cx,
+                        PassKind::Compares,
+                        n,
+                        e_spec,
+                        before,
+                        &stops,
+                        Fin::FINAL,
+                        tie,
+                    )? {
+                        Step::Normal(df) => spec_fin = spec_fin.and(df),
+                        step => return Ok(step),
+                    }
+                } else {
+                    super::discard(r, cx, before);
+                }
+            }
             #[cfg(feature = "mba")]
             if matches!(node.op, OpCode::Eq | OpCode::Ne | OpCode::And | OpCode::Or)
                 && cx.wid(n) == 1
@@ -2732,7 +2791,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     && e != n
                 {
                     let stops = stops_below(cx, n, e);
-                    return finish(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL);
+                    return finish(r, cx, PassKind::Compares, n, e, before, &stops, spec_fin);
                 }
             }
             if let Some(step) = packed_zero_or(r, cx, n)? {
@@ -2762,11 +2821,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     emit_values(r, cx, t, &residue_set(&truth, cx.width_of(t)), None)?
                 };
                 if let Some(e) = e {
-                    return finish(r, cx, PassKind::Compares, n, e, before, &[x], Fin::FINAL);
+                    return finish(r, cx, PassKind::Compares, n, e, before, &[x], spec_fin);
                 }
                 super::discard(r, cx, before);
             }
-            return order_step(r, cx, n);
+            return Ok(match order_step(r, cx, n)? {
+                Step::Normal(f) => Step::Normal(f.and(spec_fin)),
+                step => step,
+            });
         }
     };
     match &info {
@@ -2979,7 +3041,6 @@ fn residue_set(truth: &[bool], w: Width) -> Set {
     out
 }
 
-/// The order reading of `n` (see `order`).
 /// The most nodes above its condition an arm may have for [`arms_read`].
 const MAX_ARM: usize = 64;
 
@@ -3056,61 +3117,45 @@ fn arms_read(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<
         return finish(r, cx, PassKind::Compares, n, e, before, &stops, maj_fin).map(Some);
     }
     super::discard(r, cx, before);
-    // Specialize `t` (`c = true`) and `f` (`c = false`) when `c` or its direct negation (`!c` /
-    // `Eq` <-> `Ne`) appears inside an arm and substitution strictly shrinks the DAG.
-    let cn = cx.node(c);
-    let mut neg_cands: Vec<u32> = Vec::with_capacity(3);
-    if cn.op == OpCode::Not {
-        neg_cands.push(cn.a);
-    } else if let Some(nc) = cx.find(&crate::expr::Node::new(OpCode::Not, 1, c, 0, 0)) {
-        neg_cands.push(nc);
-    }
-    if matches!(cn.op, OpCode::Eq | OpCode::Ne) {
-        let flip = if cn.op == OpCode::Eq {
-            OpCode::Ne
-        } else {
-            OpCode::Eq
-        };
-        for (x, y) in [(cn.a, cn.b), (cn.b, cn.a)] {
-            if let Some(id) = cx.find(&crate::expr::Node::new(flip, 1, x, y, 0))
-                && !neg_cands.contains(&id)
-            {
-                neg_cands.push(id);
-            }
-        }
-    }
-    let t_reads = reads(cx, t, c) || neg_cands.iter().any(|&nc| reads(cx, t, nc));
-    let f_reads = reads(cx, f, c) || neg_cands.iter().any(|&nc| reads(cx, f, nc));
-    if t_reads || f_reads {
+    // Specialize `t` (`c = true`) and `f` (`c = false`) under `c`'s bit-mask and relational
+    // guard facts (including `trunc<k>(x) == trunc<k>(y)`, `(x & m) == (y & m)`, `x == y + k`,
+    // and `c` / `!c` occurrences) when the resulting `select` strictly shrinks the DAG.
+    if r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
+        && (cx.meta[t as usize].tree <= 128 || cx.meta[f as usize].tree <= 128)
+    {
         let before = cx.len() as u32;
-        let one = bool_const(r, cx, true)?;
-        let zero = bool_const(r, cx, false)?;
-        let t2 = if t_reads {
-            let mut repl = crate::hash::IdMap::default();
-            repl.insert(c, one);
-            for &nc in &neg_cands {
-                repl.insert(nc, zero);
-            }
-            r.build(cx, |cx| Ok(cx.substitute_ids(&[t], &repl)?[0]))?
+        let t2 = if cx.meta[t as usize].tree <= 128 {
+            r.build(cx, |cx| super::context::specialize_arm(cx, t, c, true))?
         } else {
             t
         };
-        let f2 = if f_reads {
-            let mut repl = crate::hash::IdMap::default();
-            repl.insert(c, zero);
-            for &nc in &neg_cands {
-                repl.insert(nc, one);
-            }
-            r.build(cx, |cx| Ok(cx.substitute_ids(&[f], &repl)?[0]))?
+        let f2 = if cx.meta[f as usize].tree <= 128 {
+            r.build(cx, |cx| super::context::specialize_arm(cx, f, c, false))?
         } else {
             f
         };
         if t2 != t || f2 != f {
             let e = r.build(cx, |cx| cx.c_select(c, t2, f2))?;
             let stops = stops_below(cx, n, e);
-            return finish(r, cx, PassKind::Compares, n, e, before, &stops, maj_fin).map(Some);
+            let tie = cx.meta[n as usize].tree != u32::MAX
+                && cx.meta[e as usize].tree < cx.meta[n as usize].tree;
+            match super::finish_with(
+                r,
+                cx,
+                PassKind::Compares,
+                n,
+                e,
+                before,
+                &stops,
+                maj_fin,
+                tie,
+            )? {
+                Step::Normal(df) => maj_fin = maj_fin.and(df),
+                step => return Ok(Some(step)),
+            }
+        } else {
+            super::discard(r, cx, before);
         }
-        super::discard(r, cx, before);
     }
     Ok((maj_fin != Fin::FINAL).then_some(Step::Normal(maj_fin)))
 }

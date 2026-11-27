@@ -10,8 +10,7 @@ mod cases;
 pub(super) mod casts;
 pub(super) mod compares;
 mod conditions;
-#[cfg(feature = "mba")]
-mod context;
+pub(crate) mod context;
 #[cfg(feature = "prove")]
 pub(crate) mod cse;
 pub(super) mod demanded;
@@ -28,7 +27,7 @@ mod order;
 mod poly;
 pub(crate) mod predicate;
 pub(super) mod residue;
-pub(super) mod shuffle;
+pub(crate) mod shuffle;
 #[cfg(feature = "prove")]
 pub(super) mod slices;
 #[cfg(test)]
@@ -1010,32 +1009,112 @@ fn query<T>(
     Ok((f, Fin::relying(rel)))
 }
 
-/// Fact folding: a node whose facts pin one value becomes that constant.
+/// Fact folding: a node whose facts pin one value becomes that constant, and a node equated to a
+/// canonical peer by the run's assumptions (full-width or under a projected mask) folds to that
+/// peer while recording its constraint reliance.
 fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     if cx.const_val(n).is_some() {
         return Ok(Step::Normal(Fin::FINAL));
     }
     let (f, fin) = facts(r, cx, n)?;
-    let Some(v) = f.and_then(|f| f.as_constant()) else {
-        r.stats.passes.entry("fact_fold").or_default().noop += 1;
-        return Ok(Step::Normal(fin));
-    };
-    if let Some(h) = r.hooks
-        && !h.fold_known(cx, cx.handle(n))
+    if let Some(v) = f.and_then(|f| f.as_constant()) {
+        if let Some(h) = r.hooks
+            && !h.fold_known(cx, cx.handle(n))
+        {
+            r.stats.hook_vetoes += 1;
+            return Ok(Step::Normal(fin));
+        }
+        let before = cx.len() as u32;
+        let c = r.build(cx, |cx| cx.mk_const(&v))?;
+        if let Some(f) = f {
+            r.explain_with(|| Explanation::Fold {
+                known_zero: f.known().known_zero(),
+                known_one: f.known().known_one(),
+                value: v,
+            });
+        }
+        return finish(r, cx, PassKind::FactFold, n, c, before, &[], fin);
+    }
+    if let Some(assump) = r.assumptions
+        && r.hooks.is_none_or(|h| h.fold_known(cx, cx.handle(n)))
     {
-        r.stats.hook_vetoes += 1;
-        return Ok(Step::Normal(fin));
+        let env = &assump.store.env;
+        let (rep, rel) = env.find(n);
+        if rep != n
+            && cx.wid(rep) == cx.wid(n)
+            && cx.meta[rep as usize].tree <= cx.meta[n as usize].tree
+        {
+            let before = cx.len() as u32;
+            let tie = cx.order(rep, n).is_lt();
+            match finish_with(
+                r,
+                cx,
+                PassKind::FactFold,
+                n,
+                rep,
+                before,
+                &[rep],
+                fin.unchanged().and(Fin::relying(rel)),
+                tie,
+            )? {
+                Step::Normal(_) => {}
+                step => return Ok(step),
+            }
+        }
+        if let Some((operand, dem_mask)) = demanded::observed(cx, n) {
+            for &(hi, lo, ref mask, ref xor_diff, srel) in &env.slice_rels {
+                if operand == hi
+                    && crate::facts::known::bv_and(&dem_mask, &crate::facts::known::bv_not(mask))
+                        .is_zero()
+                {
+                    let before = cx.len() as u32;
+                    let sub_xor = crate::facts::known::bv_and(xor_diff, &dem_mask);
+                    let repl_op = if sub_xor.is_zero() {
+                        lo
+                    } else if sub_xor == dem_mask {
+                        r.build(cx, |cx| cx.c_un(crate::ops::UnOp::Not, lo))?
+                    } else {
+                        r.build(cx, |cx| {
+                            let kc = cx.mk_const(&sub_xor)?;
+                            cx.c_bin(crate::ops::BinOp::Xor, lo, kc)
+                        })?
+                    };
+                    let nd = cx.node(n);
+                    let mut kids = [nd.a, nd.b, nd.c];
+                    for k in kids.iter_mut().take(nd.op.arity()) {
+                        if *k == operand {
+                            *k = repl_op;
+                        }
+                    }
+                    let rebuilt = r.build(cx, |cx| cx.rebuild(n, kids))?;
+                    let mut stops = vec![lo];
+                    for k in kids.iter().take(nd.op.arity()) {
+                        if *k != repl_op && *k < before && !stops.contains(k) {
+                            stops.push(*k);
+                        }
+                    }
+                    let tie = cx.meta[rebuilt as usize].tree < cx.meta[n as usize].tree
+                        || cx.order(lo, hi).is_lt();
+                    match finish_with(
+                        r,
+                        cx,
+                        PassKind::FactFold,
+                        n,
+                        rebuilt,
+                        before,
+                        &stops,
+                        fin.unchanged().and(Fin::relying(srel)),
+                        tie,
+                    )? {
+                        Step::Normal(_) => {}
+                        step => return Ok(step),
+                    }
+                }
+            }
+        }
     }
-    let before = cx.len() as u32;
-    let c = r.build(cx, |cx| cx.mk_const(&v))?;
-    if let Some(f) = f {
-        r.explain_with(|| Explanation::Fold {
-            known_zero: f.known().known_zero(),
-            known_one: f.known().known_one(),
-            value: v,
-        });
-    }
-    finish(r, cx, PassKind::FactFold, n, c, before, &[], fin)
+    r.stats.passes.entry("fact_fold").or_default().noop += 1;
+    Ok(Step::Normal(fin))
 }
 
 /// Use counts (parent edges) of the live DAG: counted once per phase run over the current

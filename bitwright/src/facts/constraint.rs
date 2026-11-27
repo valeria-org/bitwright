@@ -529,6 +529,9 @@ pub(crate) struct Env {
     root: IdMap<u32, (u32, Reliance)>,
     /// The members of each class, by representative.
     members: IdMap<u32, Vec<u32>>,
+    /// Projected bit-slice congruences `(hi, lo, mask, xor_diff, rel)` (`(hi ^ lo) & mask == xor_diff`)
+    /// derived from assumed slice/masked equalities.
+    pub(crate) slice_rels: Vec<(u32, u32, BitVec, BitVec, Reliance)>,
 }
 
 impl Default for Env {
@@ -539,6 +542,7 @@ impl Default for Env {
             entry_slot: IdMap::default(),
             root: IdMap::default(),
             members: IdMap::default(),
+            slice_rels: Vec::new(),
             min: u32::MAX,
             infeasible: None,
         }
@@ -694,10 +698,41 @@ impl Propagation<'_> {
             self.infeasible(all);
             return Ok(false);
         };
-        if let (Some(cmp), Some(v)) = (node.op.as_cmp(), r.as_constant())
-            && !self.relate(cmp, kids[0], kids[1], !v.is_zero(), all)
-        {
-            return Ok(false);
+        if let (Some(cmp), Some(v)) = (node.op.as_cmp(), r.as_constant()) {
+            let holds = !v.is_zero();
+            if !self.relate(cmp, kids[0], kids[1], holds, all) {
+                return Ok(false);
+            }
+            if (cmp == CmpOp::Eq && holds) || (cmp == CmpOp::Ne && !holds) {
+                match crate::engine::pass::context::extract_slice_congruence(cx, kids[0], kids[1]) {
+                    crate::engine::pass::context::SliceCheck::Conflict => {
+                        self.infeasible(all);
+                        return Ok(false);
+                    }
+                    crate::engine::pass::context::SliceCheck::FullEq(lo, hi) => {
+                        if !self.relate(CmpOp::Eq, lo, hi, true, all) {
+                            return Ok(false);
+                        }
+                    }
+                    crate::engine::pass::context::SliceCheck::Slice {
+                        hi,
+                        lo,
+                        mask,
+                        xor_diff,
+                    } => {
+                        if !self.store.env.slice_rels.iter().any(|(h, l, m, x, _)| {
+                            *h == hi && *l == lo && *m == mask && *x == xor_diff
+                        }) {
+                            self.store.env.min = self.store.env.min.min(hi.min(lo));
+                            self.store
+                                .env
+                                .slice_rels
+                                .push((hi, lo, mask, xor_diff, all));
+                        }
+                    }
+                    crate::engine::pass::context::SliceCheck::None => {}
+                }
+            }
         }
         for (k, f) in out.iter().enumerate().take(arity) {
             if let Some(f) = f {

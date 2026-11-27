@@ -336,8 +336,8 @@ fn walk<const QUICK: bool>(
         rot_unions: Vec::new(),
     };
     if !QUICK {
-        merge_complement_atoms(cx, &mut reg);
         merge_rot_union_atoms(cx, &mut reg, allow_slice_rot);
+        merge_complement_atoms(cx, &mut reg);
     }
     if reg.atoms.len() + reg.lifts.len() > if QUICK { 5 } else { MAX_ATOMS } {
         return Err(Walk::Over);
@@ -471,18 +471,78 @@ fn flatten_affine(cx: &Context, root: u32, w: u16) -> Option<AffineForm> {
 type AffineForm = (Vec<((u32, u64), u64)>, u64);
 
 /// Detect pairs of atoms `a, b` in `reg.atoms` that are equal (`a == b`) or bitwise complements
-/// (`a + b == -1 (mod 2^w)`, i.e. `b == ~a`), such as `x * (-C) - 1` beside `x * C`, or two
-/// spellings of the same affine sum through disjoint `|` / subset `^` / `zext(trunc)`.
-/// Removing `b` and evaluating it as `a` or `!a` shrinks the corner table and enables cancellation.
+/// (`a + b == -1 (mod 2^w)`, i.e. `b == ~a`), either via bit-provenance across all widths
+/// `1..=512` or via flattened affine forms (`x * (-C) - 1` beside `x * C`).
 fn merge_complement_atoms(cx: &Context, reg: &mut Region) {
     if reg.atoms.len() < 2 {
         return;
     }
     let w = cx.wid(reg.atoms[0]);
-    if w == 0 || w > 64 {
+    if w == 0 {
         return;
     }
-    merge_complement_atoms_at(cx, reg, w);
+    merge_bit_provenance_atoms(cx, reg, w);
+    if reg.atoms.len() >= 2 && w <= 64 {
+        merge_complement_atoms_at(cx, reg, w);
+    }
+    // Resolve any 2-step chains (`comp -> mid -> base`) so every `base` in `reg.complements`
+    // is guaranteed to remain in `reg.atoms`.
+    if reg.complements.len() >= 2 {
+        let snap = reg.complements.clone();
+        for entry in &mut reg.complements {
+            while let Some(&(_, next_base, next_neg)) = snap.iter().find(|&&(c, _, _)| c == entry.1)
+            {
+                if next_base == entry.1 {
+                    break;
+                }
+                entry.1 = next_base;
+                entry.2 ^= next_neg;
+            }
+        }
+    }
+}
+
+fn merge_bit_provenance_atoms(cx: &Context, reg: &mut Region, w: u16) {
+    if reg.atoms.len() < 2 || w == 0 || w > super::shuffle::MAX_WIDTH {
+        return;
+    }
+    if !reg.atoms.iter().all(|&a| cx.wid(a) == w) {
+        return;
+    }
+    let runs: Vec<Option<Vec<super::shuffle::BitRun>>> = reg
+        .atoms
+        .iter()
+        .map(|&a| super::shuffle::bit_runs_of(cx, a, 24))
+        .collect();
+    let mut dropped = vec![false; reg.atoms.len()];
+    for j in 1..reg.atoms.len() {
+        let Some(rj) = &runs[j] else { continue };
+        let inv_rj = super::shuffle::runs_invert(rj);
+        for i in 0..j {
+            if dropped[i] {
+                continue;
+            }
+            let Some(ri) = &runs[i] else { continue };
+            if ri == rj {
+                reg.complements.push((reg.atoms[j], reg.atoms[i], false));
+                dropped[j] = true;
+                break;
+            }
+            if *ri == inv_rj {
+                reg.complements.push((reg.atoms[j], reg.atoms[i], true));
+                dropped[j] = true;
+                break;
+            }
+        }
+    }
+    if dropped.iter().any(|&d| d) {
+        let mut idx = 0;
+        reg.atoms.retain(|_| {
+            let keep = !dropped[idx];
+            idx += 1;
+            keep
+        });
+    }
 }
 
 fn merge_complement_atoms_at(cx: &Context, reg: &mut Region, eff_w: u16) {
@@ -545,205 +605,71 @@ fn merge_complement_atoms_at(cx: &Context, reg: &mut Region, eff_w: u16) {
     }
 }
 
-/// Exact single-base bit-affine representation of a `<= 64`-bit node:
-/// `val == (rotl(base, rot) & mask) ^ flip`.
-#[derive(Copy, Clone, PartialEq, Eq)]
-struct BitSlice {
-    base: u32,
-    rot: u32,
-    mask: u64,
-    flip: u64,
-}
-
-fn rotl_u64(x: u64, r: u32, w: u16) -> u64 {
-    let wb = u32::from(w);
-    let ones = u64::MAX >> (64 - wb);
-    let r = r % wb;
-    if r == 0 {
-        x & ones
-    } else {
-        ((x << r) | ((x & ones) >> (wb - r))) & ones
-    }
-}
-
-fn bit_slice_of(cx: &Context, i: u32, w: u16, depth: u8) -> BitSlice {
-    let ones = u64::MAX >> (64 - w);
-    let leaf = BitSlice {
-        base: i,
-        rot: 0,
-        mask: ones,
-        flip: 0,
-    };
-    if depth == 0 {
-        return leaf;
-    }
-    let n = cx.node(i);
-    if n.width != w {
-        return leaf;
-    }
-    match n.op {
-        OpCode::Not => {
-            let mut s = bit_slice_of(cx, n.a, w, depth - 1);
-            s.flip = (!s.flip) & ones;
-            s
-        }
-        OpCode::And => match (
-            cx.const_val(n.a).and_then(|v| v.to_u64()),
-            cx.const_val(n.b).and_then(|v| v.to_u64()),
-        ) {
-            (None, Some(k)) => {
-                let mut s = bit_slice_of(cx, n.a, w, depth - 1);
-                s.mask &= k & ones;
-                s.flip &= k & ones;
-                s
-            }
-            (Some(k), None) => {
-                let mut s = bit_slice_of(cx, n.b, w, depth - 1);
-                s.mask &= k & ones;
-                s.flip &= k & ones;
-                s
-            }
-            _ => leaf,
-        },
-        OpCode::Or => match (
-            cx.const_val(n.a).and_then(|v| v.to_u64()),
-            cx.const_val(n.b).and_then(|v| v.to_u64()),
-        ) {
-            (None, Some(k)) => {
-                let k = k & ones;
-                let mut s = bit_slice_of(cx, n.a, w, depth - 1);
-                s.mask &= !k;
-                s.flip |= k;
-                s
-            }
-            (Some(k), None) => {
-                let k = k & ones;
-                let mut s = bit_slice_of(cx, n.b, w, depth - 1);
-                s.mask &= !k;
-                s.flip |= k;
-                s
-            }
-            _ => leaf,
-        },
-        OpCode::Xor => match (
-            cx.const_val(n.a).and_then(|v| v.to_u64()),
-            cx.const_val(n.b).and_then(|v| v.to_u64()),
-        ) {
-            (None, Some(k)) => {
-                let mut s = bit_slice_of(cx, n.a, w, depth - 1);
-                s.flip ^= k & ones;
-                s
-            }
-            (Some(k), None) => {
-                let mut s = bit_slice_of(cx, n.b, w, depth - 1);
-                s.flip ^= k & ones;
-                s
-            }
-            _ => leaf,
-        },
-        OpCode::RotL | OpCode::RotR => {
-            let Some(k) = cx.const_val(n.b).and_then(|v| v.to_u64()) else {
-                return leaf;
-            };
-            let wb = u32::from(w);
-            let r = (k % u64::from(wb)) as u32;
-            let r = if n.op == OpCode::RotL {
-                r
-            } else {
-                (wb - r) % wb
-            };
-            let mut s = bit_slice_of(cx, n.a, w, depth - 1);
-            s.rot = (s.rot + r) % wb;
-            s.mask = rotl_u64(s.mask, r, w);
-            s.flip = rotl_u64(s.flip, r, w);
-            s
-        }
-        _ => leaf,
-    }
-}
-
-/// Detect any atom `rot` proved equal to `rotl(x, s)` (either directly `RotL`/`RotR` or via
-/// bit-affine equivalence `rotl(x & M ^ K, s) == (rotl(x, s) & rotl(M, s)) ^ rotl(K, s)`)
-/// whose two constituent shifts `x << s` and `x >>u (w - s)` are both already present in
-/// `reg.atoms`. Since `rotl(x, s) == (x << s) | (x >>u (w - s))` identically, `rot` is
-/// evaluated as `shl | lshr` without spending an extra variable column.
+/// Detect any atom `u` proved equal to `a | b` for two other kept atoms `a, b` in `reg.atoms`
+/// across widths `2..=512` (including `rotl(x, s) == (x << s) | (x >>u (w - s))`, bit-affine
+/// masked/flipped rotations when `allow_slice_rot` is enabled, and limb concatenations
+/// `concat(hi, lo) == (zext(hi) << k) | zext(lo)`). Evaluated as `a | b` in the signature
+/// without spending an extra variable column.
 fn merge_rot_union_atoms(cx: &Context, reg: &mut Region, allow_slice_rot: bool) {
     if reg.atoms.len() < 3 {
         return;
     }
     let w = cx.wid(reg.atoms[0]);
-    if !(2..=64).contains(&w) {
+    if !(2..=super::shuffle::MAX_WIDTH).contains(&w) {
         return;
     }
-    let wb = u32::from(w);
-    // Find all complementary shift pairs `(x, s, shl_id, lshr_id)` present in `reg.atoms`.
-    let mut pairs: Vec<(u32, u32, usize, usize)> = Vec::new();
-    for (i, &a) in reg.atoms.iter().enumerate() {
-        let na = cx.node(a);
-        if na.width != w || na.op != OpCode::Shl {
-            continue;
-        }
-        let Some(s) = cx.const_val(na.b).and_then(|v| v.to_u64()) else {
-            continue;
-        };
-        if s == 0 || s >= u64::from(w) {
-            continue;
-        }
-        let r = u64::from(w) - s;
-        if let Some(j) = reg.atoms.iter().position(|&b| {
-            let nb = cx.node(b);
-            nb.op == OpCode::LShr
-                && nb.a == na.a
-                && cx.const_val(nb.b).and_then(|v| v.to_u64()) == Some(r)
-        }) {
-            pairs.push((na.a, s as u32, i, j));
-        }
-    }
-    if pairs.is_empty() {
+    let has_rot_or_concat = reg.atoms.iter().any(|&a| {
+        matches!(
+            cx.node(a).op,
+            OpCode::RotL | OpCode::RotR | OpCode::Concat | OpCode::Bswap | OpCode::BitRev
+        )
+    });
+    if !allow_slice_rot && !has_rot_or_concat {
         return;
     }
-    let slices: Vec<BitSlice> = if allow_slice_rot {
-        reg.atoms
-            .iter()
-            .map(|&a| bit_slice_of(cx, a, w, 6))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let runs: Vec<Option<Vec<super::shuffle::BitRun>>> = reg
+        .atoms
+        .iter()
+        .map(|&a| {
+            (cx.wid(a) == w)
+                .then(|| super::shuffle::bit_runs_of(cx, a, 24))
+                .flatten()
+        })
+        .collect();
     let mut dropped = vec![false; reg.atoms.len()];
-    for &(x, s, shl_idx, lshr_idx) in &pairs {
-        let target = if allow_slice_rot {
-            let mut t = bit_slice_of(cx, x, w, 6);
-            t.rot = (t.rot + s) % wb;
-            t.mask = rotl_u64(t.mask, s, w);
-            t.flip = rotl_u64(t.flip, s, w);
-            Some(t)
-        } else {
-            None
-        };
-        for (idx, &a) in reg.atoms.iter().enumerate() {
-            if idx == shl_idx || idx == lshr_idx || dropped[idx] {
+    let mut used = vec![false; reg.atoms.len()];
+    let n = reg.atoms.len();
+    for u in 0..n {
+        if dropped[u] || used[u] {
+            continue;
+        }
+        if !allow_slice_rot
+            && !matches!(
+                cx.node(reg.atoms[u]).op,
+                OpCode::RotL | OpCode::RotR | OpCode::Concat | OpCode::Bswap | OpCode::BitRev
+            )
+        {
+            continue;
+        }
+        let Some(ru) = &runs[u] else { continue };
+        'pair: for i in 0..n {
+            if i == u || dropped[i] {
                 continue;
             }
-            let direct = {
-                let n = cx.node(a);
-                n.width == w
-                    && n.a == x
-                    && matches!(n.op, OpCode::RotL | OpCode::RotR)
-                    && cx.const_val(n.b).and_then(|v| v.to_u64()).is_some_and(|k| {
-                        let rs = if n.op == OpCode::RotL {
-                            k % u64::from(w)
-                        } else {
-                            (u64::from(w) - (k % u64::from(w))) % u64::from(w)
-                        };
-                        rs == u64::from(s)
-                    })
-            };
-            let matches = direct || target.is_some_and(|t| slices[idx] == t);
-            if matches {
-                reg.rot_unions
-                    .push((a, reg.atoms[shl_idx], reg.atoms[lshr_idx]));
-                dropped[idx] = true;
+            let Some(ri) = &runs[i] else { continue };
+            for j in (i + 1)..n {
+                if j == u || dropped[j] {
+                    continue;
+                }
+                let Some(rj) = &runs[j] else { continue };
+                if super::shuffle::runs_is_or(ru, ri, rj) {
+                    reg.rot_unions
+                        .push((reg.atoms[u], reg.atoms[i], reg.atoms[j]));
+                    dropped[u] = true;
+                    used[i] = true;
+                    used[j] = true;
+                    break 'pair;
+                }
             }
         }
     }

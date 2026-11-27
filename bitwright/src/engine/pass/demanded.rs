@@ -79,7 +79,7 @@ const FIRST_HEIGHT: u32 = 64;
 
 /// The operand `n` observes through a mask, and the mask: `x & k`, `x | k`, an extraction, a
 /// shift by a constant.
-fn observed(cx: &Context, n: u32) -> Option<(u32, BitVec)> {
+pub(super) fn observed(cx: &Context, n: u32) -> Option<(u32, BitVec)> {
     let node = cx.node(n);
     let w = cx.width_of(n);
     match node.op {
@@ -2215,7 +2215,10 @@ pub(crate) fn narrow_root(
     cx: &mut Context,
     root: u32,
 ) -> Result<Option<(u32, Fin)>, Stop> {
-    if r.assumptions.is_some_and(|a| !a.store.seeds.is_empty()) || r.life.live_roots.len() > 1 {
+    if r.inner.strategy.sharing == crate::engine::Sharing::Ignored
+        || r.assumptions.is_some_and(|a| !a.store.seeds.is_empty())
+        || r.life.live_roots.len() > 1
+    {
         return Ok(None);
     }
     let Some((order, read)) = demands(r, cx, root)? else {
@@ -2235,15 +2238,15 @@ pub(crate) fn dedup_root(
     cx: &mut Context,
     root: u32,
 ) -> Result<Option<(u32, Fin)>, Stop> {
-    if cx.is_const(root) || r.assumptions.is_some_and(|a| !a.store.seeds.is_empty()) {
+    if cx.is_const(root)
+        || r.inner.strategy.sharing == crate::engine::Sharing::Ignored
+        || r.assumptions.is_some_and(|a| !a.store.seeds.is_empty())
+    {
         return Ok(None);
     }
     let mut circuit_questions = 8;
     if let Some(result) = super::views::merge(r, cx, root, &mut circuit_questions)? {
         return Ok(Some(result));
-    }
-    if r.life.live_roots.len() > 1 {
-        return Ok(None);
     }
     let Some((order, read)) = demands(r, cx, root)? else {
         return Ok(None);
@@ -2253,6 +2256,11 @@ pub(crate) fn dedup_root(
     }
     r.meter
         .charge(Counter::PassWork, (order.len() as u64) * 2)?;
+    let has_wide = order.iter().any(|&u| cx.wid(u) > 64);
+    if has_wide {
+        super::views::eval_sigs(r, cx, &order)?;
+    }
+    let pinned = super::views::other_roots_reach(r, cx);
 
     const LANES: usize = 16;
     let splitmix = |mut z: u64| -> u64 {
@@ -2478,34 +2486,50 @@ pub(crate) fn dedup_root(
             continue;
         }
         let w_v = cx.wid(v_cur);
-        if w_v == 0 || w_v > 64 {
+        if w_v == 0 {
             continue;
         }
         let Some(m_v) = read.get(&v).copied().filter(|m| !m.is_zero()) else {
             continue;
         };
-        let Some(mw) = m_v.to_u64() else {
-            continue;
-        };
-        let Some(&sv) = sigs.get(&v) else {
-            continue;
-        };
         let mut masked_sig = [0u64; LANES];
-        for (dst, &src) in masked_sig.iter_mut().zip(sv.iter()) {
-            *dst = src & mw;
+        if w_v <= 64
+            && let Some(mw) = m_v.to_u64()
+            && let Some(&sv) = sigs.get(&v)
+        {
+            for (dst, &src) in masked_sig.iter_mut().zip(sv.iter()) {
+                *dst = src & mw;
+            }
+        } else if has_wide && let Some(vals) = r.demanded.view_sigs.get(&v) {
+            for (k, slot) in masked_sig.iter_mut().enumerate() {
+                let sv = &vals[k % vals.len()];
+                let masked = bv_and(sv, &m_v);
+                *slot = masked
+                    .limbs()
+                    .iter()
+                    .fold(0x9e37_79b9_7f4a_7c15u64, |h, &l| crate::hash::combine(h, l));
+            }
+        } else {
+            continue;
         }
         // Constant signature check: skip all-identical-lane constants (already handled by sweeps).
         if masked_sig.iter().all(|&x| x == masked_sig[0]) {
             continue;
         }
-        let ones = mw.count_ones();
-        let is_prefix = ones > 0 && ones == 64 - mw.leading_zeros();
+        let ones = crate::facts::known::count_ones(&m_v);
+        let active_span = u32::from(w_v) - crate::facts::known::leading_zeros(&m_v);
+        let is_prefix = ones > 0 && ones == active_span;
+        let mask_hash = m_v
+            .limbs()
+            .iter()
+            .fold(u64::from(w_v), |h, &l| crate::hash::combine(h, l));
         let key = if is_prefix {
             (ones as u16, 0u64, masked_sig)
         } else {
-            (w_v, mw, masked_sig)
+            (w_v, mask_hash, masked_sig)
         };
         let mut matched: Option<(u32, Fin)> = None;
+        let mut reverse_matched: Option<(u32, u32, Fin)> = None;
         if proofs_tried < MAX_DEDUP_PROOFS
             && let Some(cands) = buckets.get(&key)
         {
@@ -2521,6 +2545,14 @@ pub(crate) fn dedup_root(
                 }
                 proofs_tried += 1;
                 let mark = cx.len() as u32;
+                // When `v_cur` is pinned by another root and `u_orig` is not, and `m_v` covers
+                // all bits demanded of `u_orig`, prefer merging `u_orig -> v` instead!
+                let prefer_v = pinned.contains_key(&v_cur)
+                    && !pinned.contains_key(&u_cur)
+                    && w_u == w_v
+                    && read
+                        .get(&u_orig)
+                        .is_some_and(|m_u| bv_and(m_u, &bv_not(&m_v)).is_zero());
                 let u_at_v = match w_u.cmp(&w_v) {
                     core::cmp::Ordering::Equal => u_cur,
                     core::cmp::Ordering::Less => r.build(cx, |cx| cx.c_zext(u_cur, w_v))?,
@@ -2537,8 +2569,13 @@ pub(crate) fn dedup_root(
                     is_prefix.then_some(ones as u16),
                     &mut circuit_questions,
                 )? {
-                    super::discard_but(r, cx, mark, u_at_v);
-                    matched = Some((u_at_v, pf));
+                    if prefer_v {
+                        super::discard(r, cx, mark);
+                        reverse_matched = Some((u_orig, v_cur, pf));
+                    } else {
+                        super::discard_but(r, cx, mark, u_at_v);
+                        matched = Some((u_at_v, pf));
+                    }
                     break;
                 }
                 super::discard(r, cx, mark);
@@ -2550,8 +2587,40 @@ pub(crate) fn dedup_root(
         if let Some((rep, pf)) = matched {
             fin = fin.and(pf);
             done.insert(v, rep);
+        } else if let Some((u_orig, rep_v, pf)) = reverse_matched {
+            fin = fin.and(pf);
+            done.insert(u_orig, rep_v);
+            buckets.entry(key).or_default().push(v);
         } else {
             buckets.entry(key).or_default().push(v);
+        }
+    }
+
+    // Propagate any reverse substitutions (`u_orig -> rep_v`) upward to `root`.
+    if !done.is_empty() {
+        for &u in &order {
+            if done
+                .get(&u)
+                .is_some_and(|&mapped| !order.contains(&mapped) || mapped != u)
+                && u != root
+            {
+                // Keep direct peer substitutions on `u`, while rebuilding parents above them.
+            }
+            let node = cx.node(u);
+            let mut kids = [node.a, node.b, node.c];
+            let mut changed = false;
+            for k in kids.iter_mut().take(node.op.arity()) {
+                if let Some(&t) = done.get(k)
+                    && t != *k
+                {
+                    *k = t;
+                    changed = true;
+                }
+            }
+            if changed && (!done.contains_key(&u) || u == root) {
+                let rebuilt = r.build(cx, |cx| cx.rebuild(u, kids))?;
+                done.insert(u, rebuilt);
+            }
         }
     }
 
@@ -2564,10 +2633,28 @@ pub(crate) fn dedup_root(
         return Ok(None);
     }
     super::discard_but(r, cx, before, new_root);
-    let old_sz = match cx
-        .dag_size(&[cx.handle(root)], 1 << 20)
-        .map_err(Stop::Error)?
-    {
+    let (old_roots, new_roots): (Vec<crate::Expr>, Vec<crate::Expr>) =
+        if r.inner.strategy.sharing == crate::engine::Sharing::Roots && r.life.live_roots.len() > 1
+        {
+            let old_r = r
+                .life
+                .live_roots
+                .iter()
+                .enumerate()
+                .map(|(i, &rt)| cx.handle(if i == r.active { root } else { rt }))
+                .collect();
+            let new_r = r
+                .life
+                .live_roots
+                .iter()
+                .enumerate()
+                .map(|(i, &rt)| cx.handle(if i == r.active { new_root } else { rt }))
+                .collect();
+            (old_r, new_r)
+        } else {
+            (vec![cx.handle(root)], vec![cx.handle(new_root)])
+        };
+    let old_sz = match cx.dag_size(&old_roots, 1 << 20).map_err(Stop::Error)? {
         crate::expr::Bounded::Exact(n) => n,
         _ => {
             super::discard(r, cx, before);
@@ -2575,8 +2662,7 @@ pub(crate) fn dedup_root(
         }
     };
     let shrunk = matches!(
-        cx.dag_size(&[cx.handle(new_root)], old_sz - 1)
-            .map_err(Stop::Error)?,
+        cx.dag_size(&new_roots, old_sz - 1).map_err(Stop::Error)?,
         crate::expr::Bounded::Exact(_)
     );
     if !shrunk {
@@ -2612,14 +2698,18 @@ fn prove_masked_equal(
     prefix_bits: Option<u16>,
     circuit_questions: &mut u8,
 ) -> Result<Option<Fin>, Stop> {
-    if a == b || super::views::known(r, a, b) {
-        return Ok(Some(Fin::FINAL));
+    if let Some(vfin) = super::views::known(r, a, b) {
+        return Ok(Some(vfin));
     }
     if let Some(bits) = prefix_bits
         && bits > 1
-        && super::poly::equal_mod(r, cx, a, b, bits)?
     {
-        return Ok(Some(Fin::FINAL));
+        if super::poly::equal_mod(r, cx, a, b, bits)? {
+            return Ok(Some(Fin::FINAL));
+        }
+        if let Some(wfin) = super::words::prove_equal(r, cx, a, b, bits)? {
+            return Ok(Some(wfin));
+        }
     }
     // Simplify both sides under `m` via `demanded::simplify` (exposes high-bit constant noise
     // differences like `0x63007002b3 - x` vs `0x7002b3 - x` inside `Select`/`And`/`Or`).
@@ -2667,8 +2757,8 @@ fn prove_masked_equal(
     if super::poly::equal(r, cx, am, bm)? || super::linear_mba::equal(r, cx, am, bm)? {
         return Ok(Some(fin));
     }
-    if super::views::prove_pair(r, cx, am, bm, circuit_questions)? {
-        return Ok(Some(fin));
+    if let Some(vfin) = super::views::prove_pair(r, cx, am, bm, circuit_questions)? {
+        return Ok(Some(fin.and(vfin)));
     }
     Ok(None)
 }
@@ -3058,12 +3148,14 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     r.demanded.memo = std::mem::take(&mut st.memo);
     if x2 == operand {
+        super::discard(r, cx, before);
         count(r).noop += 1;
         return Ok(Step::Normal(fin));
     }
     let kept = sorted_distinct(&mut stops);
     stops.truncate(kept);
     let e = rebuilt(r, cx, x2)?;
+    super::discard_but(r, cx, before, e);
     r.explain_with(|| crate::engine::Explanation::Demanded {
         operand: cx.handle(operand),
         mask,
@@ -3074,9 +3166,15 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
 /// The pass's state for a call.
 #[derive(Default)]
 pub(crate) struct State {
-    /// Full-width equalities proved over the original words during this call.
+    /// Full-width equalities proved over the original words during this call, with reliance.
     #[cfg(feature = "prove")]
-    pub(crate) view_equal: IdMap<(u32, u32), ()>,
+    pub(crate) view_equal: IdMap<(u32, u32), Fin>,
+    /// Pairs refuted (or exhausted) during speculative view equality checks in this call.
+    #[cfg(feature = "prove")]
+    pub(crate) view_refuted: IdMap<(u32, u32), ()>,
+    /// Memoized `PassWork`-only deterministic `BitVec` signatures across widths `1..=512`.
+    #[cfg(feature = "prove")]
+    pub(crate) view_sigs: IdMap<u32, [BitVec; super::views::LANES]>,
     /// Gates and propagations spent on speculative view equalities in this call.
     #[cfg(feature = "prove")]
     pub(crate) view_work: u64,

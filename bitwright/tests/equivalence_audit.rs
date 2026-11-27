@@ -307,3 +307,227 @@ fn partial_register_writes_preserve_unwritten_bytes() {
     assert_eq!(cx.width(block.register("x0").unwrap()).unwrap(), Width::W64);
     assert!(block.register("x1").is_some());
 }
+
+#[test]
+fn multi_width_bit_provenance_and_poly_refinement() {
+    let eng = engine(false);
+    // 1. Bit-provenance with complement/bitrev/rotate across odd and wide widths `7..=512`.
+    for w in [7u16, 8, 9, 16, 31, 32, 33, 63, 64, 65, 128, 256, 512] {
+        let opts = ParseOptions::width(Width::new(w).unwrap());
+        let sh = (w / 2).max(1);
+        let eq = format!("bitrev(~rotl(x, {sh})) == ~rotr(bitrev(x), {sh})");
+        assert_recovers(&eng, &opts, &eq, None, "1:1");
+    }
+
+    // 2. Coalesced sign-bit provenance: `sext<W>(a:K)` vs `(zext<W>(a:K) ^ 2^(K-1)) - 2^(K-1)`
+    //    inside ring polynomial expressions across odd and wide vector widths.
+    for (k, w) in [
+        (7u16, 15u16),
+        (8, 16),
+        (9, 31),
+        (31, 63),
+        (32, 64),
+        (64, 128),
+        (128, 256),
+        (256, 512),
+    ] {
+        let opts = ParseOptions::width(Width::new(w).unwrap());
+        let mut cx = Context::new();
+        let sign = BitVec::bin_unchecked_for_test_pow2(w, k - 1);
+        let s_lit = format!("{sign}");
+        let src = format!(
+            "let lhs = sext<{w}>(a:{k}) * 5 + y; \
+             let rhs = ((zext<{w}>(a:{k}) ^ {s_lit}) - {s_lit}) * 5 + y; \
+             lhs - rhs"
+        );
+        let e = cx.parse(&src, &opts).unwrap();
+        let out = eng.simplify(&mut cx, e).unwrap().expr;
+        assert_eq!(
+            out,
+            cx.parse("0", &opts).unwrap(),
+            "sext/zext-xor K={k} W={w}: got {}",
+            cx.display(out)
+        );
+    }
+
+    // 3. Disjoint slice partition & overlapping mask Venn refinement in ring polynomials (`1..=512`).
+    for (k, w) in [
+        (4u16, 9u16),
+        (15, 31),
+        (32, 64),
+        (64, 129),
+        (128, 256),
+        (256, 512),
+    ] {
+        let opts = ParseOptions::width(Width::new(w).unwrap());
+        let rest = w - k;
+        let shift = BitVec::bin_unchecked_for_test_pow2(w, k);
+        let src = format!(
+            "let split = zext<{w}>(extract<0, {k}>(x)) + zext<{w}>(extract<{k}, {rest}>(x)) * {shift}; \
+             (split * 3 + z) - (x * 3 + z)"
+        );
+        assert_recovers(&eng, &opts, &src, None, &format!("0:{w}"));
+    }
+
+    for w in [16u16, 64, 128, 256, 512] {
+        let opts = ParseOptions::width(Width::new(w).unwrap());
+        // Overlapping masks `0xff` and `0x3fc`: `(x & m1) + (x & m2) == (x & (m1 | m2)) + (x & (m1 & m2))`.
+        let src = "((x & 0xff) + (x & 0x3fc)) - ((x & 0x3ff) + (x & 0xfc))";
+        assert_recovers(&eng, &opts, src, None, &format!("0:{w}"));
+    }
+
+    // 4. Wide linear MBA rotation-union & complement atom merging at widths `65, 128, 256, 512`.
+    for w in [65u16, 128, 256, 512] {
+        let opts = ParseOptions::width(Width::new(w).unwrap());
+        let rsh = w - 5;
+        let src = format!(
+            "let r1 = rotl(x, 5); \
+             let r2 = (x << 5) | (x >>u {rsh}); \
+             (r1 & y) + (r1 | y) - (r2 + y)"
+        );
+        assert_recovers(&eng, &opts, &src, None, &format!("0:{w}"));
+    }
+}
+
+trait Pow2Ext {
+    fn bin_unchecked_for_test_pow2(w: u16, bit: u16) -> BitVec;
+}
+
+impl Pow2Ext for BitVec {
+    fn bin_unchecked_for_test_pow2(w: u16, bit: u16) -> BitVec {
+        let width = Width::new(w).unwrap();
+        let one = BitVec::one(width);
+        let amt = BitVec::wrapping_from_u64(width, u64::from(bit));
+        BitVec::apply_bin(bitwright::BinOp::Shl, &one, &amt).unwrap()
+    }
+}
+
+#[test]
+fn multi_root_relations_and_z_floor_lens() {
+    let eng = engine(false);
+    // Multi-root runs `[parent(p, q), p]` and `[parent(p, q), q]` across widths `16, 64, 128, 256`.
+    for (w, p, q) in [
+        (16u16, "zext<16>(clz(a:8))", "clz(zext<16>(a:8)) - 8"),
+        (
+            64,
+            "zext<64>(a:32 << (b:32 & 31))",
+            "(zext<64>(a:32) << (zext<64>(b:32) & 31)) & 0xffffffff",
+        ),
+        (
+            128,
+            "concat(extract<64, 64>(x ^ y), trunc<64>(x ^ y))",
+            "x ^ y",
+        ),
+        (256, "(x & 0xff00) + (x & 0x00ff)", "x & 0xffff"),
+    ] {
+        let opts = ParseOptions::width(Width::new(w).unwrap());
+        let parent = format!("let p = {p}; let q = {q}; ((p ^ z) + 9) ^ ((q ^ z) + 9)");
+        let zero = format!("0:{w}");
+        for extra in [None, Some(p), Some(q)] {
+            assert_recovers(&eng, &opts, &parent, extra, &zero);
+        }
+    }
+
+    // Z-floor (`words::prove_equal`) carry/quotient identity inside `Compares` / `Relations`.
+    let opts32 = ParseOptions::width(Width::W32);
+    assert_recovers(
+        &eng,
+        &opts32,
+        "((((x >>u 4) + (y >>u 4) + (((x & 15) + (y & 15)) >>u 4)) & 0x0fffffff) == ((x + y) >>u 4))",
+        None,
+        "1:1",
+    );
+}
+
+#[test]
+fn scoped_relational_slice_and_affine_propagation_is_sound() {
+    let eng = engine(false);
+    let std_eng = Engine::standard();
+
+    // 1. Positive `Select` arm and boolean `And` spine specialization across `16, 64, 256`.
+    for w in [16u16, 64, 256] {
+        let opts = ParseOptions::width(Width::new(w).unwrap());
+        // Partial-slice guard specializes matching demanded slice `(x & 255) ^ (y & 255) -> 0`.
+        assert_recovers(
+            &eng,
+            &opts,
+            "select(trunc<8>(x) == trunc<8>(y), (x & 255) ^ (y & 255), z)",
+            None,
+            "select(trunc<8>(x) == trunc<8>(y), 0, z)",
+        );
+        // Full-width affine guard `x == y + 5` specializes `x - y -> 5`.
+        assert_recovers(
+            &eng,
+            &opts,
+            "select(x == y + 5, x - y, z)",
+            None,
+            "select(x == y + 5, 5, z)",
+        );
+        // Boolean `And` spine contradiction on slice equality vs inequality and affine offset.
+        assert_recovers(
+            &std_eng,
+            &opts,
+            "((x & 255) == (y & 255)) & (trunc<8>(x) != trunc<8>(y))",
+            None,
+            "0:1",
+        );
+        assert_recovers(&std_eng, &opts, "(x == y + 7) & (x - y != 7)", None, "0:1");
+    }
+
+    // 2. `Assumptions` projected slice congruence + `Reliance` tracking + unmasked soundness check.
+    let mut cx = Context::new();
+    let opts = ParseOptions::width(Width::W64);
+    let pred = cx.parse("trunc<8>(x) == trunc<8>(y)", &opts).unwrap();
+    let masked_diff = cx.parse("(x & 0x0f) ^ (y & 0x0f)", &opts).unwrap();
+    let unmasked_diff = cx.parse("x ^ y", &opts).unwrap();
+    let wider_diff = cx.parse("(x & 0x1ff) ^ (y & 0x1ff)", &opts).unwrap();
+
+    let mut assump = bitwright::Assumptions::new();
+    let cid = assump.assume_true(&mut cx, pred).unwrap();
+    let out = std_eng
+        .run(
+            &mut cx,
+            &[masked_diff, unmasked_diff, wider_diff],
+            Run::default().with_assumptions(&assump),
+        )
+        .unwrap();
+    assert_eq!(out.roots[0].expr, cx.parse("0", &opts).unwrap());
+    assert!(out.roots[0].relies_on.may_use(cid));
+
+    // Soundness: unmasked `x ^ y` and wider `(x & 0x1ff) ^ (y & 0x1ff)` MUST NOT collapse to 0!
+    // Evaluate at `x = 0x12a`, `y = 0x02a` (which satisfies `trunc<8>(x) == trunc<8>(y) == 0x2a`).
+    let env = [
+        (
+            bitwright::SymbolKey::from("x"),
+            BitVec::from_u64(Width::W64, 0x12a).unwrap(),
+        ),
+        (
+            bitwright::SymbolKey::from("y"),
+            BitVec::from_u64(Width::W64, 0x02a).unwrap(),
+        ),
+    ];
+    let vals = cx
+        .eval(
+            &[
+                unmasked_diff,
+                out.roots[1].expr,
+                wider_diff,
+                out.roots[2].expr,
+            ],
+            env.as_slice(),
+        )
+        .unwrap();
+    assert_eq!(vals[0], vals[1]);
+    assert_ne!(vals[1], BitVec::zero(Width::W64));
+    assert_eq!(vals[2], vals[3]);
+    assert_ne!(vals[3], BitVec::zero(Width::W64));
+
+    // Near-miss `Select` guard (`trunc<8>(x) == trunc<8>(y)` guarding `x & 511`) must be refuted.
+    let opts16 = ParseOptions::width(Width::W16);
+    check_pair(
+        &opts16,
+        "select(trunc<8>(x) == trunc<8>(y), x & 511, t)",
+        "select(trunc<8>(x) == trunc<8>(y), y & 511, t)",
+        false,
+    );
+}

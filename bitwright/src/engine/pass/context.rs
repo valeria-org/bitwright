@@ -24,31 +24,323 @@
 //! two sides (once the engine has simplified each) as one expression again, the choice as
 //! far down as the sides agree (see `Runner::strategy`).
 
-use crate::Error;
 use crate::expr::{Context, OpCode};
+use crate::facts::known::{bv_and, bv_lshr, bv_not, bv_or, bv_shl, bv_xor, count_ones, low_mask};
 use crate::hash::IdMap;
 use crate::ops::{BinOp, CmpOp, UnOp};
+use crate::{BitVec, Error, Width};
 
-/// Bits of a node a condition fixes: node `x` (at most 64 bits wide) has the bits `mask`
-/// equal to `value`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// Bits of a node a condition fixes across widths `1..=512`: node `x` has bits `mask` equal to
+/// `value`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Fact {
     x: u32,
-    mask: u64,
-    value: u64,
+    mask: BitVec,
+    value: BitVec,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RelOp {
+    Equal,
+    Xor(BitVec),
+    Add(BitVec),
+    SubFrom(BitVec),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RelFact {
+    /// Full-width functional relation `hi == f(lo)` (`lo` is the preferred representative).
+    Full { hi: u32, lo: u32, op: RelOp },
+    /// Partial-mask congruence `(hi ^ lo) & mask == xor_diff` (`0 < mask < ones`).
+    /// Never substitutes unmasked `hi`; only rewrites consumers whose demanded bits on `hi`
+    /// lie inside `mask`.
+    Slice {
+        hi: u32,
+        lo: u32,
+        mask: BitVec,
+        xor_diff: BitVec,
+    },
+}
+
+#[derive(Clone, Debug, Default)]
+struct GuardFacts {
+    bits: Vec<Fact>,
+    rels: Vec<RelFact>,
+    conflict: bool,
+}
+
+impl GuardFacts {
+    fn is_empty(&self) -> bool {
+        !self.conflict && self.bits.is_empty() && self.rels.is_empty()
+    }
+
+    fn extend_from(&mut self, other: &GuardFacts) {
+        self.conflict |= other.conflict;
+        self.bits.extend_from_slice(&other.bits);
+        self.rels.extend_from_slice(&other.rels);
+    }
+}
+
+/// Outcome of inspecting `lhs == rhs` for a two-source bit-slice or full-width congruence.
+pub(crate) enum SliceCheck {
+    None,
+    Conflict,
+    FullEq(u32, u32),
+    Slice {
+        hi: u32,
+        lo: u32,
+        mask: BitVec,
+        xor_diff: BitVec,
+    },
+}
+
+fn orient_pair(cx: &Context, a: u32, b: u32) -> (u32, u32) {
+    let key = |id: u32| (cx.node(id).op != OpCode::Sym, cx.meta[id as usize].tree);
+    match key(a).cmp(&key(b)).then_with(|| cx.order(a, b)) {
+        core::cmp::Ordering::Greater => (b, a),
+        _ => (a, b),
+    }
+}
+
+fn set_range_limbs(limbs: &mut [u64; 8], off: u16, len: u16) {
+    if len == 0 {
+        return;
+    }
+    let start = usize::from(off);
+    let end = start + usize::from(len);
+    let mut pos = start;
+    while pos < end {
+        let word = pos / 64;
+        let bit = pos % 64;
+        let chunk = (end - pos).min(64 - bit);
+        let m = if chunk == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << chunk) - 1) << bit
+        };
+        limbs[word] |= m;
+        pos += chunk;
+    }
+}
+
+/// Extracts a 2-variable bit-slice congruence `(hi ^ lo) & mask == xor_diff` (or full-width
+/// equality / conflict) from `lhs == rhs` via canonical bit-provenance runs (`1..=512` bits).
+pub(crate) fn extract_slice_congruence(cx: &Context, lhs: u32, rhs: u32) -> SliceCheck {
+    use super::shuffle::BitRun;
+    if lhs == rhs {
+        return SliceCheck::None;
+    }
+    let (Some(rl), Some(rr)) = (
+        super::shuffle::bit_runs_of(cx, lhs, 16),
+        super::shuffle::bit_runs_of(cx, rhs, 16),
+    ) else {
+        return SliceCheck::None;
+    };
+    let run_len = |r: BitRun| match r {
+        BitRun::Const { len, .. } | BitRun::Slice { len, .. } => len,
+    };
+    let split = |r: BitRun, take: u16| -> (BitRun, BitRun) {
+        match r {
+            BitRun::Const { val, len } => (
+                BitRun::Const { val, len: take },
+                BitRun::Const {
+                    val,
+                    len: len - take,
+                },
+            ),
+            BitRun::Slice { src, lo, len, inv } => (
+                BitRun::Slice {
+                    src,
+                    lo,
+                    len: take,
+                    inv,
+                },
+                BitRun::Slice {
+                    src,
+                    lo: lo + take,
+                    len: len - take,
+                    inv,
+                },
+            ),
+        }
+    };
+
+    let (mut il, mut ir) = (0usize, 0usize);
+    let (Some(mut cl), Some(mut cr)) = (rl.first().copied(), rr.first().copied()) else {
+        return SliceCheck::None;
+    };
+    let mut pair: Option<(u32, u32)> = None;
+    let mut mask_limbs = [0u64; 8];
+    let mut xor_limbs = [0u64; 8];
+    let mut any_slice = false;
+
+    loop {
+        let step = run_len(cl).min(run_len(cr));
+        let (hl, next_cl) = split(cl, step);
+        let (hr, next_cr) = split(cr, step);
+        match (hl, hr) {
+            (BitRun::Const { val: vl, .. }, BitRun::Const { val: vr, .. }) => {
+                if vl != vr {
+                    return SliceCheck::Conflict;
+                }
+            }
+            (
+                BitRun::Slice {
+                    src: sx,
+                    lo: lx,
+                    inv: ix,
+                    ..
+                },
+                BitRun::Slice {
+                    src: sy,
+                    lo: ly,
+                    inv: iy,
+                    ..
+                },
+            ) => {
+                if sx == sy && lx == ly {
+                    if ix != iy {
+                        return SliceCheck::Conflict;
+                    }
+                } else if lx == ly && cx.wid(sx) == cx.wid(sy) {
+                    match pair {
+                        None => pair = Some((sx, sy)),
+                        Some((px, py)) if px == sx && py == sy => {}
+                        _ => return SliceCheck::None,
+                    }
+                    set_range_limbs(&mut mask_limbs, lx, step);
+                    if ix ^ iy {
+                        set_range_limbs(&mut xor_limbs, lx, step);
+                    }
+                    any_slice = true;
+                } else {
+                    return SliceCheck::None;
+                }
+            }
+            _ => return SliceCheck::None,
+        }
+        cl = if run_len(next_cl) == 0 {
+            il += 1;
+            if il == rl.len() {
+                ir += usize::from(run_len(next_cr) == 0);
+                if ir != rr.len() {
+                    return SliceCheck::None;
+                }
+                break;
+            }
+            rl[il]
+        } else {
+            next_cl
+        };
+        cr = if run_len(next_cr) == 0 {
+            ir += 1;
+            if ir == rr.len() {
+                return SliceCheck::None;
+            }
+            rr[ir]
+        } else {
+            next_cr
+        };
+    }
+
+    if !any_slice {
+        return SliceCheck::None;
+    }
+    let Some((sx, sy)) = pair else {
+        return SliceCheck::None;
+    };
+    let w = cx.width_of(sx);
+    let mask = BitVec::wrapping_from_limbs(w, &mask_limbs);
+    let xor_diff = BitVec::wrapping_from_limbs(w, &xor_limbs);
+    let (lo, hi) = orient_pair(cx, sx, sy);
+    if mask.is_ones() && xor_diff.is_zero() {
+        return SliceCheck::FullEq(lo, hi);
+    }
+    SliceCheck::Slice {
+        hi,
+        lo,
+        mask,
+        xor_diff,
+    }
+}
+
+/// Unwrap simple full-width affine/complement wrappers around a single variable:
+/// `x == base * (±1) + offset` (`negated = true` means `offset - base`).
+fn peel_affine_side(cx: &Context, mut id: u32) -> (u32, bool, BitVec) {
+    let w = cx.width_of(id);
+    let mut neg = false;
+    let mut off = BitVec::zero(w);
+    for _ in 0..6 {
+        if cx.is_const(id) {
+            break;
+        }
+        let n = cx.node(id);
+        match n.op {
+            OpCode::Add => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => {
+                    off = if neg {
+                        BitVec::bin_unchecked(BinOp::Sub, &off, &k)
+                    } else {
+                        BitVec::bin_unchecked(BinOp::Add, &off, &k)
+                    };
+                    id = n.a;
+                }
+                (Some(k), None) => {
+                    off = if neg {
+                        BitVec::bin_unchecked(BinOp::Sub, &off, &k)
+                    } else {
+                        BitVec::bin_unchecked(BinOp::Add, &off, &k)
+                    };
+                    id = n.b;
+                }
+                _ => break,
+            },
+            OpCode::Sub => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => {
+                    off = if neg {
+                        BitVec::bin_unchecked(BinOp::Add, &off, &k)
+                    } else {
+                        BitVec::bin_unchecked(BinOp::Sub, &off, &k)
+                    };
+                    id = n.a;
+                }
+                (Some(k), None) => {
+                    off = if neg {
+                        BitVec::bin_unchecked(BinOp::Sub, &off, &k)
+                    } else {
+                        BitVec::bin_unchecked(BinOp::Add, &off, &k)
+                    };
+                    neg = !neg;
+                    id = n.b;
+                }
+                _ => break,
+            },
+            OpCode::Neg => {
+                neg = !neg;
+                id = n.a;
+            }
+            OpCode::Not => {
+                // `~u == -1 - u`
+                let minus_one = BitVec::ones(w);
+                off = if neg {
+                    BitVec::bin_unchecked(BinOp::Sub, &off, &minus_one)
+                } else {
+                    BitVec::bin_unchecked(BinOp::Add, &off, &minus_one)
+                };
+                neg = !neg;
+                id = n.a;
+            }
+            _ => break,
+        }
+    }
+    (id, neg, off)
 }
 
 /// The most conditions [`push`] reads facts from in one root.
 const MAX_SITES: usize = 512;
 
-/// All ones at node `i`'s width, when it is at most 64 bits.
-fn ones(cx: &Context, i: u32) -> Option<u64> {
-    let w = cx.wid(i);
-    (w <= 64).then(|| u64::MAX >> (64 - u32::from(w)))
-}
-
-/// What 1-bit node `c` being `want` fixes, added to `out`. An unknown shape fixes nothing.
-fn fixes(cx: &Context, c: u32, want: bool, out: &mut Vec<Fact>, depth: u32) {
+/// What 1-bit node `c` being `want` fixes across widths `1..=512`, added to `out`.
+fn fixes(cx: &Context, c: u32, want: bool, out: &mut GuardFacts, depth: u32) {
     if depth > 16 || cx.wid(c) != 1 || cx.is_const(c) {
         return;
     }
@@ -63,101 +355,499 @@ fn fixes(cx: &Context, c: u32, want: bool, out: &mut Vec<Fact>, depth: u32) {
             fixes(cx, n.a, false, out, depth + 1);
             fixes(cx, n.b, false, out, depth + 1);
         }
-        // The comparison itself, and its complement (see [`put`]): `t != 0` in what `t == 0`
-        // being false guards.
         OpCode::Eq | OpCode::Ne => {
-            out.push(Fact {
+            out.bits.push(Fact {
                 x: c,
-                mask: 1,
-                value: u64::from(want),
+                mask: BitVec::one(Width::W1),
+                value: BitVec::from_bool(want),
             });
             if (n.op == OpCode::Eq) != want {
                 return;
             }
-            let (x, k) = match (cx.const_val(n.a), cx.const_val(n.b)) {
-                (None, Some(k)) => (n.a, k),
-                (Some(k), None) => (n.b, k),
-                _ => return,
-            };
-            if let (Some(k), Some(all)) = (k.to_u64(), ones(cx, x)) {
-                masked(cx, x, all, k, out, depth + 1);
+            match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => {
+                    let w = cx.width_of(n.a);
+                    masked(cx, n.a, BitVec::ones(w), k, out, depth + 1);
+                }
+                (Some(k), None) => {
+                    let w = cx.width_of(n.b);
+                    masked(cx, n.b, BitVec::ones(w), k, out, depth + 1);
+                }
+                (None, None) => {
+                    extract_relational_eq(cx, n.a, n.b, out);
+                }
+                (Some(ka), Some(kb)) => {
+                    if ka != kb {
+                        out.conflict = true;
+                    }
+                }
             }
         }
-        _ => out.push(Fact {
+        _ => out.bits.push(Fact {
             x: c,
-            mask: 1,
-            value: u64::from(want),
+            mask: BitVec::one(Width::W1),
+            value: BitVec::from_bool(want),
         }),
     }
 }
 
-/// `x & mask == value`, read through the shifts, extractions, extensions and masks that pick
-/// `x`'s bits from another node's.
-fn masked(cx: &Context, x: u32, mask: u64, value: u64, out: &mut Vec<Fact>, depth: u32) {
-    if mask == 0 || value & !mask != 0 || cx.is_const(x) {
+fn extract_relational_eq(cx: &Context, lhs: u32, rhs: u32, out: &mut GuardFacts) {
+    if lhs == rhs {
+        return;
+    }
+    let mut eq_pair = (lhs, rhs);
+    // 1. Check bit-slice / masked / XOR congruence (also peels `bswap(a) == bswap(b)`,
+    //    `rotl(a, k) == rotl(b, k)`, and `x ^ c1 == y ^ c2`).
+    match extract_slice_congruence(cx, lhs, rhs) {
+        SliceCheck::Conflict => {
+            out.conflict = true;
+            return;
+        }
+        SliceCheck::FullEq(lo, hi) => {
+            out.rels.push(RelFact::Full {
+                hi,
+                lo,
+                op: RelOp::Equal,
+            });
+            // Continue into affine peeling on `(lo, hi)` so `y + 5 == x` (and even
+            // `bswap(y + 5) == bswap(x)`) also extracts `y = x - 5`.
+            eq_pair = (lo, hi);
+        }
+        SliceCheck::Slice {
+            hi,
+            lo,
+            mask,
+            xor_diff,
+        } => {
+            if mask.is_ones() {
+                out.rels.push(RelFact::Full {
+                    hi,
+                    lo,
+                    op: if xor_diff.is_zero() {
+                        RelOp::Equal
+                    } else {
+                        RelOp::Xor(xor_diff)
+                    },
+                });
+                if xor_diff.is_zero() {
+                    eq_pair = (lo, hi);
+                } else {
+                    return;
+                }
+            } else {
+                out.rels.push(RelFact::Slice {
+                    hi,
+                    lo,
+                    mask,
+                    xor_diff,
+                });
+                return;
+            }
+        }
+        SliceCheck::None => {}
+    }
+
+    // 2. Check full-width affine relation (`x + k1 == y + k2`, `x - y == k`, `x + y == k`).
+    let (bx, nx, ox) = peel_affine_side(cx, eq_pair.0);
+    let (by, ny, oy) = peel_affine_side(cx, eq_pair.1);
+    if (bx, by) == eq_pair && !nx && !ny && ox.is_zero() && oy.is_zero() {
+        return;
+    }
+    if cx.is_const(bx) || cx.is_const(by) {
+        // E.g. `(x - y) == 0` peeled? No, `lhs` and `rhs` had no top-level const, unless `(x + k) == k2`.
+        return;
+    }
+    if bx == by {
+        if nx == ny && ox != oy {
+            out.conflict = true;
+        }
+        return;
+    }
+    let (lo, hi) = orient_pair(cx, bx, by);
+    let (n_lo, o_lo, n_hi, o_hi) = if lo == bx {
+        (nx, ox, ny, oy)
+    } else {
+        (ny, oy, nx, ox)
+    };
+    // Solve `(-1)^{n_hi} * hi + o_hi == (-1)^{n_lo} * lo + o_lo` for `hi`:
+    if n_hi == n_lo {
+        // If `n_hi == false`: `hi = lo + (o_lo - o_hi)`.
+        // If `n_hi == true`: `-hi + o_hi = -lo + o_lo => hi = lo + (o_hi - o_lo)`.
+        let delta = if !n_hi {
+            BitVec::bin_unchecked(BinOp::Sub, &o_lo, &o_hi)
+        } else {
+            BitVec::bin_unchecked(BinOp::Sub, &o_hi, &o_lo)
+        };
+        out.rels.push(RelFact::Full {
+            hi,
+            lo,
+            op: if delta.is_zero() {
+                RelOp::Equal
+            } else {
+                RelOp::Add(delta)
+            },
+        });
+    } else {
+        // Opposite signs:
+        // If `n_hi == false, n_lo == true`: `hi + o_hi = -lo + o_lo => hi = (o_lo - o_hi) - lo`.
+        // If `n_hi == true, n_lo == false`: `-hi + o_hi = lo + o_lo => hi = (o_hi - o_lo) - lo`.
+        let sum_k = if !n_hi {
+            BitVec::bin_unchecked(BinOp::Sub, &o_lo, &o_hi)
+        } else {
+            BitVec::bin_unchecked(BinOp::Sub, &o_hi, &o_lo)
+        };
+        out.rels.push(RelFact::Full {
+            hi,
+            lo,
+            op: RelOp::SubFrom(sum_k),
+        });
+    }
+
+    // Also record direct equality of the raw comparison operands `(lhs, rhs)` when distinct from `(bx, by)`.
+    if (lhs, rhs) != (bx, by) && (rhs, lhs) != (bx, by) {
+        let (r_lo, r_hi) = orient_pair(cx, lhs, rhs);
+        out.rels.push(RelFact::Full {
+            hi: r_hi,
+            lo: r_lo,
+            op: RelOp::Equal,
+        });
+    }
+}
+
+/// `x & mask == value`, read through shifts, extractions, extensions, complements, XORs, and
+/// full-width constant offsets across widths `1..=512`.
+fn masked(cx: &Context, x: u32, mask: BitVec, value: BitVec, out: &mut GuardFacts, depth: u32) {
+    if mask.is_zero() || cx.is_const(x) {
+        if let Some(cv) = cx.const_val(x)
+            && bv_and(&cv, &mask) != bv_and(&value, &mask)
+        {
+            out.conflict = true;
+        }
+        return;
+    }
+    if !bv_and(&value, &bv_not(&mask)).is_zero() {
+        out.conflict = true;
         return;
     }
     let n = cx.node(x);
-    let narrow = |src: u32, by: u16| -> Option<(u64, u64)> {
-        // `x`'s bits are `src`'s from `by` up: both moved up by `by`, if none falls off.
-        let all = ones(cx, src)?;
-        let m = mask.checked_shl(u32::from(by))?;
-        (m & all == m && m >> by == mask).then(|| (m, value << by))
-    };
     if depth < 16 {
         match n.op {
             OpCode::LShr | OpCode::Extract => {
                 let by = match n.op {
-                    OpCode::Extract => Some(n.b as u16),
-                    _ => cx.const_val(n.b).and_then(|k| k.to_u64()).map(|k| k as u16),
+                    OpCode::Extract => Some(n.b),
+                    _ => cx
+                        .const_val(n.b)
+                        .and_then(|k| k.to_u64())
+                        .and_then(|k| u32::try_from(k).ok()),
                 };
-                if let Some((m, v)) = by.and_then(|by| narrow(n.a, by)) {
-                    return masked(cx, n.a, m, v, out, depth + 1);
+                if let Some(by) = by {
+                    let src_w = cx.width_of(n.a);
+                    if by < u32::from(src_w.bits()) {
+                        let m_wide = resize_bv(&mask, src_w);
+                        let v_wide = resize_bv(&value, src_w);
+                        let m_up = bv_shl(&m_wide, by);
+                        if resize_bv(&bv_lshr(&m_up, by), mask.width()) == mask {
+                            return masked(cx, n.a, m_up, bv_shl(&v_wide, by), out, depth + 1);
+                        }
+                    }
+                }
+            }
+            OpCode::Shl => {
+                if let Some(by) = cx
+                    .const_val(n.b)
+                    .and_then(|k| k.to_u64())
+                    .and_then(|k| u32::try_from(k).ok())
+                    && by < u32::from(mask.width().bits())
+                {
+                    let low_zeros = low_mask(mask.width(), by);
+                    if !bv_and(&value, &bv_and(&mask, &low_zeros)).is_zero() {
+                        out.conflict = true;
+                        return;
+                    }
+                    let m_down = bv_lshr(&mask, by);
+                    let v_down = bv_lshr(&value, by);
+                    return masked(cx, n.a, m_down, v_down, out, depth + 1);
                 }
             }
             OpCode::Zext => {
-                if let Some(inner) = ones(cx, n.a)
-                    && value & !inner == 0
-                {
-                    return masked(cx, n.a, mask & inner, value, out, depth + 1);
+                let iw = cx.width_of(n.a);
+                let hi_bits = bv_not(&low_mask(mask.width(), u32::from(iw.bits())));
+                if !bv_and(&value, &bv_and(&mask, &hi_bits)).is_zero() {
+                    out.conflict = true;
+                    return;
                 }
+                let m_in = resize_bv(&mask, iw);
+                let v_in = resize_bv(&value, iw);
+                return masked(cx, n.a, m_in, v_in, out, depth + 1);
             }
             OpCode::And => {
-                let k = cx.const_val(n.b).or_else(|| cx.const_val(n.a));
-                let y = if cx.is_const(n.b) { n.a } else { n.b };
-                if let Some(k) = k.and_then(|k| k.to_u64()) {
-                    return masked(cx, y, mask & k, value & k, out, depth + 1);
+                let pair = match (cx.const_val(n.a), cx.const_val(n.b)) {
+                    (None, Some(k)) => Some((n.a, k)),
+                    (Some(k), None) => Some((n.b, k)),
+                    _ => None,
+                };
+                if let Some((y, k)) = pair {
+                    if !bv_and(&value, &bv_and(&mask, &bv_not(&k))).is_zero() {
+                        out.conflict = true;
+                        return;
+                    }
+                    return masked(cx, y, bv_and(&mask, &k), bv_and(&value, &k), out, depth + 1);
                 }
             }
+            OpCode::Or => {
+                let pair = match (cx.const_val(n.a), cx.const_val(n.b)) {
+                    (None, Some(k)) => Some((n.a, k)),
+                    (Some(k), None) => Some((n.b, k)),
+                    _ => None,
+                };
+                if let Some((y, k)) = pair {
+                    // Where `k` is 1, `(y | k)` is 1, so `value` on `mask & k` must be `mask & k`.
+                    let must_one = bv_and(&mask, &k);
+                    if bv_and(&value, &must_one) != must_one {
+                        out.conflict = true;
+                        return;
+                    }
+                    let rem_m = bv_and(&mask, &bv_not(&k));
+                    return masked(cx, y, rem_m, bv_and(&value, &rem_m), out, depth + 1);
+                }
+            }
+            OpCode::Not => {
+                return masked(
+                    cx,
+                    n.a,
+                    mask,
+                    bv_and(&bv_not(&value), &mask),
+                    out,
+                    depth + 1,
+                );
+            }
+            OpCode::Xor => {
+                let pair = match (cx.const_val(n.a), cx.const_val(n.b)) {
+                    (None, Some(k)) => Some((n.a, k)),
+                    (Some(k), None) => Some((n.b, k)),
+                    _ => None,
+                };
+                if let Some((y, k)) = pair {
+                    return masked(
+                        cx,
+                        y,
+                        mask,
+                        bv_and(&bv_xor(&value, &k), &mask),
+                        out,
+                        depth + 1,
+                    );
+                }
+            }
+            OpCode::Add if mask.is_ones() => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => {
+                    return masked(
+                        cx,
+                        n.a,
+                        mask,
+                        BitVec::bin_unchecked(BinOp::Sub, &value, &k),
+                        out,
+                        depth + 1,
+                    );
+                }
+                (Some(k), None) => {
+                    return masked(
+                        cx,
+                        n.b,
+                        mask,
+                        BitVec::bin_unchecked(BinOp::Sub, &value, &k),
+                        out,
+                        depth + 1,
+                    );
+                }
+                // `(a - b) + k == value` when `value == k` means `a == b`!
+                _ => {}
+            },
+            OpCode::Sub if mask.is_ones() => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                (None, Some(k)) => {
+                    return masked(
+                        cx,
+                        n.a,
+                        mask,
+                        BitVec::bin_unchecked(BinOp::Add, &value, &k),
+                        out,
+                        depth + 1,
+                    );
+                }
+                (Some(k), None) => {
+                    return masked(
+                        cx,
+                        n.b,
+                        mask,
+                        BitVec::bin_unchecked(BinOp::Sub, &k, &value),
+                        out,
+                        depth + 1,
+                    );
+                }
+                (None, None) if value.is_zero() => {
+                    extract_relational_eq(cx, n.a, n.b, out);
+                    return;
+                }
+                _ => {}
+            },
             _ => {}
         }
+        if mask.is_ones() && n.op == OpCode::Xor && value.is_zero() {
+            extract_relational_eq(cx, n.a, n.b, out);
+            return;
+        }
     }
-    out.push(Fact { x, mask, value });
+    out.bits.push(Fact { x, mask, value });
 }
 
-/// `e` with each node `facts` fix bits of written with those bits: `(x & !mask) | value`,
-/// or `value` where every bit is fixed.
-fn put(cx: &mut Context, e: u32, facts: &[Fact]) -> Result<u32, Error> {
-    if facts.is_empty() {
-        return Ok(e);
+fn resize_bv(v: &BitVec, w: Width) -> BitVec {
+    match v.width().bits().cmp(&w.bits()) {
+        core::cmp::Ordering::Equal => *v,
+        core::cmp::Ordering::Less => v.zext(w).unwrap_or_else(|_| BitVec::zero(w)),
+        core::cmp::Ordering::Greater => v.trunc(w).unwrap_or_else(|_| BitVec::zero(w)),
     }
+}
+
+/// Collapses multi-node affine (`Add`/`Sub`/`Neg`/`Not`) and `Xor` cancellations introduced by
+/// relational substitution (e.g. `(x + -5) + 5 -> x`, `x - (x + -5) -> 5`, `(x ^ c1) ^ x -> c1`,
+/// `(y + 7) - y != 7 -> false`) in O(1) without waiting for a later linear/xor pass.
+fn simplify_rebuilt(cx: &mut Context, id: u32) -> Result<u32, Error> {
+    if cx.is_const(id) {
+        return Ok(id);
+    }
+    let nd = cx.node(id);
+    match nd.op {
+        OpCode::Add | OpCode::Sub => {
+            let (bx, nx, ox) = peel_affine_side(cx, nd.a);
+            let (by, ny, oy) = peel_affine_side(cx, nd.b);
+            let cancels = if nd.op == OpCode::Sub {
+                bx == by && nx == ny
+            } else {
+                bx == by && nx != ny
+            };
+            if cancels {
+                let val = if nd.op == OpCode::Sub {
+                    BitVec::bin_unchecked(BinOp::Sub, &ox, &oy)
+                } else {
+                    BitVec::bin_unchecked(BinOp::Add, &ox, &oy)
+                };
+                return cx.mk_const(&val);
+            }
+            let (b, neg, off) = peel_affine_side(cx, id);
+            if b != id && !cx.is_const(b) {
+                let cand = if !neg {
+                    if off.is_zero() {
+                        b
+                    } else {
+                        let kc = cx.mk_const(&off)?;
+                        cx.c_bin(BinOp::Add, b, kc)?
+                    }
+                } else if off.is_zero() {
+                    cx.c_un(UnOp::Neg, b)?
+                } else {
+                    let kc = cx.mk_const(&off)?;
+                    cx.c_bin(BinOp::Sub, kc, b)?
+                };
+                if cx.meta[cand as usize].tree < cx.meta[id as usize].tree {
+                    return Ok(cand);
+                }
+            }
+        }
+        OpCode::Xor => {
+            let peel_xor = |cx: &Context, mut x: u32| -> (u32, BitVec) {
+                let w = cx.width_of(x);
+                let mut mask = BitVec::zero(w);
+                for _ in 0..4 {
+                    if cx.is_const(x) {
+                        break;
+                    }
+                    let n = cx.node(x);
+                    match n.op {
+                        OpCode::Not => {
+                            mask = bv_not(&mask);
+                            x = n.a;
+                        }
+                        OpCode::Xor => match (cx.const_val(n.a), cx.const_val(n.b)) {
+                            (None, Some(k)) => {
+                                mask = bv_xor(&mask, &k);
+                                x = n.a;
+                            }
+                            (Some(k), None) => {
+                                mask = bv_xor(&mask, &k);
+                                x = n.b;
+                            }
+                            _ => break,
+                        },
+                        _ => break,
+                    }
+                }
+                (x, mask)
+            };
+            let (bx, mx) = peel_xor(cx, nd.a);
+            let (by, my) = peel_xor(cx, nd.b);
+            if bx == by {
+                return cx.mk_const(&bv_xor(&mx, &my));
+            }
+            let (b, m) = peel_xor(cx, id);
+            if b != id && !cx.is_const(b) {
+                let cand = if m.is_zero() {
+                    b
+                } else if m.is_ones() {
+                    cx.c_un(UnOp::Not, b)?
+                } else {
+                    let kc = cx.mk_const(&m)?;
+                    cx.c_bin(BinOp::Xor, b, kc)?
+                };
+                if cx.meta[cand as usize].tree < cx.meta[id as usize].tree {
+                    return Ok(cand);
+                }
+            }
+        }
+        OpCode::Eq | OpCode::Ne => {
+            let (bx, nx, ox) = peel_affine_side(cx, nd.a);
+            let (by, ny, oy) = peel_affine_side(cx, nd.b);
+            if bx == by && nx == ny {
+                let eq = ox == oy;
+                let res = if nd.op == OpCode::Eq { eq } else { !eq };
+                return cx.mk_const_u64(1, u64::from(res));
+            }
+        }
+        _ => {}
+    }
+    Ok(id)
+}
+
+/// Merge bit-facts and detect contradictions (`true` when contradictory).
+fn merge_bit_facts(facts: &[Fact]) -> Result<Vec<Fact>, ()> {
     let mut merged: Vec<Fact> = Vec::new();
     for f in facts {
         match merged.iter_mut().find(|m| m.x == f.x) {
-            // Facts that disagree: the guard never holds, and nothing is put in.
-            Some(m) if (m.value ^ f.value) & m.mask & f.mask != 0 => return Ok(e),
             Some(m) => {
-                m.value |= f.value;
-                m.mask |= f.mask;
+                let shared = bv_and(&m.mask, &f.mask);
+                if !bv_and(&bv_xor(&m.value, &f.value), &shared).is_zero() {
+                    return Err(());
+                }
+                m.value = bv_or(&m.value, &f.value);
+                m.mask = bv_or(&m.mask, &f.mask);
             }
-            None => merged.push(*f),
+            None => merged.push(f.clone()),
         }
     }
-    // A comparison fixed fixes its complement: `a != b` is `!(a == b)`.
+    Ok(merged)
+}
+
+/// `e` with each node `gf` fixes bits or relations of specialized soundly.
+fn put(cx: &mut Context, e: u32, gf: &GuardFacts) -> Result<u32, Error> {
+    if gf.conflict || gf.is_empty() {
+        return Ok(e);
+    }
+    let Ok(mut merged) = merge_bit_facts(&gf.bits) else {
+        // Contradictory guard: unreachable branch, leave `e` unchanged.
+        return Ok(e);
+    };
     let mut more = Vec::new();
     for f in &merged {
         let n = cx.node(f.x);
-        if f.mask == 1 && n.width == 1 && matches!(n.op, OpCode::Eq | OpCode::Ne) {
+        if n.width == 1 && f.mask.is_ones() && matches!(n.op, OpCode::Eq | OpCode::Ne) {
             let other = if n.op == OpCode::Eq {
                 CmpOp::Ne
             } else {
@@ -167,32 +857,217 @@ fn put(cx: &mut Context, e: u32, facts: &[Fact]) -> Result<u32, Error> {
             if c != f.x && !merged.iter().any(|m| m.x == c) && cx.wid(c) == 1 && !cx.is_const(c) {
                 more.push(Fact {
                     x: c,
-                    mask: 1,
-                    value: f.value ^ 1,
+                    mask: BitVec::one(Width::W1),
+                    value: BitVec::from_bool(f.value.is_zero()),
                 });
             }
         }
     }
     merged.extend(more);
+
+    let cone = cx.post_order_ids(&[e]);
+    let in_cone: IdMap<u32, ()> = cone.iter().map(|&id| (id, ())).collect();
+
     let mut repl: IdMap<u32, u32> = IdMap::default();
     for f in merged {
-        let w = cx.wid(f.x);
-        let Some(all) = ones(cx, f.x) else { continue };
-        let v = cx.mk_const_u64(w, f.value)?;
-        let r = if f.mask == all {
+        if !in_cone.contains_key(&f.x) {
+            continue;
+        }
+        let v = cx.mk_const(&f.value)?;
+        let r = if f.mask.is_ones() {
             v
         } else {
-            let keep = cx.mk_const_u64(w, all & !f.mask)?;
+            let keep = cx.mk_const(&bv_not(&f.mask))?;
             let rest = cx.c_bin(BinOp::And, f.x, keep)?;
             cx.c_bin(BinOp::Or, rest, v)?
         };
         repl.insert(f.x, r);
     }
-    Ok(cx.substitute_ids(&[e], &repl)?[0])
+
+    let mut slice_rels: Vec<(u32, u32, BitVec, BitVec)> = Vec::new();
+    for rel in &gf.rels {
+        match rel {
+            RelFact::Full { hi, lo, op } => {
+                if !in_cone.contains_key(hi) || repl.contains_key(hi) {
+                    continue;
+                }
+                let r = match op {
+                    RelOp::Equal => *lo,
+                    RelOp::Xor(c) if c.is_ones() => cx.c_un(UnOp::Not, *lo)?,
+                    RelOp::Xor(c) => {
+                        if !in_cone.contains_key(lo) {
+                            continue;
+                        }
+                        let kc = cx.mk_const(c)?;
+                        cx.c_bin(BinOp::Xor, *lo, kc)?
+                    }
+                    RelOp::Add(c) => {
+                        if !in_cone.contains_key(lo) {
+                            continue;
+                        }
+                        let kc = cx.mk_const(c)?;
+                        cx.c_bin(BinOp::Add, *lo, kc)?
+                    }
+                    RelOp::SubFrom(c) => {
+                        if !in_cone.contains_key(lo) {
+                            continue;
+                        }
+                        let kc = cx.mk_const(c)?;
+                        cx.c_bin(BinOp::Sub, kc, *lo)?
+                    }
+                };
+                repl.insert(*hi, r);
+            }
+            RelFact::Slice {
+                hi,
+                lo,
+                mask,
+                xor_diff,
+            } => {
+                if in_cone.contains_key(hi) {
+                    slice_rels.push((*hi, *lo, *mask, *xor_diff));
+                }
+            }
+        }
+    }
+
+    if repl.is_empty() && slice_rels.is_empty() {
+        return Ok(e);
+    }
+
+    // Bottom-up cone rebuild that applies full-node `repl`, local ring/xor simplification of
+    // substituted terms, AND site-scoped `slice_rels` (only rewriting `hi` inside consumers `u`
+    // whose demanded mask on `hi` lies inside `mask`, leaving any unmasked reads of `hi`
+    // completely untouched!).
+    let mut map: IdMap<u32, u32> = repl;
+    for &u in &cone {
+        if map.contains_key(&u) {
+            continue;
+        }
+        let nd = cx.node(u);
+        let arity = nd.op.arity();
+        if arity == 0 {
+            continue;
+        }
+        let mut kids = [nd.a, nd.b, nd.c];
+        let mut changed = false;
+        for k in kids.iter_mut().take(arity) {
+            if let Some(&m) = map.get(k) {
+                changed |= m != *k;
+                *k = m;
+            }
+        }
+        let u_rebuilt = if changed {
+            let r = cx.rebuild(u, kids)?;
+            simplify_rebuilt(cx, r)?
+        } else {
+            u
+        };
+        let mut final_u = u_rebuilt;
+        if !slice_rels.is_empty()
+            && let Some((operand, dem_mask)) = super::demanded::observed(cx, u_rebuilt)
+        {
+            for &(hi, lo, ref mask, ref xor_diff) in &slice_rels {
+                if operand == hi && bv_and(&dem_mask, &bv_not(mask)).is_zero() {
+                    let lo_cur = map.get(&lo).copied().unwrap_or(lo);
+                    let sub_xor = bv_and(xor_diff, &dem_mask);
+                    let repl_op = if sub_xor.is_zero() {
+                        lo_cur
+                    } else if sub_xor == dem_mask {
+                        cx.c_un(UnOp::Not, lo_cur)?
+                    } else {
+                        let kc = cx.mk_const(&sub_xor)?;
+                        cx.c_bin(BinOp::Xor, lo_cur, kc)?
+                    };
+                    let und = cx.node(u_rebuilt);
+                    let mut ukids = [und.a, und.b, und.c];
+                    for k in ukids.iter_mut().take(und.op.arity()) {
+                        if *k == operand {
+                            *k = repl_op;
+                        }
+                    }
+                    let r2 = cx.rebuild(u_rebuilt, ukids)?;
+                    final_u = simplify_rebuilt(cx, r2)?;
+                    break;
+                }
+            }
+        }
+        if final_u != u {
+            map.insert(u, final_u);
+        }
+    }
+    Ok(map.get(&e).copied().unwrap_or(e))
+}
+
+/// Specialize `arm` assuming 1-bit condition `cond == want` (for `Select` arms in `compares`).
+pub(super) fn specialize_arm(
+    cx: &mut Context,
+    arm: u32,
+    cond: u32,
+    want: bool,
+) -> Result<u32, Error> {
+    let mut gf = GuardFacts::default();
+    fixes(cx, cond, want, &mut gf, 0);
+    if gf.conflict || gf.is_empty() {
+        return Ok(arm);
+    }
+    put(cx, arm, &gf)
+}
+
+/// Specialize a 1-bit `And` (`want = true`) or `Or` (`want = false`) binary node by propagating
+/// each side's bit/relational facts into its sibling (and detecting contradictory conjuncts/tautologous disjuncts).
+pub(super) fn specialize_bool_bin(cx: &mut Context, n: u32) -> Result<Option<u32>, Error> {
+    let nd = cx.node(n);
+    let want = match nd.op {
+        OpCode::And if nd.width == 1 => true,
+        OpCode::Or if nd.width == 1 => false,
+        _ => return Ok(None),
+    };
+    let (mut fa, mut fb) = (GuardFacts::default(), GuardFacts::default());
+    fixes(cx, nd.a, want, &mut fa, 0);
+    fixes(cx, nd.b, want, &mut fb, 0);
+    if fa.is_empty() && fb.is_empty() {
+        return Ok(None);
+    }
+    if fa.conflict || fb.conflict {
+        return cx.mk_const_u64(1, u64::from(!want)).map(Some);
+    }
+    let mut both = fa.clone();
+    both.extend_from(&fb);
+    if merge_bit_facts(&both.bits).is_err() {
+        return cx.mk_const_u64(1, u64::from(!want)).map(Some);
+    }
+    let op = if want { BinOp::And } else { BinOp::Or };
+    // Try propagating the smaller/simpler guard side into the heavier side first.
+    let a_into_b = cx.meta[nd.a as usize].tree <= cx.meta[nd.b as usize].tree;
+    let first = if a_into_b {
+        let b2 = put(cx, nd.b, &fa)?;
+        (b2 != nd.b).then_some((nd.a, b2))
+    } else {
+        let a2 = put(cx, nd.a, &fb)?;
+        (a2 != nd.a).then_some((a2, nd.b))
+    };
+    let pair = match first {
+        Some(p) => Some(p),
+        None if a_into_b => {
+            let a2 = put(cx, nd.a, &fb)?;
+            (a2 != nd.a).then_some((a2, nd.b))
+        }
+        None => {
+            let b2 = put(cx, nd.b, &fa)?;
+            (b2 != nd.b).then_some((nd.a, b2))
+        }
+    };
+    let Some((na, nb)) = pair else {
+        return Ok(None);
+    };
+    let out = cx.c_bin(op, na, nb)?;
+    Ok((out != n).then_some(out))
 }
 
 /// `root` with what each condition fixes put into the operands it guards (see the module),
 /// or `None` when no condition fixes anything, or the root would grow past `max_new` nodes.
+#[cfg_attr(not(feature = "mba"), allow(dead_code))]
 pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u32>, Error> {
     const MAX_SPINE: usize = 128;
     let start = cx.len() as u32;
@@ -269,15 +1144,19 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
                 } else if leaves.len() == 1 {
                     leaves[0]
                 } else {
-                    let mut leaf_facts: Vec<Vec<Fact>> = Vec::with_capacity(leaves.len());
+                    let mut leaf_facts: Vec<GuardFacts> = Vec::with_capacity(leaves.len());
                     let mut any_facts = false;
+                    let mut conflict = false;
                     for &l in &leaves {
-                        let mut lf = Vec::new();
+                        let mut lf = GuardFacts::default();
                         fixes(cx, l, true, &mut lf, 0);
+                        conflict |= lf.conflict;
                         any_facts |= !lf.is_empty();
                         leaf_facts.push(lf);
                     }
-                    if !any_facts {
+                    if conflict {
+                        cx.mk_const_u64(1, 0)?
+                    } else if !any_facts {
                         let mut iter = leaves.iter().copied();
                         let mut acc = iter.next().unwrap();
                         for l in iter {
@@ -288,43 +1167,30 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
                         }
                         acc
                     } else {
-                        // Every fact emitted by `fixes(.., true)` is a necessary consequence of
-                        // its conjunct holding: conflicting bit assignments across sibling
-                        // conjuncts prove the conjunction unsatisfiable (`0`).
-                        let mut check_merged: Vec<Fact> = Vec::new();
-                        let mut conflict = false;
-                        'conflict_scan: for lf in &leaf_facts {
-                            for f in lf {
-                                match check_merged.iter_mut().find(|m| m.x == f.x) {
-                                    Some(m) if (m.value ^ f.value) & m.mask & f.mask != 0 => {
-                                        conflict = true;
-                                        break 'conflict_scan;
-                                    }
-                                    Some(m) => {
-                                        m.value |= f.value;
-                                        m.mask |= f.mask;
-                                    }
-                                    None => check_merged.push(*f),
-                                }
-                            }
+                        let mut all_bits: Vec<Fact> = Vec::new();
+                        for lf in &leaf_facts {
+                            all_bits.extend_from_slice(&lf.bits);
                         }
-                        if conflict {
+                        if merge_bit_facts(&all_bits).is_err() {
                             cx.mk_const_u64(1, 0)?
                         } else {
-                            // Propagate asymmetrically along a deterministic priority order
-                            // (guards fixing symbols first, then guards fixing other nodes,
-                            // smallest height first; heavy non-guard subgraphs last):
-                            // `L_p0 & L_p1[F_0] & ... & L_pk[F_0 ∪ ... ∪ F_{k-1}]` is sound at
-                            // every input and substitutes each heavy conjunct at most once.
                             let tier = |idx: usize| -> u8 {
                                 let l = leaves[idx];
                                 let lf = &leaf_facts[idx];
-                                if lf
+                                let fixes_sym = lf
+                                    .bits
                                     .iter()
                                     .any(|f| f.x != l && cx.node(f.x).op == OpCode::Sym)
-                                {
+                                    || lf.rels.iter().any(|r| match r {
+                                        RelFact::Full { hi, lo, .. }
+                                        | RelFact::Slice { hi, lo, .. } => {
+                                            cx.node(*hi).op == OpCode::Sym
+                                                || cx.node(*lo).op == OpCode::Sym
+                                        }
+                                    });
+                                if fixes_sym {
                                     0
-                                } else if lf.iter().any(|f| f.x != l) {
+                                } else if lf.bits.iter().any(|f| f.x != l) || !lf.rels.is_empty() {
                                     1
                                 } else {
                                     2
@@ -336,7 +1202,7 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
                                 (tier(idx), cx.meta[l].height, cx.meta[l].tree, idx)
                             });
                             let mut rewritten = leaves.clone();
-                            let mut prefix_facts: Vec<Fact> = Vec::new();
+                            let mut prefix_facts = GuardFacts::default();
                             let mut any_changed = false;
                             for &idx in &perm {
                                 if cx.len() as u32 - start > max_new {
@@ -349,14 +1215,12 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
                                         any_changed = true;
                                     }
                                 }
-                                prefix_facts.extend_from_slice(&leaf_facts[idx]);
+                                prefix_facts.extend_from(&leaf_facts[idx]);
                             }
-                            // If forward propagation changed nothing, `perm[1..]` are untouched,
-                            // so rewriting `perm[0]` alone under `perm[1..]`'s facts is also sound.
                             if !any_changed && perm.len() >= 2 {
-                                let mut suffix_facts = Vec::new();
+                                let mut suffix_facts = GuardFacts::default();
                                 for &idx in &perm[1..] {
-                                    suffix_facts.extend_from_slice(&leaf_facts[idx]);
+                                    suffix_facts.extend_from(&leaf_facts[idx]);
                                 }
                                 let first = perm[0];
                                 let l2 = put(cx, leaves[first], &suffix_facts)?;
@@ -386,7 +1250,7 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
                 }
             }
             OpCode::Select => {
-                let (mut ft, mut ff) = (Vec::new(), Vec::new());
+                let (mut ft, mut ff) = (GuardFacts::default(), GuardFacts::default());
                 fixes(cx, n.a, true, &mut ft, 0);
                 fixes(cx, n.a, false, &mut ff, 0);
                 if ft.is_empty() && ff.is_empty() {
@@ -410,7 +1274,7 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
                     (None, Some(c)) => (c, n.a),
                     _ => continue,
                 };
-                let mut fc = Vec::new();
+                let mut fc = GuardFacts::default();
                 fixes(cx, c, true, &mut fc, 0);
                 if fc.is_empty() {
                     continue;
@@ -441,6 +1305,7 @@ pub(super) fn push(cx: &mut Context, root: u32, max_new: u32) -> Result<Option<u
 
 /// The condition `root` is split on by [`sides`]: the one most of its selects (and `zext(c)`
 /// factors) test, a condition and its complement counted as one, when one is tested twice.
+#[cfg_attr(not(feature = "mba"), allow(dead_code))]
 pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Error> {
     let order = cx.post_order_ids(&[root]);
     let is_bool_root = cx.wid(root) == 1;
@@ -479,18 +1344,20 @@ pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Er
         entry.1 += fan;
     }
     let sym_bits = |cx: &Context, c: u32| -> u32 {
-        let mut ft = Vec::new();
+        let mut ft = GuardFacts::default();
         fixes(cx, c, true, &mut ft, 0);
         if ft
+            .bits
             .iter()
-            .all(|f| cx.node(f.x).op != OpCode::Sym || f.mask.count_ones() < 2)
+            .all(|f| cx.node(f.x).op != OpCode::Sym || count_ones(&f.mask) < 2)
         {
-            ft.clear();
+            ft = GuardFacts::default();
             fixes(cx, c, false, &mut ft, 0);
         }
-        ft.into_iter()
-            .filter(|f| cx.node(f.x).op == OpCode::Sym && f.mask.count_ones() >= 2)
-            .map(|f| f.mask.count_ones())
+        ft.bits
+            .into_iter()
+            .filter(|f| cx.node(f.x).op == OpCode::Sym && count_ones(&f.mask) >= 2)
+            .map(|f| count_ones(&f.mask))
             .max()
             .unwrap_or(0)
     };
@@ -506,6 +1373,7 @@ pub(super) fn most_tested(cx: &mut Context, root: u32) -> Result<Option<u32>, Er
 /// Whether `root` has at least two `select` sites — or a shared multi-reader `select` (`uses >= 2`)
 /// after hoisting — guarded by a condition (or its complement) that fixes at least 2 bits of an
 /// input symbol (`OpCode::Sym`).
+#[cfg_attr(not(feature = "mba"), allow(dead_code))]
 pub(super) fn has_sym_select_guard(cx: &mut Context, root: u32) -> bool {
     let order = cx.post_order_ids(&[root]);
     let mut node_uses: IdMap<u32, u32> = IdMap::default();
@@ -541,17 +1409,19 @@ pub(super) fn has_sym_select_guard(cx: &mut Context, root: u32) -> bool {
         if count < 2 {
             return false;
         }
-        let mut f = Vec::new();
+        let mut f = GuardFacts::default();
         fixes(cx, c, true, &mut f, 0);
-        if f.iter()
-            .any(|fx| cx.node(fx.x).op == OpCode::Sym && fx.mask.count_ones() >= 2)
+        if f.bits
+            .iter()
+            .any(|fx| cx.node(fx.x).op == OpCode::Sym && count_ones(&fx.mask) >= 2)
         {
             return true;
         }
-        f.clear();
+        f = GuardFacts::default();
         fixes(cx, c, false, &mut f, 0);
-        f.iter()
-            .any(|fx| cx.node(fx.x).op == OpCode::Sym && fx.mask.count_ones() >= 2)
+        f.bits
+            .iter()
+            .any(|fx| cx.node(fx.x).op == OpCode::Sym && count_ones(&fx.mask) >= 2)
     })
 }
 
@@ -559,6 +1429,7 @@ pub(super) fn has_sym_select_guard(cx: &mut Context, root: u32) -> bool {
 /// it fixes put in, and `root` with what its complement fixes put in (see [`put`]);
 /// `select(c, t, f)` is `root`. `None` when no condition is tested twice, or neither side
 /// changes.
+#[cfg_attr(not(feature = "mba"), allow(dead_code))]
 pub(super) fn sides(cx: &mut Context, root: u32) -> Result<Option<(u32, u32, u32)>, Error> {
     let Some(c) = most_tested(cx, root)? else {
         return Ok(None);
@@ -569,8 +1440,9 @@ pub(super) fn sides(cx: &mut Context, root: u32) -> Result<Option<(u32, u32, u32
 /// [`sides`] on the condition `c`: `root` where `c` holds and where it does not, at an input
 /// where `c` holds the first is `root`'s value, at any other the second. `None` when neither
 /// differs from `root`.
+#[cfg_attr(not(feature = "mba"), allow(dead_code))]
 pub(super) fn sides_on(cx: &mut Context, root: u32, c: u32) -> Result<Option<(u32, u32)>, Error> {
-    let (mut ft, mut ff) = (Vec::new(), Vec::new());
+    let (mut ft, mut ff) = (GuardFacts::default(), GuardFacts::default());
     fixes(cx, c, true, &mut ft, 0);
     fixes(cx, c, false, &mut ff, 0);
     let (t, f) = (put(cx, root, &ft)?, put(cx, root, &ff)?);
@@ -610,6 +1482,7 @@ impl Dep {
 /// complement (`a != b` beside `a == b`) are one variable: the spelling met first, with the
 /// other's value its negation. A piece is evaluated with the variables written as constants, which
 /// the context folds to a constant for each case: the table is exact, at every input.
+#[cfg_attr(not(feature = "mba"), allow(dead_code))]
 pub(super) fn cut(cx: &mut Context, root: u32, fuel: u64) -> Result<Option<u32>, Error> {
     let order = cx.post_order_ids(&[root]);
     let mut dep: IdMap<u32, Dep> = IdMap::default();
@@ -810,6 +1683,7 @@ const MAX_JOIN_DEPTH: u32 = 512;
 /// merged operand is `t`'s, elsewhere `f`'s. A shift or a rotation keeps its amount (two
 /// amounts are two operations), and at most [`MAX_JOINED`] pairs of nodes are merged; past
 /// that, and where the sides differ in operator, the select is written.
+#[cfg_attr(not(feature = "mba"), allow(dead_code))]
 pub(super) fn join(cx: &mut Context, c: u32, t: u32, f: u32) -> Result<u32, Error> {
     fn go(
         cx: &mut Context,

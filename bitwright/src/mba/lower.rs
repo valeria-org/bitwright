@@ -450,12 +450,78 @@ fn deduplicate_peers(
     }
     let mut peers: Vec<PeerSolved> = Vec::new();
     let mut keep = vec![true; atoms.len()];
+    let bit_runs: Vec<Option<Vec<crate::engine::pass::shuffle::BitRun>>> = atoms
+        .iter()
+        .map(|&a| crate::engine::pass::shuffle::bit_runs_of(cx, a, 24))
+        .collect();
     for j in 0..atoms.len() {
         if !keep[j] {
             continue;
         }
         let aj = atoms[j];
         let wj = cx.wid(aj);
+        // 0) Canonical bit-provenance unification across widths `1..=512`:
+        //    - `aj == ai ^ c` (for earlier kept `ai`, or bare `Sym` `ai`)
+        //    - `aj == ai & m` / `aj == ~ai & m` (when `allow_nonuniform`)
+        if let Some(rj) = &bit_runs[j] {
+            let w_ty = cx.width_of(aj);
+            let xor_src = (0..atoms.len()).find_map(|i| {
+                if i == j || !keep[i] || cx.wid(atoms[i]) != wj {
+                    return None;
+                }
+                if i > j && cx.node(atoms[i]).op != OpCode::Sym {
+                    return None;
+                }
+                let ri = bit_runs[i].as_ref()?;
+                let diff = crate::engine::pass::shuffle::runs_xor_diff(ri, rj, w_ty)?;
+                if !allow_nonuniform && !diff.is_zero() && !diff.is_ones() {
+                    return None;
+                }
+                Some((atoms[i], PeerOp::Xor(diff)))
+            });
+            if let Some((src, op)) = xor_src {
+                keep[j] = false;
+                peers.push(PeerSolved {
+                    target: aj,
+                    source: src,
+                    op,
+                });
+                continue;
+            }
+            if allow_nonuniform {
+                let mask_src = (0..atoms.len()).find_map(|i| {
+                    if i == j || !keep[i] || cx.wid(atoms[i]) != wj {
+                        return None;
+                    }
+                    let ri = bit_runs[i].as_ref()?;
+                    let (m, inv) = crate::engine::pass::shuffle::runs_masked_sub(rj, ri, w_ty)?;
+                    if m.is_ones() && i > j {
+                        return None;
+                    }
+                    // Prevent symmetric mutual sub-masking if `ri == rj` (already caught above).
+                    if ri == rj && i > j {
+                        return None;
+                    }
+                    Some((
+                        atoms[i],
+                        if inv {
+                            PeerOp::NotAnd(m)
+                        } else {
+                            PeerOp::And(m)
+                        },
+                    ))
+                });
+                if let Some((src, op)) = mask_src {
+                    keep[j] = false;
+                    peers.push(PeerSolved {
+                        target: aj,
+                        source: src,
+                        op,
+                    });
+                    continue;
+                }
+            }
+        }
         // 1) Check if `aj` is `x & m_sub` or `~x & m_sub` covered by another kept atom `ai`
         // (`x`, `x & m_sup`, `~x & m_sup`, or a carry-free low-bit offset `x + c` / `c - x` /
         // `x ^ c` whose carries/flips do not disturb `m_sub`). Never inject non-uniform bitwise

@@ -361,8 +361,8 @@ fn congruence_and_extraction_ties() {
     let leaf = |eg: &mut EGraph, i: u32, m: &mut Meter<'_>| {
         eg.add(
             ENode {
-                op: EOp::Leaf(i),
-                kids: [0, 0],
+                op: EOp::Leaf { node: i, width: 8 },
+                kids: [0, 0, 0],
             },
             true,
             m,
@@ -376,7 +376,7 @@ fn congruence_and_extraction_ties() {
         .add(
             ENode {
                 op: EOp::Un(UnOp::Not),
-                kids: [x, 0],
+                kids: [x, 0, 0],
             },
             true,
             &mut meter,
@@ -387,7 +387,7 @@ fn congruence_and_extraction_ties() {
         .add(
             ENode {
                 op: EOp::Un(UnOp::Not),
-                kids: [y, 0],
+                kids: [y, 0, 0],
             },
             false,
             &mut meter,
@@ -420,11 +420,18 @@ fn extraction_propagates_costs_without_changing_selected_nodes() {
     let mut meter = Meter::new(Budget::UNLIMITED, None);
     let mut eg = EGraph::new(Width::W8);
     let add = |eg: &mut EGraph, op, kid, meter: &mut Meter<'_>| {
-        eg.add(ENode { op, kids: [kid, 0] }, true, meter)
-            .ok()
-            .unwrap()
+        eg.add(
+            ENode {
+                op,
+                kids: [kid, 0, 0],
+            },
+            true,
+            meter,
+        )
+        .ok()
+        .unwrap()
     };
-    let x = add(&mut eg, EOp::Leaf(0), 0, &mut meter);
+    let x = add(&mut eg, EOp::Leaf { node: 0, width: 8 }, 0, &mut meter);
     let mut expensive = x;
     for _ in 0..4 {
         expensive = add(&mut eg, EOp::Un(UnOp::Neg), expensive, &mut meter);
@@ -433,7 +440,7 @@ fn extraction_propagates_costs_without_changing_selected_nodes() {
     let root_index = eg.nodes.len() as u32;
     let root = add(&mut eg, EOp::Un(UnOp::Neg), parent, &mut meter);
     // This cheaper representative is visited after the original parents in each scan.
-    let late = add(&mut eg, EOp::Leaf(1), 0, &mut meter);
+    let late = add(&mut eg, EOp::Leaf { node: 1, width: 8 }, 0, &mut meter);
     let mut alternative = x;
     for op in [UnOp::Not, UnOp::Neg, UnOp::Not] {
         alternative = add(&mut eg, EOp::Un(op), alternative, &mut meter);
@@ -598,15 +605,16 @@ fn extreme_node_caps_and_the_dag_admission_cap() {
 #[test]
 fn matching_stops_at_its_limit() {
     use super::egraph::{EGraph, ENode, EOp};
-    use super::pattern::{PNode, Pattern, ematch};
+    use super::pattern::{PNode, POp, Pattern, ematch};
+    use crate::rules::WExpr;
     // A class holding every sum `a_i + a_j` of 10 leaves (one class: all united), and a root
     // `X + X`: the pattern `(x + y) + (z + t)` has 200 × 200 matches at the root.
     let mut m = Meter::new(Budget::UNLIMITED, None);
     let mut eg = EGraph::new(Width::W32);
     let leaf = |eg: &mut EGraph, m: &mut Meter<'_>, k: u32| {
         let n = ENode {
-            op: EOp::Leaf(k),
-            kids: [0, 0],
+            op: EOp::Leaf { node: k, width: 32 },
+            kids: [0, 0, 0],
         };
         eg.add(n, true, m).unwrap()
     };
@@ -616,7 +624,7 @@ fn matching_stops_at_its_limit() {
         for &b in &leaves {
             let n = ENode {
                 op: EOp::Bin(BinOp::Add),
-                kids: [a, b],
+                kids: [a, b, 0],
             };
             sums.push(eg.add(n, true, &mut m).unwrap());
         }
@@ -630,21 +638,26 @@ fn matching_stops_at_its_limit() {
         .add(
             ENode {
                 op: EOp::Bin(BinOp::Add),
-                kids: [x, x],
+                kids: [x, x, 0],
             },
             true,
             &mut m,
         )
         .unwrap();
+    let wv = WExpr::var(0);
+    let pn = |op: POp| PNode {
+        op,
+        width: wv.clone(),
+    };
     let p = Pattern {
         nodes: vec![
-            PNode::Var(0),
-            PNode::Var(1),
-            PNode::Bin(BinOp::Add, 0, 1),
-            PNode::Var(2),
-            PNode::Var(3),
-            PNode::Bin(BinOp::Add, 3, 4),
-            PNode::Bin(BinOp::Add, 2, 5),
+            pn(POp::Var(0)),
+            pn(POp::Var(1)),
+            pn(POp::Bin(BinOp::Add, 0, 1)),
+            pn(POp::Var(2)),
+            pn(POp::Var(3)),
+            pn(POp::Bin(BinOp::Add, 3, 4)),
+            pn(POp::Bin(BinOp::Add, 2, 5)),
         ],
         root: 6,
     };
@@ -656,7 +669,7 @@ fn matching_stops_at_its_limit() {
             &p,
             4,
             root,
-            Width::W8,
+            Width::W32,
             &mut out,
             limit,
             &mut |_, _| false,
@@ -757,4 +770,181 @@ fn a_passed_deadline_withholds_memo_answers_too() {
     let out = s.search(&mut cx, &[e], SearchRun::default()).unwrap();
     assert_eq!(out.stats.memo_hits, 1);
     assert!(out.roots[0].candidate.is_some());
+}
+
+#[test]
+fn mixed_width_casts_and_wide_vectors_saturate() {
+    let cfg = SaturateConfig::extended();
+    let (s, report) = Saturator::builtin_groups(
+        &[
+            "eqsat.casts",
+            "eqsat.distrib_and",
+            "eqsat.distrib",
+            "eqsat.cancel",
+        ],
+        cfg,
+    );
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+    let mut cx = Context::new();
+    // Mixed-width `zext` + `distrib_and` factoring across widths 8 -> 16 and 31 -> 63.
+    let e16 = parse(
+        &mut cx,
+        "(zext<16>(a:8) & zext<16>(b:8)) | (zext<16>(a:8) & zext<16>(c:8))",
+        16,
+    );
+    let want16 = parse(&mut cx, "zext<16>(a:8 & (b:8 | c:8))", 16);
+    let out = s.search(&mut cx, &[e16], SearchRun::default()).unwrap();
+    assert_eq!(out.publication, Publication::Published);
+    assert_eq!(out.roots[0].candidate, Some(want16));
+
+    let e63 = parse(
+        &mut cx,
+        "(sext<63>(a31:31) & sext<63>(b31:31)) | (sext<63>(a31:31) & sext<63>(c31:31))",
+        63,
+    );
+    let want63 = parse(&mut cx, "sext<63>(a31:31 & (b31:31 | c31:31))", 63);
+    let out = s.search(&mut cx, &[e63], SearchRun::default()).unwrap();
+    assert_eq!(out.roots[0].candidate, Some(want63));
+
+    // 256-bit `concat` XOR cancellation and 512-bit ring expansion-before-cancellation.
+    let e256 = parse(
+        &mut cx,
+        "concat(a128:128 ^ c128:128, b128:128 ^ d128:128) ^ concat(c128:128, d128:128)",
+        256,
+    );
+    let want256 = parse(&mut cx, "concat(a128:128, b128:128)", 256);
+    let out = s.search(&mut cx, &[e256], SearchRun::default()).unwrap();
+    assert_eq!(out.roots[0].candidate, Some(want256));
+
+    let e512 = parse(&mut cx, "x512 * (y512 + 1) - x512 * y512", 512);
+    let want512 = parse(&mut cx, "x512", 512);
+    let out = s.search(&mut cx, &[e512], SearchRun::default()).unwrap();
+    assert_eq!(out.roots[0].candidate, Some(want512));
+
+    // Narrow extract through widened XOR cancels inside the mixed-width e-graph.
+    let e_trunc = parse(&mut cx, "trunc<8>(zext<32>(p:8) ^ zext<32>(q:8)) ^ q:8", 8);
+    let want_trunc = parse(&mut cx, "p:8", 8);
+    let out = s.search(&mut cx, &[e_trunc], SearchRun::default()).unwrap();
+    assert_eq!(out.roots[0].candidate, Some(want_trunc));
+}
+
+#[test]
+fn facts_guarded_identities_and_disjoint_detours() {
+    let cfg = SaturateConfig::extended();
+    let (s, report) =
+        Saturator::builtin_groups(&["eqsat.facts", "eqsat.distrib", "eqsat.cancel"], cfg);
+    assert!(report.refused.is_empty(), "{:?}", report.refused);
+
+    for w in [8u16, 32, 64, 128, 256, 512] {
+        let mut cx = Context::new();
+        // Needs `x | y => x + y` under `disjoint(x, y)` (from e-class `Facts`), then `mul_add`,
+        // then `add_sub` cancellation.
+        let e = parse(&mut cx, "((a & 0xf0) | (b & 0x0f)) * z - (a & 0xf0) * z", w);
+        let want = parse(&mut cx, "(b & 0x0f) * z", w);
+        let out = s.search(&mut cx, &[e], SearchRun::default()).unwrap();
+        assert_eq!(out.roots[0].candidate, Some(want), "W={w}");
+
+        // Structural complement-mask disjointness `(a & m)` vs `(b & ~m)` for symbolic `m`.
+        let e_sym = parse(&mut cx, "((a & m) | (b & ~m)) - (b & ~m)", w);
+        let want_sym = parse(&mut cx, "a & m", w);
+        let out_sym = s.search(&mut cx, &[e_sym], SearchRun::default()).unwrap();
+        assert_eq!(out_sym.roots[0].candidate, Some(want_sym), "symbolic W={w}");
+
+        // `nonzero(x)` proved by e-class `Facts` on `x | 1`.
+        let e_div = parse(&mut cx, "udiv(x | 1, x | 1)", w);
+        let out_div = s.search(&mut cx, &[e_div], SearchRun::default()).unwrap();
+        assert_eq!(
+            out_div.roots[0].candidate,
+            Some(parse(&mut cx, "1", w)),
+            "udiv W={w}"
+        );
+    }
+
+    // Host-declared `KnownBits` on symbols flow into e-class `Facts`.
+    let mut cx = Context::new();
+    let a = cx.symbol("a", Width::W16).unwrap();
+    let b = cx.symbol("b", Width::W16).unwrap();
+    cx.declare_known(
+        a,
+        crate::KnownBits::from_masks(
+            BitVec::from_u64(Width::W16, 0xff00).unwrap(),
+            BitVec::zero(Width::W16),
+        ),
+    )
+    .unwrap();
+    cx.declare_known(
+        b,
+        crate::KnownBits::from_masks(
+            BitVec::from_u64(Width::W16, 0x00ff).unwrap(),
+            BitVec::zero(Width::W16),
+        ),
+    )
+    .unwrap();
+    let e_decl = parse(&mut cx, "(a | b) - b", 16);
+    let out_decl = s.search(&mut cx, &[e_decl], SearchRun::default()).unwrap();
+    assert_eq!(out_decl.roots[0].candidate, Some(a));
+
+    // Negative soundness checks: overlapping masks (`0xf0 & 0x1f == 0x10 != 0`) and potentially
+    // zero divisors (`udiv(x, x)`) must NOT fire guarded rules.
+    let mut cx = Context::new();
+    let bad_overlap = parse(&mut cx, "((a & 0xf0) | (b & 0x1f)) - (b & 0x1f)", 8);
+    let out_bad = s
+        .search(&mut cx, &[bad_overlap], SearchRun::default())
+        .unwrap();
+    assert_eq!(out_bad.roots[0].candidate, None);
+
+    let bad_div = parse(&mut cx, "udiv(x, x)", 8);
+    let out_bad_div = s.search(&mut cx, &[bad_div], SearchRun::default()).unwrap();
+    assert_eq!(out_bad_div.roots[0].candidate, None);
+}
+
+#[test]
+fn select_and_shift_detours_and_publish_policy() {
+    let cfg = SaturateConfig::extended();
+    let (s_sel, _) = Saturator::builtin_groups(&["eqsat.select", "eqsat.cancel"], cfg);
+    let mut cx = Context::new();
+    let e = parse(&mut cx, "select(c:1, x + k, y + k) - k", 64);
+    let want = parse(&mut cx, "select(c:1, x, y)", 64);
+    let out = s_sel.search(&mut cx, &[e], SearchRun::default()).unwrap();
+    assert_eq!(out.roots[0].candidate, Some(want));
+
+    let (s_sh, _) = Saturator::builtin_groups(&["eqsat.shifts", "eqsat.cancel"], cfg);
+    let e_sh = parse(&mut cx, "(x << s) + (y << s)", 128);
+    let want_sh = parse(&mut cx, "(x + y) << s", 128);
+    let out_sh = s_sh.search(&mut cx, &[e_sh], SearchRun::default()).unwrap();
+    assert_eq!(out_sh.roots[0].candidate, Some(want_sh));
+
+    // `PublishPolicy::AtIterationCap` publishes strictly cheaper verified candidates even when
+    // mutually-expanding groups hit `RootEnd::IterationCap`, while deadlines still withhold.
+    let (s_cap, _) = Saturator::builtin_groups(
+        &["eqsat.distrib_and", "eqsat.distrib_or"],
+        SaturateConfig::default().with_publish(PublishPolicy::AtIterationCap),
+    );
+    let a = parse(&mut cx, "a & b | a & c", 32);
+    let b = parse(&mut cx, "(p | q) & (p | r)", 32);
+    let out_cap = s_cap
+        .search(&mut cx, &[a, b], SearchRun::default())
+        .unwrap();
+    assert_eq!(out_cap.roots[0].end, RootEnd::IterationCap);
+    assert_eq!(out_cap.roots[1].end, RootEnd::IterationCap);
+    assert_eq!(out_cap.publication, Publication::Published);
+    assert_eq!(
+        out_cap.roots[0].candidate,
+        Some(parse(&mut cx, "a & (b | c)", 32))
+    );
+    assert_eq!(
+        out_cap.roots[1].candidate,
+        Some(parse(&mut cx, "p | (q & r)", 32))
+    );
+
+    // Passed deadline still withholds under `PublishPolicy::AtIterationCap`.
+    let out_late = s_cap
+        .search(
+            &mut cx,
+            &[a],
+            SearchRun::default().with_deadline(Deadline::new(&Late, 0)),
+        )
+        .unwrap();
+    assert!(matches!(out_late.publication, Publication::Withheld { .. }));
+    assert_eq!(out_late.roots[0].candidate, None);
 }

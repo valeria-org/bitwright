@@ -1319,6 +1319,7 @@ impl<'r, 'a> Runner<'r, 'a> {
             samples: IdMap::default(),
             compares: IdMap::default(),
             shuffle: IdMap::default(),
+            shuffle_full: IdMap::default(),
             residues: IdMap::default(),
             chains: IdMap::default(),
             quarantined_passes: Vec::new(),
@@ -1491,6 +1492,8 @@ struct Runner<'r, 'a> {
     compares: IdMap<u32, pass::compares::Info>,
     /// The shuffle pass's bit provenance, per node.
     shuffle: IdMap<u32, pass::shuffle::Bits>,
+    /// Complement-aware bit provenance for comparison/relation queries, per node.
+    shuffle_full: IdMap<u32, pass::shuffle::Bits>,
     /// Residue tables, per node and number of low bits (see `pass::residue`).
     residues: IdMap<(u32, u32), Option<std::rc::Rc<pass::residue::Residues>>>,
     /// The chains of `·`, `&` or `|` found in order, or of more operands than are put in
@@ -3028,6 +3031,8 @@ impl Runner<'_, '_> {
         // (The call still remembers the answers: a fragment two roots share is asked once.)
         #[cfg(feature = "mba")]
         self.mba.kept.clear();
+        self.demanded.dedup_runs = 0;
+        self.demanded.dedup_tried = None;
         // with the MBA phase's noise forms, the root is read with what its
         // conditions fix put into the operands they guard first (see `pass::push_context`):
         // a case table's noise folds once its selector's bits are constants, and the budget is
