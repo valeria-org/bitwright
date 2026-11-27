@@ -246,4 +246,9 @@ assert.equal(
   bw.simplify("(x + 9) - x", 32, { engine: "compile", rewrites: [relCheck] }),
   "9:32",
 );
+const omtSession = bw.runSmtlib(
+  "(set-logic QF_BV)(declare-const x (_ BitVec 8))(assert (bvult x #x05))(maximize x)(check-sat)(get-objectives)",
+);
+assert.match(omtSession, /^sat\n\(objectives\n \(x #x04\)\n\)/);
+assert.equal(bw.functionalDef(["y * 3 == x + 6"], "y", ["x"], 32), "x * 0xaaaaaaab + 2");
 console.log("ok");

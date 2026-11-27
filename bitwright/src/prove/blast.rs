@@ -92,6 +92,168 @@ pub fn sub(g: &mut Aig, a: &[L], b: &[L]) -> Bits {
     add_wrapping(g, a, &nb, TRUE)
 }
 
+/// Multi-operand modular sum `Σ terms + cin_bits (mod 2^w)` lowered through a logarithmic-depth
+/// 3:2 carry-save (Wallace) compressor tree followed by one carry-propagating [`add`].
+///
+/// Empty, single-term, and two-term (`cin_bits == 0`) inputs delegate directly to [`add`] so
+/// ordinary binary additions remain bit-for-bit identical.
+pub fn sum_csa(g: &mut Aig, terms: &[Bits], cin_bits: usize) -> Bits {
+    sum_csa_with(g, terms, cin_bits, false)
+}
+
+pub(super) fn sum_csa_compact(g: &mut Aig, terms: &[Bits], cin_bits: usize) -> Bits {
+    sum_csa_with(g, terms, cin_bits, true)
+}
+
+fn sum_csa_with(g: &mut Aig, terms: &[Bits], cin_bits: usize, compact: bool) -> Bits {
+    let Some(first_term) = terms.first() else {
+        return Vec::new();
+    };
+    let w = first_term.len();
+    if w == 0 {
+        return Vec::new();
+    }
+    if cin_bits == 0 {
+        return match terms.len() {
+            1 => terms[0].clone(),
+            2 if compact => add_compact(g, &terms[0], &terms[1]),
+            2 => add(g, &terms[0], &terms[1]),
+            _ => sum_csa_columns(g, terms, 0, w, compact),
+        };
+    }
+    if terms.len() == 2 && cin_bits == 1 {
+        return if compact {
+            add_wrapping_compact(g, &terms[0], &terms[1], TRUE)
+        } else {
+            add_wrapping(g, &terms[0], &terms[1], TRUE)
+        };
+    }
+    if terms.len() == 1 {
+        let c = small(w, cin_bits as u64);
+        return if compact {
+            add_compact(g, &terms[0], &c)
+        } else {
+            add(g, &terms[0], &c)
+        };
+    }
+    sum_csa_columns(g, terms, cin_bits, w, compact)
+}
+
+fn sum_csa_columns(g: &mut Aig, terms: &[Bits], cin_bits: usize, w: usize, compact: bool) -> Bits {
+    let mut cols: Vec<Vec<L>> = vec![Vec::new(); w];
+    for term in terms {
+        debug_assert_eq!(term.len(), w);
+        for (col, &bit) in term.iter().enumerate() {
+            if bit != FALSE {
+                cols[col].push(bit);
+            }
+        }
+    }
+    if cin_bits > 0 {
+        // Decompose `cin_bits` into binary column carry-ins (`cin_bits == 1` places one `TRUE`
+        // in `cols[0]`; larger counts avoid redundant constant-folding passes in column 0).
+        for (col, queue) in cols.iter_mut().enumerate() {
+            if col >= usize::BITS as usize {
+                break;
+            }
+            if (cin_bits >> col) & 1 == 1 {
+                queue.push(TRUE);
+            }
+        }
+    }
+    let mut head = vec![0usize; w];
+    let mut ends = vec![0usize; w];
+    let mut did_three_pass = false;
+    loop {
+        let mut max_rem = 0usize;
+        for col in 0..w {
+            let end = cols[col].len();
+            ends[col] = end;
+            max_rem = max_rem.max(end - head[col]);
+        }
+        if max_rem < 3 || (max_rem == 3 && did_three_pass) {
+            break;
+        }
+        if max_rem == 3 {
+            did_three_pass = true;
+        }
+        for col in 0..w {
+            let end = ends[col];
+            while end - head[col] >= 3 {
+                let h = head[col];
+                let (x, y, z) = (cols[col][h], cols[col][h + 1], cols[col][h + 2]);
+                head[col] = h + 3;
+                if col + 1 == w {
+                    let xy = g.xor_phase(x, y);
+                    let s = g.xor_phase(xy, z);
+                    if s != FALSE {
+                        cols[col].push(s);
+                    }
+                } else {
+                    let xy = g.xor(x, y);
+                    let s = g.xor(xy, z);
+                    if s != FALSE {
+                        cols[col].push(s);
+                    }
+                    let c = if compact {
+                        maj_with_xor(g, x, y, z, xy)
+                    } else {
+                        g.maj(x, y, z)
+                    };
+                    if c != FALSE {
+                        cols[col + 1].push(c);
+                    }
+                }
+            }
+        }
+    }
+    // Single left-to-right cleanup pass for any column bumped from 2 to 3 by an incoming carry.
+    for col in 0..w {
+        while cols[col].len() - head[col] >= 3 {
+            let h = head[col];
+            let (x, y, z) = (cols[col][h], cols[col][h + 1], cols[col][h + 2]);
+            head[col] = h + 3;
+            if col + 1 == w {
+                let xy = g.xor_phase(x, y);
+                let s = g.xor_phase(xy, z);
+                if s != FALSE {
+                    cols[col].push(s);
+                }
+            } else {
+                let xy = g.xor(x, y);
+                let s = g.xor(xy, z);
+                if s != FALSE {
+                    cols[col].push(s);
+                }
+                let c = if compact {
+                    maj_with_xor(g, x, y, z, xy)
+                } else {
+                    g.maj(x, y, z)
+                };
+                if c != FALSE {
+                    cols[col + 1].push(c);
+                }
+            }
+        }
+    }
+    let mut row0 = vec![FALSE; w];
+    let mut row1 = vec![FALSE; w];
+    for col in 0..w {
+        let h = head[col];
+        if let Some(&l0) = cols[col].get(h) {
+            row0[col] = l0;
+        }
+        if let Some(&l1) = cols[col].get(h + 1) {
+            row1[col] = l1;
+        }
+    }
+    if compact {
+        add_compact(g, &row0, &row1)
+    } else {
+        add(g, &row0, &row1)
+    }
+}
+
 fn add_wrapping(g: &mut Aig, a: &[L], b: &[L], cin: L) -> Bits {
     let mut carry = cin;
     let mut out = Vec::with_capacity(a.len());
@@ -221,7 +383,7 @@ pub fn mul(g: &mut Aig, a: &[L], b: &[L]) -> Bits {
     if a.iter().all(|&bit| bit <= TRUE) {
         return mul_constant(g, b, a);
     }
-    mul_rows(g, a, b)
+    mul_wallace(g, a, b)
 }
 
 /// A word whose only possibly nonzero bit is bit zero is exactly a Boolean multiplier.
@@ -578,6 +740,37 @@ fn mul_repeated_pair(g: &mut Aig, a: &[L], digits: &[(usize, bool)]) -> Option<B
     Some(acc)
 }
 
+fn mul_wallace(g: &mut Aig, a: &[L], b: &[L]) -> Bits {
+    let w = a.len();
+    if w == 0 {
+        return Vec::new();
+    }
+    let a_active = a.iter().filter(|&&l| l != FALSE).count();
+    let b_active = b.iter().filter(|&&l| l != FALSE).count();
+    let (cand, mult) = if a_active < b_active { (b, a) } else { (a, b) };
+    let mut rows = Vec::with_capacity(a_active.min(b_active));
+    for (i, &mi) in mult.iter().enumerate() {
+        if mi == FALSE {
+            continue;
+        }
+        let mut part = vec![FALSE; w];
+        let mut any = false;
+        for j in 0..w - i {
+            let bit = g.and(cand[j], mi);
+            part[i + j] = bit;
+            any |= bit != FALSE;
+        }
+        if any {
+            rows.push(part);
+        }
+    }
+    if rows.is_empty() {
+        return vec![FALSE; w];
+    }
+    sum_csa(g, &rows, 0)
+}
+
+#[cfg(test)]
 fn mul_rows(g: &mut Aig, a: &[L], b: &[L]) -> Bits {
     let w = a.len();
     let mut acc = vec![FALSE; w];

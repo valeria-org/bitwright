@@ -787,6 +787,25 @@ bw_status bw_solver_core(bw_solver *s, bw_context *cx, uint32_t *core, size_t ca
 bw_status bw_solver_enumerate(bw_solver *s, bw_context *cx, bw_expr e, size_t limit,
                               bw_value *values, size_t *count, bool *exact, int *answer);
 
+/* Minimizes or maximizes `e` (unsigned, or two's-complement signed with `signed_cmp`) under the
+ * solver's assertions: `*answer` receives BW_SAT (and `*out` the optimal value, with the solver's
+ * model set to a witness achieving it), BW_UNSAT, or BW_UNKNOWN. */
+bw_status bw_solver_minimize(bw_solver *s, bw_context *cx, bw_expr e, bool signed_cmp,
+                             bw_value *out, int *answer);
+bw_status bw_solver_maximize(bw_solver *s, bw_context *cx, bw_expr e, bool signed_cmp,
+                             bw_value *out, int *answer);
+
+/* Solver-tightened facts of `e` under the assertions: `*satisfiable` is false when the assertions
+ * are unsatisfiable. */
+bw_status bw_solver_tighten_facts(bw_solver *s, bw_context *cx, bw_expr e, bw_facts *out,
+                                  bool *satisfiable);
+
+/* Closed-form expression over `inputs[0..n)` proved equal to `target` under the solver's
+ * assertions: `*found` is false (and `*out` is BW_NULL_EXPR) when none is found or the assertions
+ * are unsatisfiable. */
+bw_status bw_solver_functional_def(bw_solver *s, bw_context *cx, bw_expr target,
+                                   const bw_expr *inputs, size_t n, bw_expr *out, bool *found);
+
 /* ----- proofs and synthesis ----------------------------------------------------------------- */
 
 typedef enum bw_equivalence {

@@ -8,7 +8,7 @@ use super::import::{Arr, Env, EnvMark, Sort, State, Sx, Tok, Val, check};
 use crate::engine::{Clock, Deadline};
 use crate::error::Error;
 use crate::expr::{Context, Expr};
-use crate::solve::{Config, CoreItem, Solver, Status};
+use crate::solve::{Config, CoreItem, Optimum, Solver, Status};
 use crate::{BitVec, Width};
 
 /// What a script's run came to.
@@ -30,7 +30,8 @@ pub struct Summary {
 ///
 /// Commands: everything [`import`](super::import) reads (`set-logic`, `set-info`,
 /// `declare-const`, `declare-fun` without parameters, `define-fun`, `assert`), and `push`,
-/// `pop`, `check-sat`, `check-sat-assuming`, `get-model`, `get-value`, `get-unsat-core`
+/// `pop`, `minimize`, `maximize`, `get-objectives`, `check-sat`, `check-sat-assuming`,
+/// `get-model`, `get-value`, `get-unsat-core`
 /// (the `:named` assertions of a core), `get-unsat-assumptions`, `get-info` (`:name`,
 /// `:version`, `:reason-unknown`), `set-option` (`:print-success`; any other is accepted and
 /// has no effect: models and cores are always available), `echo`, `reset`,
@@ -122,6 +123,12 @@ pub struct Session<'a> {
     names: Vec<Option<String>>,
     texts: Vec<Option<String>>,
     frames: Vec<EnvMark>,
+    /// Active bit-vector optimization objectives in declaration (lexicographic) order.
+    objectives: Vec<Objective>,
+    /// Number of active objectives at each `push`.
+    objective_frames: Vec<usize>,
+    /// Optimal `(term_text, value)` pairs achieved by the last `sat` check.
+    last_objectives: Option<Vec<(String, BitVec)>>,
     /// The assumptions of the last `check-sat-assuming`, as written.
     assumed: Vec<String>,
     /// The same, as predicates.
@@ -134,6 +141,13 @@ pub struct Session<'a> {
     pending: String,
     /// Of `pending`: how much is scanned, and the scanner's state there.
     scan: Scan,
+}
+
+#[derive(Clone)]
+struct Objective {
+    expr: Expr,
+    text: String,
+    maximize: bool,
 }
 
 /// Where a scan of pending text stands: SMT-LIB's lexical structure, as far as finding the
@@ -168,6 +182,9 @@ impl<'a> Session<'a> {
             names: Vec::new(),
             texts: Vec::new(),
             frames: Vec::new(),
+            objectives: Vec::new(),
+            objective_frames: Vec::new(),
+            last_objectives: None,
             assumed: Vec::new(),
             assumptions: Vec::new(),
             print_success: false,
@@ -349,8 +366,39 @@ impl<'a> Session<'a> {
                     self.solver.assert(self.cx, e)?;
                     self.names.push(name);
                     self.texts.push(Some(sx.text(args[0]).to_string()));
+                    self.last_objectives = None;
                 }
                 Ok(None)
+            }
+            Some("minimize" | "maximize") => {
+                arity(args.len() == 1)?;
+                let Val::Bv(e) = self.state().term(sx, args[0])? else {
+                    return Err(sx.err(args[0], "an objective must be a bit-vector"));
+                };
+                self.sides()?;
+                self.objectives.push(Objective {
+                    expr: e,
+                    text: sx.text(args[0]).to_string(),
+                    maximize: sx.sym(head) == Some("maximize"),
+                });
+                self.last_objectives = None;
+                Ok(None)
+            }
+            Some("get-objectives") => {
+                arity(args.is_empty())?;
+                self.need(Status::Sat, "no objectives: the last check was not sat")?;
+                let Some(objs) = &self.last_objectives else {
+                    return Err(Error::Unsupported(
+                        "no objectives: the last check was not sat".into(),
+                    ));
+                };
+                let dummy = self.cx.bool(false)?;
+                let mut text = String::from("(objectives\n");
+                for (term_text, val) in objs {
+                    let _ = writeln!(text, " ({term_text} {})", Value(Val::Bv(dummy), val));
+                }
+                text.push(')');
+                Ok(Some(text))
             }
             Some("push" | "pop") => {
                 arity(args.len() <= 1)?;
@@ -362,13 +410,18 @@ impl<'a> Session<'a> {
                     for _ in 0..n {
                         self.solver.push();
                         self.frames.push(self.env.mark());
+                        self.objective_frames.push(self.objectives.len());
                     }
                 } else if n > 0 {
                     self.solver.pop(n)?;
                     let keep = self.frames.len() - n;
                     let at = self.frames[keep];
+                    let obj_keep = self.objective_frames[keep];
                     self.env.forget(&at);
                     self.frames.truncate(keep);
+                    self.objective_frames.truncate(keep);
+                    self.objectives.truncate(obj_keep);
+                    self.last_objectives = None;
                     self.names.truncate(self.solver.assertions().len());
                     self.texts.truncate(self.solver.assertions().len());
                 }
@@ -629,6 +682,9 @@ impl<'a> Session<'a> {
                 self.solver.reset();
                 self.names.clear();
                 self.texts.clear();
+                self.objectives.clear();
+                self.objective_frames.clear();
+                self.last_objectives = None;
                 self.assumed.clear();
                 self.assumptions.clear();
                 if sx.sym(head) == Some("reset") {
@@ -692,10 +748,42 @@ impl<'a> Session<'a> {
     }
 
     fn check(&mut self, assumptions: &[Expr]) -> Result<Status, Error> {
+        self.last_objectives = None;
         let deadline = self
             .limit
             .map(|(clock, ticks)| Deadline::new(clock, clock.now_ticks().saturating_add(ticks)));
-        self.solver.check_within(self.cx, assumptions, deadline)
+        if self.objectives.is_empty() {
+            let status = self.solver.check_within(self.cx, assumptions, deadline)?;
+            if status == Status::Sat {
+                self.last_objectives = Some(Vec::new());
+            }
+            return Ok(status);
+        }
+        let objs = self.objectives.clone();
+        let mut pinned: Vec<Expr> = Vec::with_capacity(assumptions.len() + objs.len());
+        pinned.extend_from_slice(assumptions);
+        let mut solved_objs: Vec<(String, BitVec)> = Vec::with_capacity(objs.len());
+        for obj in objs {
+            let opt = if obj.maximize {
+                self.solver
+                    .maximize_within(self.cx, obj.expr, &pinned, deadline)?
+            } else {
+                self.solver
+                    .minimize_within(self.cx, obj.expr, &pinned, deadline)?
+            };
+            match opt {
+                Optimum::Found(val) => {
+                    let k = self.cx.constant(&val)?;
+                    let eq = self.cx.cmp(crate::CmpOpExt::Eq, obj.expr, k)?;
+                    pinned.push(eq);
+                    solved_objs.push((obj.text, val));
+                }
+                Optimum::Unsat => return Ok(Status::Unsat),
+                Optimum::Unknown(why) => return Ok(Status::Unknown(why)),
+            }
+        }
+        self.last_objectives = Some(solved_objs);
+        Ok(Status::Sat)
     }
 
     fn answer(&mut self, status: &Status) -> String {

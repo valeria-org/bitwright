@@ -1193,6 +1193,101 @@ inline std::string check_rules(const std::string &source) {
 
 // ----- proofs and synthesis ------------------------------------------------------------------
 
+// A solver: 1-bit predicates asserted on a stack, checks, optimization, and functional synthesis.
+class Solver {
+  public:
+    explicit Solver(Context &cx)
+        : cx_(&cx), s_(detail::check_new(bw_solver_new()), &bw_solver_free) {}
+
+    uint32_t add(Expr p) {
+        uint32_t idx = 0;
+        detail::check(bw_solver_assert(s_.get(), cx_->raw(), p.raw(), &idx));
+        return idx;
+    }
+    void push() { detail::check(bw_solver_push(s_.get())); }
+    void pop(uint32_t scopes = 1) { detail::check(bw_solver_pop(s_.get(), scopes)); }
+
+    std::optional<bool> check(const std::vector<Expr> &assumptions = {}) {
+        std::vector<bw_expr> a;
+        for (Expr e : assumptions) {
+            a.push_back(e.raw());
+        }
+        int ans = BW_UNKNOWN;
+        detail::check(bw_solver_check(s_.get(), cx_->raw(), a.data(), a.size(), &ans));
+        if (ans == BW_UNKNOWN) {
+            return std::nullopt;
+        }
+        return ans == BW_SAT;
+    }
+
+    Value value(Expr e) {
+        bw_value out;
+        detail::check(bw_solver_value(s_.get(), cx_->raw(), e.raw(), &out));
+        return Value(out);
+    }
+
+    std::optional<std::pair<std::vector<Value>, bool>> enumerate(Expr e, std::size_t limit = 16) {
+        std::vector<bw_value> buf(limit);
+        std::size_t count = 0;
+        bool exact = false;
+        int ans = BW_UNKNOWN;
+        detail::check(bw_solver_enumerate(s_.get(), cx_->raw(), e.raw(), limit,
+                                          limit > 0 ? buf.data() : nullptr, &count, &exact, &ans));
+        if (ans == BW_UNKNOWN) {
+            return std::nullopt;
+        }
+        std::vector<Value> out;
+        for (std::size_t i = 0; i < count; i++) {
+            out.emplace_back(buf[i]);
+        }
+        return std::make_pair(std::move(out), exact);
+    }
+
+    std::optional<Value> minimize(Expr e, bool signed_cmp = false) {
+        bw_value out;
+        int ans = BW_UNKNOWN;
+        detail::check(bw_solver_minimize(s_.get(), cx_->raw(), e.raw(), signed_cmp, &out, &ans));
+        return ans == BW_SAT ? std::optional<Value>(Value(out)) : std::nullopt;
+    }
+
+    std::optional<Value> maximize(Expr e, bool signed_cmp = false) {
+        bw_value out;
+        int ans = BW_UNKNOWN;
+        detail::check(bw_solver_maximize(s_.get(), cx_->raw(), e.raw(), signed_cmp, &out, &ans));
+        return ans == BW_SAT ? std::optional<Value>(Value(out)) : std::nullopt;
+    }
+
+    std::optional<Facts> tighten_facts(Expr e) {
+        bw_facts f;
+        bool sat = false;
+        detail::check(bw_solver_tighten_facts(s_.get(), cx_->raw(), e.raw(), &f, &sat));
+        if (!sat) {
+            return std::nullopt;
+        }
+        return Facts{Value(f.known_zero), Value(f.known_one), Value(f.umin),
+                     Value(f.umax),       f.ustride,          Value(f.smin),
+                     Value(f.smax),       f.relies_on};
+    }
+
+    std::optional<Expr> functional_def(Expr target, const std::vector<Expr> &inputs) {
+        std::vector<bw_expr> ins;
+        for (Expr inp : inputs) {
+            ins.push_back(inp.raw());
+        }
+        bw_expr out = BW_NULL_EXPR;
+        bool found = false;
+        detail::check(bw_solver_functional_def(s_.get(), cx_->raw(), target.raw(), ins.data(),
+                                               ins.size(), &out, &found));
+        return found ? std::optional<Expr>(cx_->wrap(out)) : std::nullopt;
+    }
+
+    bw_solver *raw() const { return s_.get(); }
+
+  private:
+    Context *cx_;
+    std::unique_ptr<bw_solver, void (*)(bw_solver *)> s_;
+};
+
 // Whether `a` and `b` are equal for every value of their symbols: true (proved), false
 // (refuted), or no value (not decided within `conflicts`).
 inline std::optional<bool> equivalent(Expr a, Expr b, uint64_t conflicts = 1000000) {

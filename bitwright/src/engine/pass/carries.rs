@@ -1,6 +1,8 @@
-//! The carries pass: carry and borrow networks (parallel-prefix adders and subtractors, ripple
-//! chains written out with shifts) over at most [`MAX_ATOMS`] atoms become the affine form
-//! `c + Σ aᵢ·xᵢ` they compute, when the native prover proves them equal.
+//! The carries pass: exact width-polymorphic (`1..=512`) 3:2 carry-save and borrow-save
+//! compressor networks fold directly to their linear sums across multi-operand `Add`/`Sub` bags
+//! and cascaded Wallace/Dadda trees, and general carry/borrow networks (parallel-prefix adders
+//! and subtractors, ripple chains, and mixed carry-save sums) over at most [`MAX_ATOMS`] atoms
+//! become the affine form `c + Σ aᵢ·xᵢ` they compute when the native prover proves them equal.
 //!
 //! The region below a node is its `& | ^ ~` and constant left shifts down to atoms (constants
 //! are leaves); it is read when a bitwise operator in it reads a shift (what carries are), or
@@ -65,7 +67,7 @@ use crate::ops::{BinOp, CmpOp, UnOp};
 use crate::{BitVec, Error, SymbolKey};
 
 /// The most atoms.
-const MAX_ATOMS: usize = 3;
+const MAX_ATOMS: usize = 6;
 
 /// The fewest interior nodes of a region read as a bit count (a count spelled out is long; a
 /// short region is no smaller than its count).
@@ -157,13 +159,43 @@ fn interior(cx: &Context, i: u32) -> bool {
 }
 
 /// How a region is read: through bitwise operators and left shifts (carry networks), through
-/// slices as well (below a `concat`), or as a function of one value through arithmetic and
-/// shifts both ways (bit counts).
+/// additive + bitwise/shifted networks at `<= 64` bits ([`Mode::Mixed`]), through slices as
+/// well (below a `concat`), or as a function of one value through arithmetic and shifts both
+/// ways (bit counts).
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Mode {
     Bitwise,
+    Mixed,
     Slices,
     Counts,
+}
+
+/// Whether `cv` is `±2^k` (`k >= 1`), i.e., a non-unit power-of-two carry scale.
+fn is_pow2_carry_scale(cv: &BitVec) -> bool {
+    if cv.is_zero() || cv.bit(0) == Some(true) {
+        return false;
+    }
+    if crate::facts::known::count_ones(cv) == 1 {
+        return true;
+    }
+    let neg = BitVec::un_unchecked(UnOp::Neg, cv);
+    crate::facts::known::count_ones(&neg) == 1
+}
+
+/// Whether `i` is interior to a mixed additive + bitwise carry region of at most 64 bits.
+fn mixed(cx: &Context, i: u32) -> bool {
+    let n = cx.node(i);
+    if n.width > 64 {
+        return false;
+    }
+    match n.op {
+        OpCode::Add | OpCode::Sub | OpCode::Neg => true,
+        OpCode::Mul => cx
+            .const_val(n.a)
+            .or_else(|| cx.const_val(n.b))
+            .is_some_and(|cv| is_pow2_carry_scale(&cv)),
+        _ => interior(cx, i),
+    }
 }
 
 /// Whether `i` is interior to a region read as a bit count: `& | ^ ~ + − neg *` and shifts by
@@ -254,12 +286,17 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch, mode: Mode) -> (bool, bool, u32) 
         if !(match mode {
             Mode::Slices => sliced(cx, i),
             Mode::Counts => counted(cx, i),
+            Mode::Mixed => mixed(cx, i),
             Mode::Bitwise => interior(cx, i),
         }) {
             s.atoms.push(i);
-            let most = if mode == Mode::Counts { 1 } else { MAX_ATOMS };
+            let most = match mode {
+                Mode::Counts => 1,
+                Mode::Slices => 3,
+                Mode::Bitwise | Mode::Mixed => MAX_ATOMS,
+            };
             if s.atoms.len() > most
-                || (slices && cx.wid(i) > 64)
+                || ((slices || mode == Mode::Mixed) && cx.wid(i) > 64)
                 || (mode == Mode::Counts && cx.wid(i) != w)
             {
                 return (false, false, reached);
@@ -289,6 +326,36 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch, mode: Mode) -> (bool, bool, u32) 
             for c in node.children() {
                 s.stack.push((c, false));
             }
+        } else if mode == Mode::Mixed {
+            added |= matches!(node.op, OpCode::Add | OpCode::Sub);
+            if node.op == OpCode::Shl {
+                let a_op = cx.node(node.a).op;
+                carried |= matches!(a_op, OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not);
+                s.stack.push((node.a, false));
+            } else if node.op == OpCode::Mul {
+                let (x, c_id) = if cx.is_const(node.b) {
+                    (node.a, node.b)
+                } else {
+                    (node.b, node.a)
+                };
+                let even = cx.const_val(c_id).is_some_and(|v| v.limbs()[0] & 1 == 0);
+                let x_op = cx.node(x).op;
+                carried |=
+                    even && matches!(x_op, OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not);
+                s.stack.push((x, false));
+            } else {
+                let is_bw = matches!(
+                    node.op,
+                    OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not
+                );
+                bitwise |= is_bw;
+                for c in node.children() {
+                    if is_bw {
+                        carried |= cx.node(c).op == OpCode::Shl && interior(cx, c);
+                    }
+                    s.stack.push((c, false));
+                }
+            }
         } else if node.op == OpCode::Shl {
             s.stack.push((node.a, false));
         } else {
@@ -304,6 +371,10 @@ fn walk(cx: &Context, n: u32, s: &mut Scratch, mode: Mode) -> (bool, bool, u32) 
     s.consts.truncate(MAX_CONSTS);
     if slices {
         let fits = sliced_any && added && (compared || !joined) && !s.atoms.is_empty();
+        return (fits, false, reached);
+    }
+    if mode == Mode::Mixed {
+        let fits = added && bitwise && carried && !s.atoms.is_empty();
         return (fits, false, reached);
     }
     if mode == Mode::Counts {
@@ -346,7 +417,8 @@ fn lane_value(t: usize, j: usize, k: usize, mask: u64, consts: &[u64]) -> u64 {
         let digit = match j {
             0 => m % 5,
             1 => m / 5,
-            _ => (m % 5 + m / 5) % 5,
+            2 => (m % 5 + m / 5) % 5,
+            _ => (m % 5 + (j - 1) * (m / 5) + j) % 5,
         };
         return boundary[digit];
     }
@@ -809,10 +881,581 @@ pub(super) fn slack(cx: &Context, n: u32, e: u32, before: u32) -> u32 {
     u32::from(tree(n) != u32::MAX && tree(e) < tree(n))
 }
 
+/// A signed, shifted term `sign * (expr << shift)` inside an `Add`/`Sub` carry-save bag.
+#[derive(Clone, Copy)]
+struct CsaTerm {
+    sign: i8,
+    expr: u32,
+    shift: u16,
+}
+
+const MAX_CSA_INITIAL: usize = 32;
+const MAX_CSA_BAG: usize = 64;
+
+fn are_const_complements(cx: &Context, a: u32, b: u32) -> bool {
+    if cx.are_bitwise_complements(a, b) {
+        return true;
+    }
+    if let (Some(va), Some(vb)) = (cx.const_val(a), cx.const_val(b))
+        && va.width() == vb.width()
+    {
+        return BitVec::bin_unchecked(BinOp::Xor, &va, &vb).is_ones();
+    }
+    false
+}
+
+/// Evaluates `id` as a uniform 3-variable boolean truth table over `leaves` (`len <= 3`), where
+/// row `r` (`0..8`) assigns `(r >> j) & 1` to `leaves[j]`. Returns `None` if `id` leaves the
+/// pure uniform boolean cone (`And`, `Or`, `Xor`, `Not`, `0`, `ones`) over `leaves` or exceeds
+/// `budget` visits.
+fn eval_bool_tt(cx: &Context, id: u32, leaves: &[u32], budget: &mut u32) -> Option<u8> {
+    const LEAF_TT: [u8; 3] = [0xaa, 0xcc, 0xf0];
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    for (j, &leaf) in leaves.iter().enumerate() {
+        if id == leaf {
+            return Some(LEAF_TT[j]);
+        }
+        if are_const_complements(cx, id, leaf) {
+            return Some(!LEAF_TT[j]);
+        }
+    }
+    if let Some(v) = cx.const_val(id) {
+        if v.is_zero() {
+            return Some(0x00);
+        }
+        if v.is_ones() {
+            return Some(0xff);
+        }
+        return None;
+    }
+    let n = cx.node(id);
+    match n.op {
+        OpCode::Not => Some(!eval_bool_tt(cx, n.a, leaves, budget)?),
+        OpCode::And => {
+            let a = eval_bool_tt(cx, n.a, leaves, budget)?;
+            let b = eval_bool_tt(cx, n.b, leaves, budget)?;
+            Some(a & b)
+        }
+        OpCode::Or => {
+            let a = eval_bool_tt(cx, n.a, leaves, budget)?;
+            let b = eval_bool_tt(cx, n.b, leaves, budget)?;
+            Some(a | b)
+        }
+        OpCode::Xor => {
+            let a = eval_bool_tt(cx, n.a, leaves, budget)?;
+            let b = eval_bool_tt(cx, n.b, leaves, budget)?;
+            Some(a ^ b)
+        }
+        OpCode::Select if n.width == 1 => {
+            let c = eval_bool_tt(cx, n.a, leaves, budget)?;
+            let t = eval_bool_tt(cx, n.b, leaves, budget)?;
+            let e = eval_bool_tt(cx, n.c, leaves, budget)?;
+            Some((c & t) | (!c & e))
+        }
+        _ => None,
+    }
+}
+
+/// Collects up to 3 distinct non-uniform-constant boolean-cone leaves reachable from `roots`.
+fn collect_bool_cone_leaves(cx: &Context, roots: [u32; 2]) -> Option<(usize, [u32; 3])> {
+    let mut leaves = [0u32; 3];
+    let mut len = 0usize;
+    let mut stack = [0u32; 24];
+    stack[0] = roots[0];
+    stack[1] = roots[1];
+    let mut top = 2usize;
+    let mut visits = 0u32;
+    while top > 0 {
+        top -= 1;
+        let id = stack[top];
+        visits += 1;
+        if visits > 24 {
+            return None;
+        }
+        if let Some(v) = cx.const_val(id) {
+            if v.is_zero() || v.is_ones() {
+                continue;
+            }
+            if leaves[..len]
+                .iter()
+                .any(|&l| l == id || are_const_complements(cx, id, l))
+            {
+                continue;
+            }
+            if len == 3 {
+                return None;
+            }
+            leaves[len] = id;
+            len += 1;
+            continue;
+        }
+        let n = cx.node(id);
+        match n.op {
+            OpCode::Not => {
+                if top == stack.len() {
+                    return None;
+                }
+                stack[top] = n.a;
+                top += 1;
+            }
+            OpCode::And | OpCode::Or | OpCode::Xor => {
+                if top + 2 > stack.len() {
+                    return None;
+                }
+                stack[top] = n.b;
+                stack[top + 1] = n.a;
+                top += 2;
+            }
+            _ => {
+                if leaves[..len]
+                    .iter()
+                    .any(|&l| l == id || are_const_complements(cx, id, l))
+                {
+                    continue;
+                }
+                if len == 3 {
+                    return None;
+                }
+                leaves[len] = id;
+                len += 1;
+            }
+        }
+    }
+    (len >= 2).then_some((len, leaves))
+}
+
+/// Checks whether `bt_s` (at shift `k`) and `bt_m` (at shift `k + 1`) form an exact 3:2 or 2:2
+/// carry-save / borrow-save compressor pair over `t` (`2` or `3`) leaves, returning
+/// `(t, leaves, delta, weights)` where for every truth-table row `r in 0..(1 << t)`:
+/// `bt_s.sign * s_r + 2 * bt_m.sign * m_r == delta + Σ weights[j] * r_j` with `weights[j] in {-1, 1}`.
+fn match_csa_pair(
+    cx: &Context,
+    bt_s: CsaTerm,
+    bt_m: CsaTerm,
+) -> Option<(usize, [u32; 3], i32, [i32; 3])> {
+    let is_bw = |id: u32| {
+        matches!(
+            cx.node(id).op,
+            OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not
+        )
+    };
+    if !is_bw(bt_s.expr) || !is_bw(bt_m.expr) {
+        return None;
+    }
+    let peel_not = |id: u32| {
+        let n = cx.node(id);
+        if n.op == OpCode::Not { n.a } else { id }
+    };
+    let mut cands = [(0usize, [0u32; 3]); 4];
+    let mut num_cands = 0usize;
+    let s0 = peel_not(bt_s.expr);
+    if cx.node(s0).op == OpCode::Xor {
+        let sn = cx.node(s0);
+        let (u0, v0) = (peel_not(sn.a), peel_not(sn.b));
+        if cx.node(u0).op == OpCode::Xor {
+            let un = cx.node(u0);
+            cands[num_cands] = (3, [peel_not(un.a), peel_not(un.b), v0]);
+            num_cands += 1;
+        }
+        if cx.node(v0).op == OpCode::Xor {
+            let vn = cx.node(v0);
+            cands[num_cands] = (3, [u0, peel_not(vn.a), peel_not(vn.b)]);
+            num_cands += 1;
+        }
+        cands[num_cands] = (2, [u0, v0, 0]);
+        num_cands += 1;
+    }
+    if let Some(cone_cand) = collect_bool_cone_leaves(cx, [bt_s.expr, bt_m.expr]) {
+        cands[num_cands] = cone_cand;
+        num_cands += 1;
+    }
+    for &(raw_len, raw_leaves) in &cands[..num_cands] {
+        let mut leaves = [0u32; 3];
+        let mut t = 0usize;
+        for &cand_leaf in &raw_leaves[..raw_len] {
+            if let Some(v) = cx.const_val(cand_leaf)
+                && (v.is_zero() || v.is_ones())
+            {
+                continue;
+            }
+            if leaves[..t]
+                .iter()
+                .any(|&prev| prev == cand_leaf || are_const_complements(cx, prev, cand_leaf))
+            {
+                continue;
+            }
+            leaves[t] = cand_leaf;
+            t += 1;
+        }
+        if t < 2 {
+            continue;
+        }
+        let mut b1 = 32u32;
+        let Some(s_tt) = eval_bool_tt(cx, bt_s.expr, &leaves[..t], &mut b1) else {
+            continue;
+        };
+        let mut b2 = 32u32;
+        let Some(m_tt) = eval_bool_tt(cx, bt_m.expr, &leaves[..t], &mut b2) else {
+            continue;
+        };
+        let rows = 1usize << t;
+        let mask_t = if rows == 8 { 0xffu8 } else { (1u8 << rows) - 1 };
+        let m_masked = m_tt & mask_t;
+        if m_masked == 0 || m_masked == mask_t {
+            continue;
+        }
+        let val = |r: usize| -> i32 {
+            i32::from(bt_s.sign) * i32::from((s_tt >> r) & 1)
+                + 2 * i32::from(bt_m.sign) * i32::from((m_tt >> r) & 1)
+        };
+        let delta = val(0);
+        let mut w = [0i32; 3];
+        for (j, wj) in w.iter_mut().enumerate().take(t) {
+            *wj = val(1 << j) - delta;
+        }
+        if w[..t].iter().any(|&wj| wj != 1 && wj != -1) {
+            continue;
+        }
+        let exact = (0..rows).all(|r| {
+            let mut want = delta;
+            for (j, &wj) in w[..t].iter().enumerate() {
+                if (r >> j) & 1 == 1 {
+                    want += wj;
+                }
+            }
+            val(r) == want
+        });
+        if exact {
+            return Some((t, leaves, delta, w));
+        }
+    }
+    None
+}
+
+/// Pushes `sign * (id << sh)` into `bag` (or `konst` when constant), unwrapping `Add`, `Sub`,
+/// `Neg`, constant `Shl`, `±2^k` `Mul`, and `Not` over arithmetic/shifted subexpressions.
+fn push_csa_term(
+    cx: &Context,
+    bag: &mut Vec<CsaTerm>,
+    konst: &mut BitVec,
+    sign: i8,
+    id: u32,
+    sh: u16,
+    max_bag: usize,
+) {
+    let w = konst.width();
+    let bits = w.bits();
+    let mut stack = vec![(sign, id, sh)];
+    let mut steps = 0usize;
+    while let Some((sg, cur, cur_sh)) = stack.pop() {
+        if cur_sh >= bits {
+            continue;
+        }
+        steps += 1;
+        if steps > 64 {
+            bag.push(CsaTerm {
+                sign: sg,
+                expr: cur,
+                shift: cur_sh,
+            });
+            continue;
+        }
+        if let Some(cv) = cx.const_val(cur) {
+            let scaled = crate::facts::known::bv_shl(&cv, u32::from(cur_sh));
+            *konst = if sg > 0 {
+                BitVec::bin_unchecked(BinOp::Add, konst, &scaled)
+            } else {
+                BitVec::bin_unchecked(BinOp::Sub, konst, &scaled)
+            };
+            continue;
+        }
+        let nd = cx.node(cur);
+        if nd.op == OpCode::Shl
+            && let Some(sv) = cx.const_val(nd.b)
+        {
+            if let Some(extra) = sv.to_u64()
+                && u64::from(cur_sh) + extra < u64::from(bits)
+            {
+                stack.push((sg, nd.a, cur_sh + extra as u16));
+            }
+            continue;
+        }
+        if nd.op == OpCode::Mul && (cx.is_const(nd.a) || cx.is_const(nd.b)) {
+            let (x, c_id) = if cx.is_const(nd.b) {
+                (nd.a, nd.b)
+            } else {
+                (nd.b, nd.a)
+            };
+            if let Some(cv) = cx.const_val(c_id) {
+                if cv.is_zero() {
+                    continue;
+                }
+                if crate::facts::known::count_ones(&cv) == 1 {
+                    let extra = crate::facts::known::trailing_zeros(&cv);
+                    if u32::from(cur_sh) + extra < u32::from(bits) {
+                        stack.push((sg, x, cur_sh + extra as u16));
+                    }
+                    continue;
+                }
+                let neg_cv = BitVec::un_unchecked(UnOp::Neg, &cv);
+                if crate::facts::known::count_ones(&neg_cv) == 1 {
+                    let extra = crate::facts::known::trailing_zeros(&neg_cv);
+                    if u32::from(cur_sh) + extra < u32::from(bits) {
+                        stack.push((-sg, x, cur_sh + extra as u16));
+                    }
+                    continue;
+                }
+            }
+        }
+        let can_split = bag.len() + stack.len() + 1 < max_bag;
+        match nd.op {
+            OpCode::Add if can_split => {
+                stack.push((sg, nd.b, cur_sh));
+                stack.push((sg, nd.a, cur_sh));
+            }
+            OpCode::Sub if can_split => {
+                stack.push((-sg, nd.b, cur_sh));
+                stack.push((sg, nd.a, cur_sh));
+            }
+            OpCode::Neg => {
+                stack.push((-sg, nd.a, cur_sh));
+            }
+            OpCode::Not
+                if matches!(
+                    cx.node(nd.a).op,
+                    OpCode::Shl | OpCode::Mul | OpCode::Add | OpCode::Sub | OpCode::Neg
+                ) =>
+            {
+                // `~u << sh == -(2^sh) - (u << sh)` modulo `2^W`.
+                let pow = crate::facts::known::bv_shl(&BitVec::one(w), u32::from(cur_sh));
+                *konst = if sg > 0 {
+                    BitVec::bin_unchecked(BinOp::Sub, konst, &pow)
+                } else {
+                    BitVec::bin_unchecked(BinOp::Add, konst, &pow)
+                };
+                stack.push((-sg, nd.a, cur_sh));
+            }
+            _ => bag.push(CsaTerm {
+                sign: sg,
+                expr: cur,
+                shift: cur_sh,
+            }),
+        }
+    }
+}
+
+/// Combines identical `(expr, shift)` entries in `bag` (`+x - x -> 0`, `±x ± x -> ±(x << 1)`).
+fn normalize_csa_bag(bag: &mut Vec<CsaTerm>, bits: u16) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        'outer: for i in 0..bag.len() {
+            for j in (i + 1)..bag.len() {
+                if bag[i].expr == bag[j].expr && bag[i].shift == bag[j].shift {
+                    let s1 = bag[i].sign;
+                    let s2 = bag[j].sign;
+                    let expr = bag[i].expr;
+                    let sh = bag[i].shift;
+                    bag.swap_remove(j);
+                    bag.swap_remove(i);
+                    if s1 == s2 && sh + 1 < bits {
+                        bag.push(CsaTerm {
+                            sign: s1,
+                            expr,
+                            shift: sh + 1,
+                        });
+                    }
+                    changed = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+}
+
+/// Width-polymorphic (`1..=512`) exact 3:2 / 2:2 carry-save and borrow-save compressor folding
+/// across `Add`/`Sub` bags and multi-layer Wallace/Dadda trees.
+fn step_csa(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Option<Step>, Stop> {
+    let bits = cx.wid(n);
+    if bits < 2 || !matches!(cx.node(n).op, OpCode::Add | OpCode::Sub) {
+        return Ok(None);
+    }
+    let w = cx.width_of(n);
+    let mut konst = BitVec::zero(w);
+    let mut bag: Vec<CsaTerm> = Vec::new();
+    push_csa_term(cx, &mut bag, &mut konst, 1, n, 0, MAX_CSA_INITIAL);
+    let is_bw = |id: u32| {
+        matches!(
+            cx.node(id).op,
+            OpCode::And | OpCode::Or | OpCode::Xor | OpCode::Not
+        )
+    };
+    if bag.len() < 2 || !bag.iter().any(|t| t.shift > 0 && is_bw(t.expr)) {
+        return Ok(None);
+    }
+    r.meter.charge(Counter::PassWork, bag.len() as u64)?;
+
+    let mut reduced = 0usize;
+    for _ in 0..32 {
+        normalize_csa_bag(&mut bag, bits);
+        let mut matched = None;
+        'search: for i in 0..bag.len() {
+            let k = bag[i].shift;
+            if k + 1 >= bits {
+                continue;
+            }
+            for j in 0..bag.len() {
+                if i != j
+                    && bag[j].shift == k + 1
+                    && let Some(m) = match_csa_pair(cx, bag[i], bag[j])
+                {
+                    matched = Some((i, j, k, m));
+                    break 'search;
+                }
+            }
+        }
+        let Some((i, j, k, (t, leaves, delta, weights))) = matched else {
+            break;
+        };
+        reduced += 1;
+        r.meter.charge(Counter::PassWork, 4)?;
+        if delta != 0 {
+            let pow_k = crate::facts::known::bv_shl(&BitVec::one(w), u32::from(k));
+            let mag = BitVec::wrapping_from_u64(w, u64::from(delta.unsigned_abs()));
+            let term = BitVec::bin_unchecked(BinOp::Mul, &mag, &pow_k);
+            // `(-delta) * 2^k` modulo `2^W`.
+            konst = if delta > 0 {
+                BitVec::bin_unchecked(BinOp::Sub, &konst, &term)
+            } else {
+                BitVec::bin_unchecked(BinOp::Add, &konst, &term)
+            };
+        }
+        let (hi_idx, lo_idx) = if i > j { (i, j) } else { (j, i) };
+        bag.swap_remove(hi_idx);
+        bag.swap_remove(lo_idx);
+        for idx in 0..t {
+            push_csa_term(
+                cx,
+                &mut bag,
+                &mut konst,
+                weights[idx] as i8,
+                leaves[idx],
+                k,
+                MAX_CSA_BAG,
+            );
+        }
+    }
+    if reduced == 0 {
+        return Ok(None);
+    }
+
+    let one = BitVec::one(w);
+    let mut raw_terms: Vec<(u32, BitVec)> = Vec::with_capacity(bag.len());
+    for bt in &bag {
+        let mut scale = crate::facts::known::bv_shl(&one, u32::from(bt.shift));
+        if bt.sign < 0 {
+            scale = BitVec::un_unchecked(UnOp::Neg, &scale);
+        }
+        raw_terms.push((bt.expr, scale));
+    }
+    let form = linear::Form::of(konst, &raw_terms);
+    let (f_konst, f_terms) = form.konst_terms();
+    let stops: Vec<u32> = f_terms.iter().map(|&(a, _)| a).collect();
+    let before = cx.len() as u32;
+
+    // Factor a common shift `g > 0` across `(±a ± b ± ...) << g` when cheaper than individual shifts.
+    let mut common_shift = if f_terms.len() >= 2 {
+        let mut g = u32::from(bits);
+        for (_, coef) in f_terms {
+            g = g.min(crate::facts::known::trailing_zeros(coef));
+        }
+        if !f_konst.is_zero() {
+            g = g.min(crate::facts::known::trailing_zeros(f_konst));
+        }
+        if g > 0 && g < u32::from(bits) { g } else { 0 }
+    } else {
+        0
+    };
+
+    let e = if common_shift > 0 {
+        let sh_bv = BitVec::wrapping_from_u64(w, u64::from(common_shift));
+        let unscale = |v: &BitVec| -> BitVec {
+            if v.is_zero() {
+                BitVec::zero(w)
+            } else if common_shift == u32::from(bits) - 1 {
+                BitVec::one(w)
+            } else {
+                BitVec::bin_unchecked(BinOp::AShr, v, &sh_bv)
+            }
+        };
+        let u_terms: Vec<(u32, BitVec)> =
+            f_terms.iter().map(|&(a, ref k)| (a, unscale(k))).collect();
+        let unshifted = linear::Form::of(unscale(f_konst), &u_terms);
+        let est_sh = linear::estimate(&unshifted).saturating_add(2);
+        let est_plain = linear::estimate(&form);
+        if est_sh < est_plain {
+            if let Some(fin) = worth_building(r, cx, n, &stops, est_sh)? {
+                count(r).rejected_cost += 1;
+                return Ok(Some(Step::Normal(fin)));
+            }
+            let inner = linear::emit(r, cx, &unshifted)?;
+            r.build(cx, |cx| {
+                let sh_c = cx.mk_const(&sh_bv)?;
+                cx.c_bin(BinOp::Shl, inner, sh_c)
+            })?
+        } else {
+            common_shift = 0;
+            0
+        }
+    } else {
+        0
+    };
+
+    let e = if common_shift > 0 {
+        e
+    } else {
+        if let Some(fin) = worth_building(r, cx, n, &stops, linear::estimate(&form))? {
+            count(r).rejected_cost += 1;
+            return Ok(Some(Step::Normal(fin)));
+        }
+        linear::emit(r, cx, &form)?
+    };
+
+    let explain_konst = *f_konst;
+    let explain_terms: Vec<_> = f_terms.iter().map(|&(a, k)| (cx.handle(a), k)).collect();
+    r.explain_with(|| crate::engine::Explanation::Carries {
+        konst: explain_konst,
+        terms: explain_terms,
+        proved: false,
+    });
+    Ok(Some(finish(
+        r,
+        cx,
+        PassKind::Carries,
+        n,
+        e,
+        before,
+        &stops,
+        Fin::FINAL,
+    )?))
+}
+
 /// The carries pass at `n`.
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let bits = cx.wid(n);
     let op = cx.node(n).op;
+    let mut csa_declined = Fin::FINAL;
+    if matches!(op, OpCode::Add | OpCode::Sub)
+        && let Some(step) = step_csa(r, cx, n)?
+    {
+        match step {
+            Step::Normal(f) => csa_declined = f,
+            done => return Ok(done),
+        }
+    }
     // A sum read on its low bits only (`trunc<j>(s)`, `s & (2^j − 1)`): its carries are
     // completed there, where `j` bits may be few enough for a carry the whole sum is too
     // wide for; or it is the slice of a word below it.
@@ -867,13 +1510,13 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     // Where a sum's digits are joined without a `concat`: `hi << k | lo`, or a sum of them.
     let joined = matches!(op, OpCode::Or | OpCode::Xor | OpCode::Add | OpCode::Sub);
     if bits > 64 {
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(csa_declined));
     }
     if !(slices || joined || interior(cx, n)) {
         if ends_count(cx, n) {
             return step_count(r, cx, n);
         }
-        return Ok(Step::Normal(Fin::FINAL));
+        return Ok(Step::Normal(csa_declined));
     }
     let mask = u64::MAX >> (64 - bits);
     // The form, and whether it is exact by construction.
@@ -894,11 +1537,35 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 });
                 // One shift is its own form (`a << k`).
                 if r.carries.order.len() == 1 && (1..u64::from(bits)).contains(&k) {
-                    return Ok(Step::Normal(Fin::FINAL));
+                    return Ok(Step::Normal(csa_declined));
                 }
                 let coeff = if k < u64::from(bits) { 1u64 << k } else { 0 };
                 found = Some((0, vec![coeff], true));
             } else {
+                found = fit(r, cx, mask)?.map(|(konst, coeffs)| (konst, coeffs, false));
+            }
+        }
+    }
+    if found.is_none() && matches!(op, OpCode::Add | OpCode::Sub) {
+        let nd = cx.node(n);
+        let may_carry = |id: u32| {
+            matches!(
+                cx.node(id).op,
+                OpCode::Add
+                    | OpCode::Sub
+                    | OpCode::Neg
+                    | OpCode::Shl
+                    | OpCode::And
+                    | OpCode::Or
+                    | OpCode::Xor
+                    | OpCode::Not
+            ) || (cx.node(id).op == OpCode::Mul && mixed(cx, id))
+        };
+        if may_carry(nd.a) && may_carry(nd.b) {
+            let (fits, _, reached) = walk(cx, n, &mut r.carries, Mode::Mixed);
+            if fits {
+                r.meter.charge(Counter::PassWork, u64::from(reached))?;
+                r.carries.atoms.sort_by(|a, b| cx.order(*a, *b));
                 found = fit(r, cx, mask)?.map(|(konst, coeffs)| (konst, coeffs, false));
             }
         }
@@ -913,7 +1580,7 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     }
     let Some((konst, coeffs, exact)) = found else {
         // A sum of digits and the carries between them, written as comparisons.
-        let mut own = Fin::FINAL;
+        let mut own = csa_declined;
         if matches!(op, OpCode::Add | OpCode::Sub) {
             let before = cx.len() as u32;
             if let Some((e, fin, stops, _)) = super::borrows::expanded(r, cx, n, bits, false)? {

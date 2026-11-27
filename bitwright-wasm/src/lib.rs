@@ -65,6 +65,7 @@ const EQUIVALENCE_QUERY: u32 = 20;
 const CHECK_RULES: u32 = 21;
 const LEAN_TO_RULES: u32 = 22;
 const RUN_SMTLIB: u32 = 23;
+const FUNCTIONAL_DEF: u32 = 24;
 
 /// The command line's deobfuscation strategy: the MBA service, on bitwright's own evidence.
 fn deobfuscate_strategy() -> Strategy {
@@ -377,6 +378,32 @@ fn call(op: u32, a: &str, b: &str, n: u32) -> Result<String, String> {
             let cfg = bw::solve::Config::default();
             bw::smtlib::run(&mut cx, a, &cfg, &mut out).map_err(|e| e.to_string())?;
             Ok(out)
+        }
+        FUNCTIONAL_DEF => {
+            // `a`: newline-separated 1-bit assertions; `b`: `target\0in0\0in1...`
+            let mut cx = Context::new();
+            let o = ParseOptions::width(width(n)?);
+            let mut solver = bw::solve::Solver::default();
+            for line in a.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let p = cx.parse(line, &o).map_err(|e| e.to_string())?;
+                solver.assert(&cx, p).map_err(|e| e.to_string())?;
+            }
+            let mut parts = b.split('\0');
+            let target_str = parts.next().ok_or_else(|| "missing target".to_string())?;
+            let target = cx.parse(target_str, &o).map_err(|e| e.to_string())?;
+            let mut inputs = Vec::new();
+            for inp in parts.filter(|s| !s.is_empty()) {
+                inputs.push(cx.parse(inp, &o).map_err(|e| e.to_string())?);
+            }
+            Ok(
+                match solver
+                    .functional_def(&mut cx, target, &inputs)
+                    .map_err(|e| e.to_string())?
+                {
+                    Some(def) => cx.display(def).to_string(),
+                    None => String::new(),
+                },
+            )
         }
         _ => Err(format!("unknown operation {op}")),
     }

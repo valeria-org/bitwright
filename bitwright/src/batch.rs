@@ -9,13 +9,17 @@
 //! alone: not on the other questions, their order, the number of threads, what the store
 //! already holds, or what was cancelled.
 //!
-//! With [`Split`], a question is cut where its noise cancels. Every node is evaluated at a
-//! few assignments of the symbols; a node with one value at all of them, over something that
-//! varies, is a *hub*, and is asked on its own: "is this the constant it looks like?". Hubs
-//! proved are replaced by their constants, in the hubs above them first and in the question
-//! last. Sampling only chooses where to cut: a constant is substituted when the engine folded
-//! the hub to it or the search proved the equality, never because the samples agreed. A hub
-//! is one task however many questions contain it, and its answer is kept in the store.
+//! With [`Split`], a question is cut where its noise cancels or where two parts compute one
+//! value. Every node is evaluated at a few assignments of the symbols; a node with one value
+//! at all of them, over something that varies, is a *hub*, and is asked on its own: "is this
+//! the constant it looks like?". Varying subexpressions of one width that agree (or are
+//! bitwise complements) at every sample are likewise asked as equality questions of their
+//! own ([`Split::equivalences`]), and each proved equal is replaced by the smaller
+//! representative (or its complement). Hubs proved are replaced in the hubs above them first
+//! and in the question last. Sampling only chooses where to cut: a constant or representative
+//! is substituted when the engine folded the hub or the search proved the equality, never
+//! because the samples agreed. A hub is one task however many questions contain it, and its
+//! answer is kept in the store.
 //!
 //! A question asked [under assumptions](Ask::under) is sampled where they hold. Where no
 //! point satisfies them (a symbol held below a bound, say) an assignment that does is
@@ -62,6 +66,11 @@ pub struct Split {
     /// Ask each hub (a node with one value at every sample, over something that varies) as a
     /// question of its own, and replace those proved constant.
     pub hubs: bool,
+    /// Ask varying internal subexpressions of one width that agree — or are bitwise
+    /// complements — at every sample point as equivalence questions of their own, and
+    /// replace those proved equal by the smaller representative (or its complement) before
+    /// deciding the question or hub above them. On by default.
+    pub equivalences: bool,
     /// When a hub is not proved as written, ask the hubs below it and then the hub with
     /// those proved replaced, and so on down. Without it only the topmost hubs of a
     /// question are asked, each as written.
@@ -104,11 +113,12 @@ pub struct Split {
 }
 
 impl Default for Split {
-    /// Proofs asked whole first; then hubs, nested, with terms regrouped and two levels of
-    /// case split, from 64 points.
+    /// Proofs asked whole first; then constant and equivalence hubs, nested, with terms
+    /// regrouped and two levels of case split, from 64 points.
     fn default() -> Self {
         Split {
             hubs: true,
+            equivalences: true,
             nested: true,
             terms: true,
             cases: 2,
@@ -147,6 +157,7 @@ impl Split {
     pub fn none() -> Split {
         Split {
             hubs: false,
+            equivalences: false,
             nested: false,
             terms: false,
             cases: 0,
@@ -161,6 +172,7 @@ impl Split {
 
 setters!(Split {
     with_hubs: hubs: bool,
+    with_equivalences: equivalences: bool,
     with_nested: nested: bool,
     with_terms: terms: bool,
     with_cases: cases: u8,
@@ -458,7 +470,7 @@ pub struct Stats {
     pub tasks_stored: u64,
     /// Hubs asked...
     pub hubs: u64,
-    /// ...and proved constant.
+    /// ...and proved.
     pub hubs_proved: u64,
     /// Chains of `+` or `^` regrouped.
     pub regrouped: u64,
@@ -487,6 +499,8 @@ enum What {
     /// A proof of the root, `x == k`, by the engine on `x` first: within a hub's limits
     /// ([`Config::hub`])...
     LeafHub,
+    /// ...or of an equality between two varying subexpressions, within a hub's limits...
+    LeafEq,
     /// ...or a question's.
     LeafConstant,
     /// The root is a hub: is it its constant? With the case splits already made above it.
@@ -544,9 +558,9 @@ struct Entry {
     total: Cost,
     /// The tasks it was made of.
     parts: Vec<Arc<Entry>>,
-    /// Of a hub: the proved constants to write for it. Itself, when proved; otherwise
-    /// those of the hubs below it.
-    subst: Arc<[(u32, BitVec)]>,
+    /// Of a hub: the proved replacements (`from -> to` in the store's context) to write
+    /// for it. Itself to its constant, when proved; otherwise those of the hubs below it.
+    subst: Arc<[(u32, u32)]>,
 }
 
 /// The asks a task works for.
@@ -600,6 +614,14 @@ enum State {
     Cancelled,
 }
 
+/// An equivalence-hub proof attached to a hub or question: `job` proves `to == from`.
+#[derive(Copy, Clone, Debug)]
+struct EqEdge {
+    job: usize,
+    from: u32,
+    to: u32,
+}
+
 #[derive(Debug)]
 enum Plan {
     Leaf,
@@ -608,6 +630,10 @@ enum Plan {
         k: BitVec,
         /// The hubs nearest below it, once it was not proved as written.
         below: Vec<usize>,
+        /// Equivalence hubs planned below it, once constant hubs below it are done.
+        eq_planned: bool,
+        eq_again: bool,
+        eqs: Vec<EqEdge>,
         /// Its proofs: as written, and with the hubs below it replaced.
         proofs: [Option<usize>; 2],
         /// The hubs below it that were not proved were asked again under its assumptions.
@@ -629,6 +655,10 @@ enum Plan {
         read: bool,
         /// Its hubs that were not proved were asked again under its assumptions.
         again: bool,
+        /// Equivalence hubs planned on what remains after constant hubs.
+        eq_planned: bool,
+        eq_again: bool,
+        eqs: Vec<EqEdge>,
         /// The root with its chains regrouped.
         root: u32,
         /// The topmost hubs below it.
@@ -678,6 +708,8 @@ struct Store {
     registry: Option<Arc<crate::ext::Registry>>,
     /// What the samples say of the context's nodes.
     sampled: Sampled,
+    /// Polarity-canonicalized sample signatures of the context's nodes.
+    eq_sampled: EqSampled,
     /// Per set of assumptions that does not hold at every point: where it holds.
     views: HashMap<Assumed, View>,
     next_id: u64,
@@ -691,6 +723,7 @@ impl Store {
         cx.registry = src.registry.clone();
         self.cx = cx;
         self.sampled = Sampled::default();
+        self.eq_sampled.clear();
         self.views.clear();
         self.done.clear();
         self.config = Some(src.config().clone());
@@ -708,6 +741,30 @@ impl Store {
             subst: Arc::from([]),
         }
     }
+}
+
+/// Maximum equivalence-hub tasks scheduled per question or hub stage.
+const MAX_EQ_HUBS: usize = 32;
+
+/// Polarity-canonicalized sample signature of a node: `pol` is bit 0 of the first sample
+/// (when true, every sample was bitwise-negated before hashing into `(h1, h2)`), and
+/// `konst` records whether every sample had one value.
+#[derive(Copy, Clone, Debug)]
+struct EqSig {
+    h1: u64,
+    h2: u64,
+    pol: bool,
+    konst: bool,
+}
+
+type EqSampled = IdMap<u32, EqSig>;
+
+#[derive(Copy, Clone, Debug)]
+struct EqCand {
+    cand: u32,
+    target: u32,
+    rep: u32,
+    everywhere: bool,
 }
 
 /// What the samples say of a node: whether it had one value at every point, its value at
@@ -732,6 +789,11 @@ struct View {
     /// The nodes that move at a point where the assumptions do not hold, or at a probe.
     moves: HashSet<u32>,
     sampled: Sampled,
+    /// Deterministic `(seed, overrides)` points where the assumptions hold, for equivalence
+    /// hubs under assumptions (including narrow ranges such as `x <u 16`).
+    eq_ready: bool,
+    eq_points: Vec<(u32, Model)>,
+    eq_sampled: EqSampled,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -958,12 +1020,18 @@ fn probes(cx: &mut Context, es: &[u32]) -> Result<Vec<Model>, Error> {
     Ok(out)
 }
 
-/// The hubs nearest below the nodes `from` (those themselves, when they are hubs). A hub
-/// is a node with one value at the samples though something below it varies: where noise
-/// cancels. Of a chain of such nodes that only add a literal constant to the one below
-/// (or negate it, or mask it), the lowest is the hub: what many questions share is the
-/// noise, and each has its own constant on top.
-fn hubs_below(cx: &Context, s: &Sampled, from: &[u32], split: &Split) -> Vec<u32> {
+/// The hubs nearest below the nodes `from` (those themselves, when they are hubs, except
+/// `skip` when cutting a question's own root). A hub is a node with one value at the
+/// samples though something below it varies: where noise cancels. Of a chain of such nodes
+/// that only add a literal constant to the one below (or negate it, or mask it), the lowest
+/// is the hub: what many questions share is the noise, and each has its own constant on top.
+fn hubs_below(
+    cx: &Context,
+    s: &Sampled,
+    from: &[u32],
+    split: &Split,
+    skip: Option<u32>,
+) -> Vec<u32> {
     let cancels = |i: u32| s.get(&i).is_some_and(|x| x.0 && x.2);
     let mut seen: HashSet<u32> = HashSet::new();
     let mut stack: Vec<u32> = from.to_vec();
@@ -973,7 +1041,7 @@ fn hubs_below(cx: &Context, s: &Sampled, from: &[u32], split: &Split) -> Vec<u32
             continue;
         }
         let n = cx.node(i);
-        if !cancels(i) {
+        if Some(i) == skip || !cancels(i) {
             stack.extend(n.children());
             continue;
         }
@@ -1003,6 +1071,537 @@ fn hubs_below(cx: &Context, s: &Sampled, from: &[u32], split: &Split) -> Vec<u32
         }
     }
     hubs
+}
+
+#[inline]
+fn hash_bv(mut h: u64, v: &BitVec) -> u64 {
+    if v.width().bits() <= 64 {
+        crate::hash::combine(h, v.limbs()[0])
+    } else {
+        for &l in v.limbs() {
+            h = crate::hash::combine(h, l);
+        }
+        h
+    }
+}
+
+#[inline]
+fn mask_low(v: &BitVec, bits: u16) -> BitVec {
+    let w = v.width();
+    if bits >= w.bits() {
+        return *v;
+    }
+    let shift = BitVec::wrapping_from_u64(w, u64::from(w.bits() - bits));
+    let mask = BitVec::bin_unchecked(BinOp::LShr, &BitVec::ones(w), &shift);
+    BitVec::bin_unchecked(BinOp::And, v, &mask)
+}
+
+/// Samples polarity-canonicalized signatures of nodes below `roots` into `known` across the
+/// unconditional points `0..points.max(2)`.
+fn sample_eq_unconditional(
+    cx: &mut Context,
+    known: &mut EqSampled,
+    roots: &[u32],
+    points: u32,
+) -> Result<(), Error> {
+    let missing: Vec<u32> = roots
+        .iter()
+        .copied()
+        .filter(|i| !known.contains_key(i))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let n = points.max(2) as usize;
+    let order = cx.post_order_ids(&missing);
+    let handles: Vec<Expr> = order.iter().map(|&i| cx.handle(i)).collect();
+    let symbols = symbols_below(cx, &missing)?;
+    let mut first: Vec<BitVec> = Vec::new();
+    let mut pol = vec![false; order.len()];
+    let mut konst = vec![true; order.len()];
+    let mut h1 = vec![0x6571_5f68_7562_3121u64; order.len()];
+    let mut h2 = vec![0x6571_5f68_7562_3221u64; order.len()];
+    for p in 0..n {
+        let env: HashMap<SymbolKey, BitVec> = symbols
+            .iter()
+            .map(|(key, w, decl)| (key.clone(), point_value(key, *w, *decl, p as u32)))
+            .collect();
+        let vals = cx.eval(&handles, &env)?;
+        if p == 0 {
+            for (k, v) in vals.iter().enumerate() {
+                pol[k] = v.bit(0).unwrap_or(false);
+                let canon = if pol[k] {
+                    BitVec::un_unchecked(UnOp::Not, v)
+                } else {
+                    *v
+                };
+                h1[k] = hash_bv(h1[k], &canon);
+                h2[k] = hash_bv(h2[k], &canon);
+            }
+            first = vals;
+        } else {
+            for (k, v) in vals.iter().enumerate() {
+                konst[k] &= *v == first[k];
+                let canon = if pol[k] {
+                    BitVec::un_unchecked(UnOp::Not, v)
+                } else {
+                    *v
+                };
+                h1[k] = hash_bv(h1[k], &canon);
+                h2[k] = hash_bv(h2[k], &canon);
+            }
+        }
+    }
+    for (k, &i) in order.iter().enumerate() {
+        known.entry(i).or_insert(EqSig {
+            h1: h1[k],
+            h2: h2[k],
+            pol: pol[k],
+            konst: konst[k],
+        });
+    }
+    Ok(())
+}
+
+/// Evaluates `nodes` across the unconditional points `0..points.max(2)`.
+fn eval_eq_unconditional(
+    cx: &mut Context,
+    nodes: &[u32],
+    points: u32,
+) -> Result<IdMap<u32, Vec<BitVec>>, Error> {
+    if nodes.is_empty() {
+        return Ok(IdMap::default());
+    }
+    let n = points.max(2) as usize;
+    let handles: Vec<Expr> = nodes.iter().map(|&i| cx.handle(i)).collect();
+    let symbols = symbols_below(cx, nodes)?;
+    let blank = BitVec::zero(Width::W1);
+    let mut out: IdMap<u32, Vec<BitVec>> = nodes.iter().map(|&i| (i, vec![blank; n])).collect();
+    for p in 0..n {
+        let env: HashMap<SymbolKey, BitVec> = symbols
+            .iter()
+            .map(|(key, w, decl)| (key.clone(), point_value(key, *w, *decl, p as u32)))
+            .collect();
+        let vals = cx.eval(&handles, &env)?;
+        for (&node, &val) in nodes.iter().zip(&vals) {
+            if let Some(slot) = out.get_mut(&node) {
+                slot[p] = val;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Populates `view.eq_points` with deterministic `(seed, overrides)` assignments at which
+/// `assume` holds, supplementing sparse random hits with boundary probes and bit-masked
+/// assignments of the assumptions' symbols.
+fn ensure_view_eq_points(
+    cx: &mut Context,
+    assume: &Assumed,
+    view: &mut View,
+    points: u32,
+) -> Result<(), Error> {
+    if view.eq_ready {
+        return Ok(());
+    }
+    let mut eq_points: Vec<(u32, Model)> = Vec::new();
+    for (p, &held) in view.holds.iter().enumerate() {
+        if held {
+            eq_points.push((p as u32, view.fixed.clone()));
+        }
+    }
+    if eq_points.len() < 16 && !view.searched {
+        let es: Vec<u32> = assume.iter().map(|x| x.0).collect();
+        let es_handles: Vec<Expr> = es.iter().map(|&i| cx.handle(i)).collect();
+        let es_syms = symbols_below(cx, &es)?;
+        let n = points.max(2);
+        for (idx, probe) in view.probes.iter().enumerate() {
+            if eq_points.len() >= 32 {
+                break;
+            }
+            let seed = n.saturating_add(idx as u32);
+            let mut env: HashMap<SymbolKey, BitVec> = es_syms
+                .iter()
+                .map(|(key, w, decl)| (key.clone(), point_value(key, *w, *decl, seed)))
+                .collect();
+            for (k, v) in view.fixed.iter().chain(probe) {
+                if let Some(slot) = env.get_mut(k) {
+                    *slot = *v;
+                }
+            }
+            let vals = cx.eval(&es_handles, &env)?;
+            if assume.iter().zip(&vals).all(|((_, f), v)| f.contains(v)) {
+                let mut merged = view.fixed.clone();
+                for (k, v) in probe {
+                    match merged.iter_mut().find(|x| x.0 == *k) {
+                        Some(slot) => slot.1 = *v,
+                        None => merged.push((k.clone(), *v)),
+                    }
+                }
+                eq_points.push((seed, merged));
+            }
+        }
+        if eq_points.len() < 16 && !es_syms.is_empty() {
+            let mut consts: Vec<BitVec> = cx
+                .post_order_ids(&es)
+                .into_iter()
+                .filter_map(|i| cx.const_val(i))
+                .collect();
+            consts.sort_by(|a, b| (a.width(), a.limbs()).cmp(&(b.width(), b.limbs())));
+            consts.dedup();
+            const WIDTHS: [u16; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32, 40, 48];
+            for step in 0..128u32 {
+                if eq_points.len() >= 32 {
+                    break;
+                }
+                let seed = 10_000 + step;
+                let cap = WIDTHS[(step as usize) % WIDTHS.len()];
+                let mut model = Model::with_capacity(es_syms.len());
+                for (sym_idx, (key, w, decl)) in es_syms.iter().enumerate() {
+                    let raw = point_value(
+                        key,
+                        *w,
+                        None,
+                        seed.wrapping_add((sym_idx as u32).wrapping_mul(257)),
+                    );
+                    let b = cap.min(w.bits());
+                    let cand_v = if step < 64 {
+                        mask_low(&raw, b)
+                    } else if step < 96 {
+                        let same_w: Vec<&BitVec> =
+                            consts.iter().filter(|c| c.width() == *w).collect();
+                        if !same_w.is_empty() {
+                            let c = same_w[((step - 64) as usize) % same_w.len()];
+                            let delta = mask_low(&raw, 4);
+                            if step.is_multiple_of(2) {
+                                BitVec::bin_unchecked(BinOp::Add, c, &delta)
+                            } else {
+                                BitVec::bin_unchecked(BinOp::Sub, c, &delta)
+                            }
+                        } else {
+                            BitVec::un_unchecked(UnOp::Not, &mask_low(&raw, b))
+                        }
+                    } else {
+                        BitVec::un_unchecked(UnOp::Not, &mask_low(&raw, b))
+                    };
+                    model.push((key.clone(), declared(cand_v, *decl)));
+                }
+                let env: HashMap<SymbolKey, BitVec> = model.iter().cloned().collect();
+                let vals = cx.eval(&es_handles, &env)?;
+                if assume.iter().zip(&vals).all(|((_, f), v)| f.contains(v)) {
+                    eq_points.push((seed, model));
+                }
+            }
+        }
+    }
+    view.eq_points = eq_points;
+    view.eq_ready = true;
+    Ok(())
+}
+
+/// Samples polarity-canonicalized signatures of nodes below `roots` into `known` across
+/// `eq_points`.
+fn sample_eq_at_points(
+    cx: &mut Context,
+    known: &mut EqSampled,
+    roots: &[u32],
+    eq_points: &[(u32, Model)],
+) -> Result<(), Error> {
+    if eq_points.len() < 2 {
+        return Ok(());
+    }
+    let missing: Vec<u32> = roots
+        .iter()
+        .copied()
+        .filter(|i| !known.contains_key(i))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let order = cx.post_order_ids(&missing);
+    let handles: Vec<Expr> = order.iter().map(|&i| cx.handle(i)).collect();
+    let symbols = symbols_below(cx, &missing)?;
+    let mut first: Vec<BitVec> = Vec::new();
+    let mut pol = vec![false; order.len()];
+    let mut konst = vec![true; order.len()];
+    let mut h1 = vec![0x6571_5f68_7562_3121u64; order.len()];
+    let mut h2 = vec![0x6571_5f68_7562_3221u64; order.len()];
+    for (idx, (seed, fixed)) in eq_points.iter().enumerate() {
+        let mut env: HashMap<SymbolKey, BitVec> = symbols
+            .iter()
+            .map(|(key, w, decl)| (key.clone(), point_value(key, *w, *decl, *seed)))
+            .collect();
+        for (k, v) in fixed {
+            if let Some(slot) = env.get_mut(k) {
+                *slot = *v;
+            }
+        }
+        let vals = cx.eval(&handles, &env)?;
+        if idx == 0 {
+            for (k, v) in vals.iter().enumerate() {
+                pol[k] = v.bit(0).unwrap_or(false);
+                let canon = if pol[k] {
+                    BitVec::un_unchecked(UnOp::Not, v)
+                } else {
+                    *v
+                };
+                h1[k] = hash_bv(h1[k], &canon);
+                h2[k] = hash_bv(h2[k], &canon);
+            }
+            first = vals;
+        } else {
+            for (k, v) in vals.iter().enumerate() {
+                konst[k] &= *v == first[k];
+                let canon = if pol[k] {
+                    BitVec::un_unchecked(UnOp::Not, v)
+                } else {
+                    *v
+                };
+                h1[k] = hash_bv(h1[k], &canon);
+                h2[k] = hash_bv(h2[k], &canon);
+            }
+        }
+    }
+    for (k, &i) in order.iter().enumerate() {
+        known.entry(i).or_insert(EqSig {
+            h1: h1[k],
+            h2: h2[k],
+            pol: pol[k],
+            konst: konst[k],
+        });
+    }
+    Ok(())
+}
+
+/// Evaluates `nodes` across `eq_points`.
+fn eval_eq_at_points(
+    cx: &mut Context,
+    nodes: &[u32],
+    eq_points: &[(u32, Model)],
+) -> Result<IdMap<u32, Vec<BitVec>>, Error> {
+    if nodes.is_empty() || eq_points.is_empty() {
+        return Ok(IdMap::default());
+    }
+    let handles: Vec<Expr> = nodes.iter().map(|&i| cx.handle(i)).collect();
+    let symbols = symbols_below(cx, nodes)?;
+    let blank = BitVec::zero(Width::W1);
+    let m = eq_points.len();
+    let mut out: IdMap<u32, Vec<BitVec>> = nodes.iter().map(|&i| (i, vec![blank; m])).collect();
+    for (idx, (seed, fixed)) in eq_points.iter().enumerate() {
+        let mut env: HashMap<SymbolKey, BitVec> = symbols
+            .iter()
+            .map(|(key, w, decl)| (key.clone(), point_value(key, *w, *decl, *seed)))
+            .collect();
+        for (k, v) in fixed {
+            if let Some(slot) = env.get_mut(k) {
+                *slot = *v;
+            }
+        }
+        let vals = cx.eval(&handles, &env)?;
+        for (&node, &val) in nodes.iter().zip(&vals) {
+            if let Some(slot) = out.get_mut(&node) {
+                slot[idx] = val;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `cand` and `other` rebuild to one node once lower equivalences in `canon` hold.
+fn is_congruent(cx: &Context, cand: u32, other: u32, canon: &IdMap<u32, (u32, bool)>) -> bool {
+    let (nc, no) = (cx.node(cand), cx.node(other));
+    if nc.op != no.op || nc.width != no.width || nc.aux != no.aux {
+        return false;
+    }
+    let arity = nc.op.arity();
+    if arity == 0 || (arity == 1 && (nc.b != no.b || nc.c != no.c)) || (arity == 2 && nc.c != no.c)
+    {
+        return false;
+    }
+    match arity {
+        1 => canon.get(&nc.a) == canon.get(&no.a),
+        2 => {
+            let (Some(&ca0), Some(&ca1)) = (canon.get(&nc.a), canon.get(&nc.b)) else {
+                return false;
+            };
+            let (Some(&cb0), Some(&cb1)) = (canon.get(&no.a), canon.get(&no.b)) else {
+                return false;
+            };
+            let comm = nc.op.as_bin().is_some_and(BinOp::is_commutative)
+                || matches!(nc.op, OpCode::Eq | OpCode::Ne);
+            (ca0 == cb0 && ca1 == cb1) || (comm && ca0 == cb1 && ca1 == cb0)
+        }
+        3 if nc.op == OpCode::Select => {
+            let (Some(&cc), Some(&ct), Some(&ce)) =
+                (canon.get(&nc.a), canon.get(&nc.b), canon.get(&nc.c))
+            else {
+                return false;
+            };
+            let (Some(&oc), Some(&ot), Some(&oe)) =
+                (canon.get(&no.a), canon.get(&no.b), canon.get(&no.c))
+            else {
+                return false;
+            };
+            (cc == oc && ct == ot && ce == oe)
+                || (cc.0 == oc.0 && cc.1 != oc.1 && ct == oe && ce == ot)
+        }
+        3 => {
+            canon.get(&nc.a) == canon.get(&no.a)
+                && canon.get(&nc.b) == canon.get(&no.b)
+                && canon.get(&nc.c) == canon.get(&no.c)
+        }
+        _ => false,
+    }
+}
+
+/// Exact sample-equivalent (or bitwise-complement) pairs `(cand, target, rep)` among the
+/// varying nodes below `from`, verified across all active sample points via `eval_exact`.
+fn find_eq_candidates(
+    cx: &mut Context,
+    from: &[u32],
+    min_nodes: u32,
+    sigs: &EqSampled,
+    eval_exact: impl FnOnce(&mut Context, &[u32]) -> Result<IdMap<u32, Vec<BitVec>>, Error>,
+) -> Result<Vec<(u32, u32, u32)>, Error> {
+    let order = cx.post_order_ids(from);
+    let mut pos_map: IdMap<u32, u32> = IdMap::default();
+    let mut bucket_idx: HashMap<(u16, u64, u64), usize> = HashMap::new();
+    let mut buckets: Vec<Vec<u32>> = Vec::new();
+    for (pos, &u) in order.iter().enumerate() {
+        pos_map.insert(u, pos as u32);
+        let op = cx.node(u).op;
+        if matches!(op, OpCode::Const | OpCode::Not) {
+            continue;
+        }
+        let Some(sig) = sigs.get(&u) else {
+            continue;
+        };
+        if sig.konst {
+            continue;
+        }
+        let key = (cx.wid(u), sig.h1, sig.h2);
+        match bucket_idx.get(&key).copied() {
+            Some(b) => buckets[b].push(u),
+            None => {
+                bucket_idx.insert(key, buckets.len());
+                buckets.push(vec![u]);
+            }
+        }
+    }
+    buckets.retain(|b| b.len() >= 2 && b.iter().any(|&u| cx.meta[u as usize].tree >= min_nodes));
+    if buckets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let verify_nodes: Vec<u32> = buckets.iter().flatten().copied().collect();
+    let exact = eval_exact(cx, &verify_nodes)?;
+    let mut classes: Vec<Vec<(u32, bool)>> = Vec::new();
+    for bucket in buckets {
+        let mut sub: Vec<Vec<(u32, bool)>> = Vec::new();
+        for u in bucket {
+            let pol_u = sigs[&u].pol;
+            let Some(vals_u) = exact.get(&u) else {
+                continue;
+            };
+            let matched = sub.iter_mut().find(|cls| {
+                let (v, pol_v) = cls[0];
+                let vals_v = &exact[&v];
+                if pol_u == pol_v {
+                    vals_u == vals_v
+                } else {
+                    vals_u
+                        .iter()
+                        .zip(vals_v)
+                        .all(|(a, b)| *a == BitVec::un_unchecked(UnOp::Not, b))
+                }
+            });
+            match matched {
+                Some(cls) => cls.push((u, pol_u)),
+                None => sub.push(vec![(u, pol_u)]),
+            }
+        }
+        for mut cls in sub {
+            if cls.len() < 2
+                || !cls
+                    .iter()
+                    .any(|&(u, _)| cx.meta[u as usize].tree >= min_nodes)
+            {
+                continue;
+            }
+            cls.sort_by_key(|&(u, _)| {
+                let m = cx.meta[u as usize];
+                (m.tree, m.height, m.shash, pos_map[&u])
+            });
+            let (rep, _) = cls[0];
+            // Ensure `rep` never depends on any retained `cand`.
+            let mut rep_cone: HashSet<u32> = HashSet::new();
+            let mut stack = vec![rep];
+            rep_cone.insert(rep);
+            while let Some(x) = stack.pop() {
+                for c in cx.node(x).children() {
+                    if rep_cone.insert(c) {
+                        stack.push(c);
+                    }
+                }
+            }
+            let mut valid = Vec::with_capacity(cls.len());
+            valid.push(cls[0]);
+            for &(cand, cand_pol) in &cls[1..] {
+                if !rep_cone.contains(&cand) {
+                    valid.push((cand, cand_pol));
+                }
+            }
+            if valid.len() >= 2 {
+                classes.push(valid);
+            }
+        }
+    }
+    if classes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut class_target: IdMap<u32, (u32, bool)> = IdMap::default();
+    for cls in &classes {
+        let (rep, rep_pol) = cls[0];
+        for &(u, u_pol) in cls {
+            class_target.insert(u, (rep, u_pol != rep_pol));
+        }
+    }
+    let mut canon: IdMap<u32, (u32, bool)> = IdMap::default();
+    for &u in &order {
+        let n = cx.node(u);
+        let mapped = if n.op == OpCode::Not {
+            let &(b, p) = canon.get(&n.a).unwrap_or(&(n.a, false));
+            (b, !p)
+        } else if let Some(&t) = class_target.get(&u) {
+            t
+        } else {
+            (u, false)
+        };
+        canon.insert(u, mapped);
+    }
+    let mut out = Vec::new();
+    for cls in classes {
+        let (rep, rep_pol) = cls[0];
+        let mut kept: Vec<(u32, bool)> = vec![cls[0]];
+        for &(cand, cand_pol) in &cls[1..] {
+            if kept.iter().any(|&(other, other_pol)| {
+                other_pol == cand_pol && is_congruent(cx, cand, other, &canon)
+            }) {
+                continue;
+            }
+            let inverted = cand_pol != rep_pol;
+            let target = if inverted {
+                cx.c_un(UnOp::Not, rep)?
+            } else {
+                rep
+            };
+            if target == cand {
+                continue;
+            }
+            kept.push((cand, cand_pol));
+            out.push((cand, target, rep));
+        }
+    }
+    Ok(out)
 }
 
 /// The terms of the chain of `op` at `i`: its operands, and theirs while they are `op` too.
@@ -1308,6 +1907,7 @@ impl Session {
                 config: None,
                 registry: None,
                 sampled: Sampled::default(),
+                eq_sampled: EqSampled::default(),
                 views: HashMap::new(),
                 next_id: 0,
                 stats: Stats::default(),
@@ -1339,6 +1939,7 @@ impl Session {
         let mut st = self.lock();
         st.cx = Context::new();
         st.sampled = Sampled::default();
+        st.eq_sampled.clear();
         st.views.clear();
         st.done.clear();
         st.config = None;
@@ -1589,10 +2190,17 @@ impl Session {
             None => State::Pending,
         };
         let plan = match key.what {
-            What::LeafSimplify | What::LeafValid | What::LeafHub | What::LeafConstant => Plan::Leaf,
+            What::LeafSimplify
+            | What::LeafValid
+            | What::LeafHub
+            | What::LeafEq
+            | What::LeafConstant => Plan::Leaf,
             What::Hub(_) => Plan::Hub {
                 k: BitVec::zero(Width::W1),
                 below: Vec::new(),
+                eq_planned: false,
+                eq_again: false,
+                eqs: Vec::new(),
                 proofs: [None, None],
                 again: false,
                 asked: key.root,
@@ -1605,6 +2213,9 @@ impl Session {
                 found: None,
                 read: false,
                 again: false,
+                eq_planned: false,
+                eq_again: false,
+                eqs: Vec::new(),
                 root: key.root,
                 hubs: Vec::new(),
                 first: None,
@@ -1658,6 +2269,9 @@ impl Session {
         let base = job.base;
         if let Plan::Hub {
             below,
+            eq_planned,
+            eq_again,
+            eqs,
             proofs,
             again,
             cases,
@@ -1665,6 +2279,9 @@ impl Session {
         } = &mut job.plan
         {
             below.truncate(job.base);
+            *eq_planned = false;
+            *eq_again = false;
+            eqs.clear();
             *proofs = [None, None];
             *again = false;
             *cases = None;
@@ -1677,11 +2294,16 @@ impl Session {
             found,
             read,
             again,
+            eq_planned,
+            eq_again,
+            eqs,
             ..
         } = &mut job.plan
         {
             (*rest, *cases, *first) = (None, None, None);
             (*found, *read, *again) = (None, false, false);
+            (*eq_planned, *eq_again) = (false, false);
+            eqs.clear();
             hubs.truncate(base);
         }
         if st.graph.tops.contains(&j) {
@@ -1734,7 +2356,8 @@ impl Session {
         let constants: Vec<usize> = (0..asks.len())
             .filter(|&k| st.graph.jobs[asks[k]].key.what == What::AskConstant)
             .collect();
-        if !split.hubs && constants.is_empty() {
+        let cuts = split.hubs || split.equivalences;
+        if !cuts && constants.is_empty() {
             for &j in &asks {
                 st.graph.jobs[j].base = 0;
                 self.ready_if(st, j);
@@ -1765,7 +2388,7 @@ impl Session {
         for (k, &j) in asks.iter().enumerate() {
             let key = &st.graph.jobs[j].key;
             let constant = key.what == What::AskConstant;
-            if !constant && (key.assume.is_empty() || !split.hubs || !split.assumed) {
+            if !constant && (key.assume.is_empty() || !cuts || !split.assumed) {
                 continue;
             }
             match groups.iter_mut().find(|g| g.0 == key.assume) {
@@ -1800,7 +2423,7 @@ impl Session {
             for (&j, &root) in asks.iter().zip(&roots) {
                 let searching = matches!(st.graph.jobs[j].plan, Plan::Ask { search: true, .. });
                 if !searching && !self.whole_first(st, j) {
-                    self.plan_hubs(st, j, &[root])?;
+                    self.plan_hubs(st, j, &[root], Some(root))?;
                     st.graph.jobs[j].base = st.graph.jobs[j].deps.len();
                 }
             }
@@ -1862,6 +2485,9 @@ impl Session {
             probes,
             moves: HashSet::new(),
             sampled: Sampled::default(),
+            eq_ready: false,
+            eq_points: Vec::new(),
+            eq_sampled: EqSampled::default(),
         };
         st.views.insert(assume.clone(), view);
         Ok(Looked::Holds)
@@ -1962,15 +2588,21 @@ impl Session {
     /// Makes the tasks of the hubs nearest below the nodes `from` and has `parent` (a
     /// question, or a hub that was not proved as written) wait for them, from the samples
     /// `s` of those nodes.
-    fn plan_hubs(&self, st: &mut Store, parent: usize, from: &[u32]) -> Result<(), Error> {
+    fn plan_hubs(
+        &self,
+        st: &mut Store,
+        parent: usize,
+        from: &[u32],
+        skip: Option<u32>,
+    ) -> Result<(), Error> {
         if matches!(st.graph.jobs[parent].state, State::Done(_)) {
             return Ok(());
         }
         let split = self.config.split;
         let wanted = st.graph.jobs[parent].wanted.clone();
         let mut made: Vec<usize> = Vec::new();
-        let mut work: Vec<(usize, Vec<u32>)> = vec![(parent, from.to_vec())];
-        while let Some((parent, from)) = work.pop() {
+        let mut work: Vec<(usize, Vec<u32>, Option<u32>)> = vec![(parent, from.to_vec(), skip)];
+        while let Some((parent, from, skip)) = work.pop() {
             // Under the parent's assumptions, where they do not hold everywhere: a hub
             // there is asked under them, unless it is one everywhere.
             let assume = st.graph.jobs[parent].key.assume.clone();
@@ -1978,8 +2610,8 @@ impl Session {
             self.sample_under(st, &assume, &from, &[])?;
             let under = split.assumed && st.views.get(&assume).is_some_and(View::tells);
             let found = match under {
-                true => hubs_below(&st.cx, &st.views[&assume].sampled, &from, &split),
-                false => hubs_below(&st.cx, &st.sampled, &from, &split),
+                true => hubs_below(&st.cx, &st.views[&assume].sampled, &from, &split, skip),
+                false => hubs_below(&st.cx, &st.sampled, &from, &split, skip),
             };
             for h in found {
                 let everywhere = !under
@@ -2009,7 +2641,7 @@ impl Session {
                     made.push(j);
                     if split.bottom_up {
                         // The hubs below it are part of its plan.
-                        work.push((j, st.cx.node(h).children().collect()));
+                        work.push((j, st.cx.node(h).children().collect(), None));
                     }
                 }
                 self.depend(st, parent, j);
@@ -2026,6 +2658,268 @@ impl Session {
                 st.graph.jobs[j].base = st.graph.jobs[j].deps.len();
             }
             self.ready_if(st, j);
+        }
+        Ok(())
+    }
+
+    /// Plans equivalence (and bitwise-complement) hubs among varying nodes below `from`,
+    /// attaching at most [`MAX_EQ_HUBS`] leaf equality tasks ranked by node savings.
+    fn plan_equivalences(&self, st: &mut Store, parent: usize, from: &[u32]) -> Result<(), Error> {
+        if matches!(st.graph.jobs[parent].state, State::Done(_)) || from.is_empty() {
+            return Ok(());
+        }
+        let split = self.config.split;
+        let points = split.points;
+        let assume = st.graph.jobs[parent].key.assume.clone();
+        let wanted = st.graph.jobs[parent].wanted.clone();
+        let store = &mut *st;
+        sample_eq_unconditional(&mut store.cx, &mut store.eq_sampled, from, points)?;
+        let uncond = find_eq_candidates(
+            &mut store.cx,
+            from,
+            split.min_nodes,
+            &store.eq_sampled,
+            |cx, nodes| eval_eq_unconditional(cx, nodes, points),
+        )?;
+        let mut cands: Vec<EqCand> = Vec::new();
+        let mut seen_cand: HashSet<u32> = HashSet::new();
+        match store.views.get_mut(&assume) {
+            Some(view) if !assume.is_empty() && !view.all => {
+                ensure_view_eq_points(&mut store.cx, &assume, view, points)?;
+                if !uncond.is_empty() {
+                    let mut check_nodes = Vec::with_capacity(uncond.len() * 2);
+                    for &(cand, target, _) in &uncond {
+                        check_nodes.push(cand);
+                        check_nodes.push(target);
+                    }
+                    let at_eq = eval_eq_at_points(&mut store.cx, &check_nodes, &view.eq_points)?;
+                    let probe_pts: Vec<(u32, Model)> = view
+                        .probes
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, m)| (points.max(2).saturating_add(idx as u32), m.clone()))
+                        .collect();
+                    let at_probes = eval_eq_at_points(&mut store.cx, &check_nodes, &probe_pts)?;
+                    for &(cand, target, rep) in &uncond {
+                        let holds_under = view.eq_points.is_empty()
+                            || at_eq
+                                .get(&cand)
+                                .zip(at_eq.get(&target))
+                                .is_some_and(|(a, b)| a == b);
+                        if !holds_under {
+                            continue;
+                        }
+                        let holds_probes = probe_pts.is_empty()
+                            || at_probes
+                                .get(&cand)
+                                .zip(at_probes.get(&target))
+                                .is_some_and(|(a, b)| a == b);
+                        if holds_probes {
+                            seen_cand.insert(cand);
+                            cands.push(EqCand {
+                                cand,
+                                target,
+                                rep,
+                                everywhere: true,
+                            });
+                        } else if split.assumed {
+                            seen_cand.insert(cand);
+                            cands.push(EqCand {
+                                cand,
+                                target,
+                                rep,
+                                everywhere: false,
+                            });
+                        }
+                    }
+                }
+                if split.assumed && view.eq_points.len() >= 2 {
+                    sample_eq_at_points(
+                        &mut store.cx,
+                        &mut view.eq_sampled,
+                        from,
+                        &view.eq_points,
+                    )?;
+                    let eq_pts = &view.eq_points;
+                    let under_only = find_eq_candidates(
+                        &mut store.cx,
+                        from,
+                        split.min_nodes,
+                        &view.eq_sampled,
+                        |cx, nodes| eval_eq_at_points(cx, nodes, eq_pts),
+                    )?;
+                    for (cand, target, rep) in under_only {
+                        if seen_cand.insert(cand) {
+                            cands.push(EqCand {
+                                cand,
+                                target,
+                                rep,
+                                everywhere: false,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {
+                for (cand, target, rep) in uncond {
+                    if seen_cand.insert(cand) {
+                        cands.push(EqCand {
+                            cand,
+                            target,
+                            rep,
+                            everywhere: true,
+                        });
+                    }
+                }
+            }
+        }
+        if cands.is_empty() {
+            return Ok(());
+        }
+        let order = st.cx.post_order_ids(from);
+        let pos_map: IdMap<u32, u32> = order
+            .into_iter()
+            .enumerate()
+            .map(|(k, u)| (u, k as u32))
+            .collect();
+        cands.sort_by_key(|c| {
+            let tc = st.cx.meta[c.cand as usize].tree;
+            let tr = st.cx.meta[c.rep as usize].tree;
+            (
+                core::cmp::Reverse(tc.saturating_sub(tr)),
+                core::cmp::Reverse(tc),
+                st.cx.meta[c.cand as usize].shash,
+                st.cx.meta[c.rep as usize].shash,
+                pos_map.get(&c.cand).copied().unwrap_or(u32::MAX),
+                pos_map.get(&c.rep).copied().unwrap_or(u32::MAX),
+            )
+        });
+        cands.truncate(MAX_EQ_HUBS);
+        for c in cands {
+            let eq_root = st.cx.c_cmp(CmpOp::Eq, c.target, c.cand)?;
+            let task_assume: Assumed = match c.everywhere {
+                true => Arc::from([]),
+                false => assume.clone(),
+            };
+            let key = Key {
+                what: What::LeafEq,
+                root: eq_root,
+                assume: task_assume,
+                k: None,
+            };
+            let new = !st.graph.by_key.contains_key(&key);
+            let stored = st.done.contains_key(&key);
+            let l = self.job(st, key, &wanted);
+            if new && stored {
+                st.stats.tasks_stored += 1;
+            } else if new {
+                st.stats.hubs += 1;
+                st.stats.hubs_assumed += u64::from(!c.everywhere);
+            }
+            self.depend(st, parent, l);
+            self.ready_if(st, l);
+            let edge = EqEdge {
+                job: l,
+                from: c.cand,
+                to: c.target,
+            };
+            match &mut st.graph.jobs[parent].plan {
+                Plan::Ask { eqs, .. } | Plan::Hub { eqs, .. } => eqs.push(edge),
+                Plan::Leaf => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-asks under `j`'s assumptions any unconditional equivalence hub of `j` that failed
+    /// (for instance, refuted at a corner outside `j`'s assumptions) when it reads a symbol
+    /// the assumptions constrain and still agrees where they hold.
+    fn ask_again_eq(&self, st: &mut Store, j: usize) -> Result<(), Error> {
+        let split = self.config.split;
+        let assume = st.graph.jobs[j].key.assume.clone();
+        let eqs = match &mut st.graph.jobs[j].plan {
+            Plan::Hub { eqs, eq_again, .. } | Plan::Ask { eqs, eq_again, .. } => {
+                *eq_again = true;
+                eqs.clone()
+            }
+            Plan::Leaf => Vec::new(),
+        };
+        if assume.is_empty() || !split.assumed || !st.views.contains_key(&assume) {
+            return Ok(());
+        }
+        let es: Vec<u32> = assume.iter().map(|x| x.0).collect();
+        let theirs: HashSet<SymbolKey> = symbols_below(&mut st.cx, &es)?
+            .into_iter()
+            .map(|x| x.0)
+            .collect();
+        let wanted = st.graph.jobs[j].wanted.clone();
+        for edge in eqs {
+            let leaf = &st.graph.jobs[edge.job];
+            let open = match &leaf.state {
+                State::Done(e) => !matches!(e.res, Res::Proved),
+                _ => false,
+            };
+            if leaf.key.what != What::LeafEq || !leaf.key.assume.is_empty() || !open {
+                continue;
+            }
+            let eq_root = leaf.key.root;
+            if !symbols_below(&mut st.cx, &[edge.from, edge.to])?
+                .iter()
+                .any(|x| theirs.contains(&x.0))
+            {
+                continue;
+            }
+            let agrees = {
+                let store = &mut *st;
+                match store.views.get_mut(&assume) {
+                    Some(view) if !view.all => {
+                        ensure_view_eq_points(&mut store.cx, &assume, view, split.points)?;
+                        if view.eq_points.len() < 2 {
+                            false
+                        } else {
+                            let vals = eval_eq_at_points(
+                                &mut store.cx,
+                                &[edge.from, edge.to],
+                                &view.eq_points,
+                            )?;
+                            match (vals.get(&edge.from), vals.get(&edge.to)) {
+                                (Some(a), Some(b)) => a == b && a.iter().any(|v| *v != a[0]),
+                                _ => false,
+                            }
+                        }
+                    }
+                    _ => true,
+                }
+            };
+            if !agrees {
+                continue;
+            }
+            let key = Key {
+                what: What::LeafEq,
+                root: eq_root,
+                assume: assume.clone(),
+                k: None,
+            };
+            let new = !st.graph.by_key.contains_key(&key);
+            let stored = st.done.contains_key(&key);
+            let again = self.job(st, key, &wanted);
+            if new && stored {
+                st.stats.tasks_stored += 1;
+            } else if new {
+                st.stats.hubs += 1;
+                st.stats.hubs_assumed += 1;
+            }
+            self.depend(st, j, again);
+            self.ready_if(st, again);
+            let new_edge = EqEdge {
+                job: again,
+                from: edge.from,
+                to: edge.to,
+            };
+            match &mut st.graph.jobs[j].plan {
+                Plan::Ask { eqs, .. } | Plan::Hub { eqs, .. } => eqs.push(new_edge),
+                Plan::Leaf => {}
+            }
         }
         Ok(())
     }
@@ -2146,7 +3040,7 @@ impl Session {
                 }
                 if split.bottom_up {
                     let kids: Vec<u32> = st.cx.node(h).children().collect();
-                    self.plan_hubs(st, again, &kids)?;
+                    self.plan_hubs(st, again, &kids, None)?;
                     st.graph.jobs[again].base = st.graph.jobs[again].deps.len();
                 }
                 self.ready_if(st, again);
@@ -2161,17 +3055,32 @@ impl Session {
         Ok(())
     }
 
-    /// The proved constants to write for the tasks `deps` of a hub or a question.
-    fn substitution(&self, st: &Store, deps: &[usize]) -> Vec<(u32, BitVec)> {
+    /// The proved replacements (`from -> to`) to write for the hub tasks `deps`.
+    fn substitution(&self, st: &Store, deps: &[usize]) -> Vec<(u32, u32)> {
         let mut seen: HashSet<u32> = HashSet::new();
         let mut pairs = Vec::new();
         for &d in deps {
             if let State::Done(e) = &st.graph.jobs[d].state {
-                for (i, v) in e.subst.iter() {
-                    if seen.insert(*i) {
-                        pairs.push((*i, *v));
+                for &(from, to) in e.subst.iter() {
+                    if seen.insert(from) {
+                        pairs.push((from, to));
                     }
                 }
+            }
+        }
+        pairs
+    }
+
+    /// The proved replacements (`from -> to`) of the equivalence edges `eqs`.
+    fn eq_substitution(&self, st: &Store, eqs: &[EqEdge]) -> Vec<(u32, u32)> {
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut pairs = Vec::new();
+        for edge in eqs {
+            if let State::Done(e) = &st.graph.jobs[edge.job].state
+                && matches!(e.res, Res::Proved)
+                && seen.insert(edge.from)
+            {
+                pairs.push((edge.from, edge.to));
             }
         }
         pairs
@@ -2180,19 +3089,30 @@ impl Session {
     fn substituted(
         &self,
         st: &mut Store,
-        root: u32,
-        pairs: &[(u32, BitVec)],
+        mut root: u32,
+        pairs: &[(u32, u32)],
     ) -> Result<u32, Error> {
         if pairs.is_empty() {
             return Ok(root);
         }
-        let mut map = Vec::with_capacity(pairs.len());
-        for (i, v) in pairs {
-            let c = st.cx.mk_const(v)?;
-            map.push((st.cx.handle(*i), st.cx.handle(c)));
+        let mut repl: IdMap<u32, u32> = IdMap::default();
+        for &(from, to) in pairs {
+            if from != to && st.cx.wid(from) == st.cx.wid(to) {
+                repl.entry(from).or_insert(to);
+            }
         }
-        let e = st.cx.substitute(&[st.cx.handle(root)], &map)?[0];
-        st.cx.id(e)
+        if repl.is_empty() {
+            return Ok(root);
+        }
+        let rounds = if repl.len() == 1 { 1 } else { 4 };
+        for _ in 0..rounds {
+            let next = st.cx.substitute_ids(&[root], &repl)?[0];
+            if next == root {
+                break;
+            }
+            root = next;
+        }
+        Ok(root)
     }
 
     fn parts(&self, st: &Store, j: usize) -> Vec<Arc<Entry>> {
@@ -2265,7 +3185,7 @@ impl Session {
                     return Ok(Step::Solve(Box::new(Spec {
                         job: j,
                         simplify: key.what == What::LeafSimplify,
-                        hub: key.what == What::LeafHub,
+                        hub: matches!(key.what, What::LeafHub | What::LeafEq),
                         constant: key.k,
                         cx,
                         root,
@@ -2276,12 +3196,16 @@ impl Session {
                 Plan::Hub {
                     k,
                     below,
+                    eq_planned,
+                    eq_again,
+                    eqs,
                     proofs,
                     again,
                     asked,
                     cases,
                 } => {
                     let (k, below, proofs, again) = (*k, below.clone(), *proofs, *again);
+                    let (eq_planned, eq_again, eqs) = (*eq_planned, *eq_again, eqs.clone());
                     let (asked, cases) = (*asked, *cases);
                     let proved_by = |st: &Store, l: Option<usize>| {
                         l.is_some_and(|l| match &st.graph.jobs[l].state {
@@ -2309,8 +3233,10 @@ impl Session {
                     let mut proved = proved_by(st, proofs[0]);
                     if stage == 1 && !proved && self.config.split.nested {
                         // The hubs below it first, then.
-                        let kids: Vec<u32> = st.cx.node(key.root).children().collect();
-                        self.plan_hubs(st, j, &kids)?;
+                        if self.config.split.hubs {
+                            let kids: Vec<u32> = st.cx.node(key.root).children().collect();
+                            self.plan_hubs(st, j, &kids, None)?;
+                        }
                         st.graph.jobs[j].stage = 2;
                         continue;
                     }
@@ -2318,11 +3244,38 @@ impl Session {
                         self.ask_again(st, j)?;
                         continue;
                     }
-                    let pairs = self.substitution(st, &below);
-                    if stage == 2 && (bottom_up || !pairs.is_empty()) {
-                        let hub = self.substituted(st, key.root, &pairs)?;
+                    let mut pairs = self.substitution(st, &below);
+                    let hub_after_consts = if stage == 2 {
+                        let h = self.substituted(st, key.root, &pairs)?;
+                        if st.cx.const_val(h) == Some(k) {
+                            proved = true;
+                        }
+                        h
+                    } else {
+                        key.root
+                    };
+                    if !proved && stage == 2 && !eq_planned {
+                        if let Plan::Hub { eq_planned, .. } = &mut st.graph.jobs[j].plan {
+                            *eq_planned = true;
+                        }
+                        if self.config.split.equivalences {
+                            let kids: Vec<u32> = st.cx.node(hub_after_consts).children().collect();
+                            self.plan_equivalences(st, j, &kids)?;
+                        }
+                        continue;
+                    }
+                    if !proved && stage == 2 && !eq_again {
+                        self.ask_again_eq(st, j)?;
+                        continue;
+                    }
+                    let eq_pairs = self.eq_substitution(st, &eqs);
+                    if !proved
+                        && stage == 2
+                        && (bottom_up || !pairs.is_empty() || !eq_pairs.is_empty())
+                    {
+                        let hub = self.substituted(st, hub_after_consts, &eq_pairs)?;
                         if st.cx.const_val(hub) == Some(k) {
-                            // Folded by the constants below it.
+                            // Folded by the constants and equivalences below it.
                             proved = true;
                         } else {
                             let l =
@@ -2333,6 +3286,11 @@ impl Session {
                             }
                             st.graph.jobs[j].stage = 3;
                             continue;
+                        }
+                    }
+                    for (from, to) in eq_pairs {
+                        if !pairs.iter().any(|&(f, _)| f == from) {
+                            pairs.push((from, to));
                         }
                     }
                     proved |= proved_by(st, proofs[1]);
@@ -2373,10 +3331,15 @@ impl Session {
                         true => Res::Constant(k),
                         false => Res::Unknown(Unknown::Unsupported("not proved constant".into())),
                     };
+                    let k_subst = if proved {
+                        Some(st.cx.mk_const(&k)?)
+                    } else {
+                        None
+                    };
                     let mut entry = st.entry(res, Cost::default(), parts);
-                    entry.subst = match proved {
-                        true => Arc::from([(key.root, k)]),
-                        false => pairs.into(),
+                    entry.subst = match k_subst {
+                        Some(c) => Arc::from([(key.root, c)]),
+                        None => pairs.into(),
                     };
                     st.stats.hubs_proved += u64::from(proved);
                     self.finish(st, j, entry);
@@ -2395,11 +3358,16 @@ impl Session {
                     found,
                     read,
                     again,
+                    eq_planned,
+                    eq_again,
+                    eqs,
                 } => {
                     let (candidate, fallback, root, pred) = (*candidate, *fallback, *root, *pred);
                     let (rest, cases, first) = (*rest, *cases, *first);
                     let (search, found, read, again) = (*search, *found, *read, *again);
+                    let (eq_planned, eq_again, eqs) = (*eq_planned, *eq_again, eqs.clone());
                     let hubs = hubs.clone();
+                    let cuts = self.config.split.hubs || self.config.split.equivalences;
                     let done = |st: &Store, d: usize| match &st.graph.jobs[d].state {
                         State::Done(e) => Ok(e.clone()),
                         _ => Err(Error::Contract("a task ready before its parts".into())),
@@ -2443,7 +3411,7 @@ impl Session {
                             *fallback |= constant && !held;
                         }
                         if self.config.split.hubs && !self.whole_first(st, j) {
-                            self.plan_hubs(st, j, &[root])?;
+                            self.plan_hubs(st, j, &[root], Some(root))?;
                         }
                         continue;
                     }
@@ -2499,8 +3467,10 @@ impl Session {
                             self.finish(st, j, entry);
                             return Ok(Step::Settled);
                         }
-                        if self.config.split.hubs {
-                            self.plan_hubs(st, j, &[root])?;
+                        if cuts {
+                            if self.config.split.hubs {
+                                self.plan_hubs(st, j, &[root], Some(root))?;
+                            }
                             st.graph.jobs[j].stage = 2;
                         } else {
                             if let Plan::Ask { rest, .. } = &mut st.graph.jobs[j].plan {
@@ -2514,9 +3484,28 @@ impl Session {
                         self.ask_again(st, j)?;
                         continue;
                     }
+                    let const_pairs = self.substitution(st, &hubs);
+                    let left_after_consts = if stage == 2 {
+                        self.substituted(st, root, &const_pairs)?
+                    } else {
+                        root
+                    };
+                    if stage == 2 && !eq_planned {
+                        if let Plan::Ask { eq_planned, .. } = &mut st.graph.jobs[j].plan {
+                            *eq_planned = true;
+                        }
+                        if self.config.split.equivalences && !st.cx.is_const(left_after_consts) {
+                            self.plan_equivalences(st, j, &[left_after_consts])?;
+                        }
+                        continue;
+                    }
+                    if stage == 2 && !eq_again {
+                        self.ask_again_eq(st, j)?;
+                        continue;
+                    }
                     if stage == 2 {
-                        let pairs = self.substitution(st, &hubs);
-                        let left = self.substituted(st, root, &pairs)?;
+                        let eq_pairs = self.eq_substitution(st, &eqs);
+                        let left = self.substituted(st, left_after_consts, &eq_pairs)?;
                         let mut is = None;
                         let (what, asked) = match (key.what, candidate) {
                             (What::AskSimplify, _) => (What::LeafSimplify, left),
@@ -2765,6 +3754,9 @@ impl Session {
             SolvedRes::Outcome(Outcome::Refuted(m)) => Res::Refuted(m),
             SolvedRes::Outcome(Outcome::Unknown(why)) => Res::Unknown(why),
         };
+        if st.graph.jobs[j].key.what == What::LeafEq && matches!(res, Res::Proved) {
+            st.stats.hubs_proved += 1;
+        }
         st.stats.tasks_solved += 1;
         let entry = st.entry(res, s.cost, Vec::new());
         self.finish(st, j, entry);

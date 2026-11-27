@@ -132,6 +132,59 @@ fn the_cpp_example() {
     }
 }
 
+#[test]
+fn cpp_solver_omt_memory_merge_and_site_queries() {
+    let cxx = compiler("CXX", "c++");
+    let code = r#"
+#include "bitwright.hpp"
+#include <cassert>
+
+int main() {
+    bitwright::Context cx;
+    auto x = cx.symbol("x", 8);
+    auto y = cx.symbol("y", 8);
+    bitwright::Solver s(cx);
+    s.add(x.cmp(bitwright::CmpOp::Ult, cx.constant(8, 4)));
+    assert(s.check() == true);
+    auto en = s.enumerate(x, 8);
+    assert(en.has_value() && en->second && en->first.size() == 4);
+    assert(s.minimize(x)->to_u64() == 0);
+    assert(s.maximize(x)->to_u64() == 3);
+    auto tf = s.tighten_facts(x);
+    assert(tf.has_value() && tf->umin.to_u64() == 0 && tf->umax.to_u64() == 3);
+    s.add(y.cmp(bitwright::CmpOp::Eq, x ^ 5));
+    auto fdef = s.functional_def(y, {x});
+    assert(fdef.has_value() && fdef->str() == "x ^ 5");
+
+    bitwright::Memory mem("mem", 64, 8);
+    auto sp = cx.symbol("sp", 64);
+    auto c = cx.symbol("c", 1);
+    auto v0 = mem.snapshot();
+    mem.store(sp, cx.constant(32, 0x11223344));
+    auto vt = mem.snapshot();
+    mem.restore(v0);
+    mem.store(sp, cx.constant(32, 0x55667788));
+    auto ve = mem.snapshot();
+    mem.merge(c, vt, ve);
+    auto loaded = mem.load(sp, 4);
+    mem.memcpy(sp + 16, sp, 4);
+    assert(bitwright::equivalent(loaded, mem.load(sp + 16, 4)) == true);
+    mem.memset(sp + 16, cx.constant(8, 0xaa), 2);
+    assert(mem.load(sp + 16, 2).value()->to_u64() == 0xaaaa);
+
+    auto smt = cx.run_smtlib("(set-logic QF_BV)(declare-const k (_ BitVec 8))(assert (bvult k #x05))(maximize k)(check-sat)");
+    assert(smt == "sat\n");
+    return 0;
+}
+"#;
+    let src = Path::new(env!("CARGO_TARGET_TMPDIR")).join("solver-omt-cpp.cpp");
+    std::fs::write(&src, code).unwrap();
+    for std in ["-std=c++17", "-std=c++20"] {
+        let out = build_and_run(&cxx, &[std], &src, &format!("solver-omt-cpp-{std}"));
+        assert_eq!(out, "");
+    }
+}
+
 /// The C header compiles as C++ too (inside `extern "C"`).
 #[test]
 fn the_c_example_as_cpp() {

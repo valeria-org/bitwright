@@ -2502,3 +2502,111 @@ fn integers_are_read_where_bit_vectors_bound_them() {
         assert!(out.contains(why), "{out}");
     }
 }
+
+#[cfg(feature = "prove")]
+#[test]
+fn smtlib_optimization_single_lexicographic_and_scoping() {
+    let cfg = crate::solve::Config::default();
+
+    // Single objective + compound expression + get-objectives + get-model + get-value.
+    let script = "
+        (declare-const x (_ BitVec 8))
+        (assert (bvuge x #x05))
+        (assert (bvule x #x20))
+        (assert (= (bvand x #x03) #x02))
+        (minimize x)
+        (check-sat)
+        (get-objectives)
+        (get-value (x))
+        (push)
+        (reset-assertions)
+        (assert (bvuge x #x05))
+        (assert (bvule x #x20))
+        (assert (= (bvand x #x03) #x02))
+        (maximize x)
+        (check-sat)
+        (get-objectives)
+        (get-model)
+    ";
+    let mut out = String::new();
+    let summary = run(&mut Context::new(), script, &cfg, &mut out).unwrap();
+    assert_eq!((summary.sat, summary.unsat, summary.errors), (2, 0, 0));
+    assert!(
+        out.contains("sat\n(objectives\n (x #x06)\n)\n((x #x06))\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("sat\n(objectives\n (x #x1e)\n)\n(\n  (define-fun x () (_ BitVec 8) #x1e)\n)"),
+        "{out}"
+    );
+
+    // Lexicographic multi-objective optimization + push/pop objective scoping.
+    let lex_script = "
+        (declare-const x (_ BitVec 8))
+        (declare-const y (_ BitVec 8))
+        (assert (bvule x #x07))
+        (assert (bvule y #x07))
+        (assert (bvuge (bvadd x y) #x0a))
+        (minimize (bvadd x y))
+        (push)
+        (maximize x)
+        (check-sat)
+        (get-objectives)
+        (get-value (x y))
+        (pop)
+        (push)
+        (minimize x)
+        (check-sat)
+        (get-objectives)
+        (get-value (x y))
+        (pop)
+        (check-sat)
+        (get-objectives)
+    ";
+    let mut out = String::new();
+    let summary = run(&mut Context::new(), lex_script, &cfg, &mut out).unwrap();
+    assert_eq!((summary.sat, summary.unsat, summary.errors), (3, 0, 0));
+    let expected = "\
+sat
+(objectives
+ ((bvadd x y) #x0a)
+ (x #x07)
+)
+((x #x07) (y #x03))
+sat
+(objectives
+ ((bvadd x y) #x0a)
+ (x #x03)
+)
+((x #x03) (y #x07))
+sat
+(objectives
+ ((bvadd x y) #x0a)
+)
+";
+    assert_eq!(out, expected);
+
+    // Empty objectives, unsat error, and non-bit-vector objective error.
+    let edge_script = "
+        (declare-const x (_ BitVec 8))
+        (declare-const b Bool)
+        (get-objectives)
+        (assert (= x #x04))
+        (check-sat)
+        (get-objectives)
+        (minimize b)
+        (push)
+        (assert (= x #x05))
+        (minimize x)
+        (check-sat)
+        (get-objectives)
+    ";
+    let mut out = String::new();
+    let summary = run(&mut Context::new(), edge_script, &cfg, &mut out).unwrap();
+    assert_eq!((summary.sat, summary.unsat, summary.errors), (1, 1, 3));
+    assert!(out.contains("(objectives\n)\n"), "{out}");
+    assert!(
+        out.contains("no objectives: the last check was not sat"),
+        "{out}"
+    );
+}

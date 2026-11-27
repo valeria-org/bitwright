@@ -120,6 +120,7 @@ fn answers_and_costs_do_not_depend_on_threads_order_or_the_store() {
         Split::eager(),
         Split::shared(),
         Split::none(),
+        Split::default().with_equivalences(false),
     ] {
         let base = Config::default().with_prove(small()).with_split(split);
         let want = replies(base.with_threads(1), &forward, 1);
@@ -771,4 +772,373 @@ fn a_hub_refuted_where_the_assumptions_fail_is_asked_again_under_them() {
     let lane = BitVec::from_u64(Width::W64, 0xffff_cffe_0000_0b40).unwrap();
     assert_eq!(got[1].answer, Answer::Constant(lane));
     assert!(session.stats().hubs_assumed > 0, "{:?}", session.stats());
+}
+
+/// 8-bit unsigned quotient `udiv(A, B)` (`A` in `0..32`, `B` in `1..8`) against a symbolic
+/// factor-scaled quotient `udiv(A * F, B * F)` (`F = zext<8>(trunc<2>(p)) + 1:8` in `1..=4`,
+/// so `A * F <= 124 < 256`) and against `-(udiv((A + B) * F, B * F)) == -(Q + 1) == ~Q` in
+/// 8-bit two's complement. The engine never cancels symbolic factors across `udiv`, while a
+/// hub proof decides the 10-input-bit divider core in a few conflicts.
+const Q12_PLAIN: &str = "udiv(zext<8>(trunc<5>(x)), zext<8>(trunc<3>(y) | 1:3))";
+const Q12_SCALED: &str = "udiv(zext<8>(trunc<5>(x)) * (zext<8>(trunc<2>(p)) + 1:8), zext<8>(trunc<3>(y) | 1:3) * (zext<8>(trunc<2>(p)) + 1:8))";
+const Q12_COMP: &str = "(0:8 - udiv((zext<8>(trunc<5>(x)) + zext<8>(trunc<3>(y) | 1:3)) * (zext<8>(trunc<2>(p)) + 1:8), zext<8>(trunc<3>(y) | 1:3) * (zext<8>(trunc<2>(p)) + 1:8)))";
+const DIV_PLAIN: &str = "zext<64>(udiv(zext<8>(trunc<5>(x)), zext<8>(trunc<3>(y) | 1:3)))";
+const DIV_SCALED: &str = "zext<64>(udiv(zext<8>(trunc<5>(x)) * (zext<8>(trunc<2>(p)) + 1:8), zext<8>(trunc<3>(y) | 1:3) * (zext<8>(trunc<2>(p)) + 1:8)))";
+
+/// Equal to `SH_MASKED_4` (`((x & 0xf) + (p & 0xff)) << (y & 7)`) ONLY when `x <u 16`.
+const SH_MASKED_4: &str = "(((x & 0xf) + (p & 0xff)) << (y & 7))";
+const SH_PLAIN_4: &str = "((x << (y & 7)) + ((p & 0xff) << (y & 7)))";
+
+fn udiv_wrap(sub: &str, salt: usize) -> String {
+    format!("udiv((({sub}) ^ (z + {salt})) * (w | 1), ((({sub}) + {salt}) ^ w) | 3)")
+}
+
+#[test]
+fn equivalent_and_complementary_subtrees_are_proved_once_and_collapse_miters_and_simplifications() {
+    let mut cx = Context::new();
+    let o = w64();
+    let mut miters = Vec::new();
+    let mut simplifications = Vec::new();
+    let mut doubled_targets = Vec::new();
+    for k in 0..8 {
+        let lhs = udiv_wrap(&format!("zext<64>({Q12_PLAIN})"), k);
+        // Alternate direct equality (`Q12_SCALED`) and bitwise complement (`~Q12_COMP`).
+        let rhs_sub = if k % 2 == 0 {
+            format!("zext<64>({Q12_SCALED})")
+        } else {
+            format!("zext<64>(~{Q12_COMP})")
+        };
+        let rhs = udiv_wrap(&rhs_sub, k);
+        let l = cx.parse(&lhs, &o).unwrap();
+        let r = cx.parse(&rhs, &o).unwrap();
+        miters.push((l, r));
+        // `lhs + rhs` varies and is not equal to `lhs`, so it creates neither a constant hub
+        // nor a root equivalence hub; once the inner equivalence is substituted, `lhs + lhs`
+        // collapses to `lhs << 1`.
+        let simp = cx.parse(&format!("{lhs} + {rhs}"), &o).unwrap();
+        let want_doubled = cx.parse(&format!("({lhs}) << 1"), &o).unwrap();
+        simplifications.push(simp);
+        doubled_targets.push(want_doubled);
+    }
+
+    let prove_cfg = small()
+        .with_simplify(false)
+        .with_sweeping(false)
+        .with_simplify_budget(bitwright::engine::Budget::ZERO)
+        .with_max_conflicts(1_500);
+    // Without equivalence hubs, the 64-bit `udiv` miter exceeds budget and `Ask::simplify`
+    // cannot merge `lhs + rhs` into `lhs << 1`.
+    let no_eq = Session::new(
+        Config::default()
+            .with_prove(prove_cfg)
+            .with_split(Split::eager().with_equivalences(false)),
+    );
+    let fail = no_eq
+        .run(
+            &mut cx,
+            &[
+                Ask::equal(miters[0].0, miters[0].1),
+                Ask::simplify(simplifications[0]),
+            ],
+        )
+        .unwrap();
+    assert!(
+        matches!(fail[0].answer, Answer::Unknown(_)),
+        "expected miter without equivalence hubs to exceed budget, got {:?}",
+        fail[0].answer
+    );
+    let Answer::Simplified {
+        expr: unmerged_expr,
+        ..
+    } = fail[1].answer
+    else {
+        panic!("expected Simplified");
+    };
+
+    for split in [Split::eager(), Split::shared()] {
+        let config = Config::default()
+            .with_prove(prove_cfg)
+            .with_split(split)
+            .with_threads(4);
+        let session = Session::new(config);
+        let batch: Vec<Ask<'_>> = miters
+            .iter()
+            .map(|&(l, r)| Ask::equal(l, r))
+            .chain(simplifications.iter().map(|&e| Ask::simplify(e)))
+            .collect();
+
+        let replies = session.run(&mut cx, &batch).unwrap();
+        for (k, r) in replies[..8].iter().enumerate() {
+            assert_eq!(r.answer, Answer::Proved, "{split:?} miter {k}");
+        }
+        let stats = session.stats();
+        // Exactly two underlying equivalence hubs (`DIV_PLAIN == DIV_SCALED` and
+        // `~DIV_PLAIN == DIV_COMP`) proved once across all 16 questions in the batch!
+        assert_eq!(
+            (stats.hubs, stats.hubs_proved),
+            (2, 2),
+            "{split:?}: {stats:?}"
+        );
+
+        let want_0 = session
+            .run(&mut cx, &[Ask::simplify(doubled_targets[0])])
+            .unwrap()
+            .remove(0);
+        let Answer::Simplified {
+            expr: want_merged, ..
+        } = want_0.answer
+        else {
+            panic!("expected Simplified");
+        };
+        assert!(
+            cx.tree_size(want_merged).unwrap() < cx.tree_size(unmerged_expr).unwrap(),
+            "{split:?}: merged form must be strictly smaller than unmerged form"
+        );
+        assert!(
+            matches!(replies[8].answer, Answer::Simplified { expr, .. } if expr == want_merged),
+            "{split:?} simplify 0: {:?}",
+            replies[8].answer
+        );
+        for (k, r) in replies[8..16].iter().enumerate() {
+            let Answer::Simplified { expr, .. } = r.answer else {
+                panic!("{split:?} simplify {k}: {:?}", r.answer);
+            };
+            assert!(
+                cx.tree_size(expr).unwrap() < cx.tree_size(simplifications[k]).unwrap(),
+                "{split:?} simplify {k} did not collapse"
+            );
+        }
+    }
+}
+
+#[test]
+fn subtrees_that_only_agree_on_samples_are_refuted_and_never_substituted() {
+    let mut cx = Context::new();
+    let o = w64();
+    // `a` and `b` vary with `x, y, z` and agree at all 64 sample points, differing only at
+    // the single `x` where `x * 3 == 0x123456789abcde01`.
+    let a_text = "((x & 0xff) * (y & 0xff) + z)";
+    let b_text = "((x & 0xff) * (y & 0xff) + z + zext<64>(x * 3 == 0x123456789abcde01))";
+    let a = cx.parse(a_text, &o).unwrap();
+    let b = cx.parse(b_text, &o).unwrap();
+    let diff = cx.parse(&format!("{a_text} ^ {b_text}"), &o).unwrap();
+
+    for split in [Split::default(), Split::eager(), Split::shared()] {
+        let session = Session::new(Config::default().with_split(split));
+        let replies = session
+            .run(&mut cx, &[Ask::equal(a, b), Ask::simplify(diff)])
+            .unwrap();
+        let Answer::Refuted(model) = &replies[0].answer else {
+            panic!("{split:?}: expected Refuted, got {:?}", replies[0].answer);
+        };
+        assert_ne!(
+            value_at(&mut cx, a, model),
+            value_at(&mut cx, b, model),
+            "{split:?}: counterexample must separate a and b"
+        );
+        let Answer::Simplified { expr, .. } = replies[1].answer else {
+            panic!(
+                "{split:?}: expected Simplified, got {:?}",
+                replies[1].answer
+            );
+        };
+        assert_eq!(
+            value_at(&mut cx, expr, model),
+            value_at(&mut cx, diff, model),
+            "{split:?}: simplified expression must preserve rare difference"
+        );
+        assert!(!value_at(&mut cx, expr, model).is_zero());
+    }
+}
+
+#[test]
+fn assumed_equivalence_hubs_hold_under_assumptions_and_never_leak_outside_them() {
+    let mut cx = Context::new();
+    let o = w64();
+    // Equal ONLY when `x <u 16` (so `x & 0xf == x`).
+    let h1 = cx.parse(SH_MASKED_4, &o).unwrap();
+    let h2 = cx.parse(SH_PLAIN_4, &o).unwrap();
+
+    let mut under_16 = Assumptions::new();
+    let lt_16 = cx.parse("x <u 16", &o).unwrap();
+    let one = BitVec::one(Width::W1);
+    under_16
+        .assume(&mut cx, lt_16, Facts::constant(&one))
+        .unwrap();
+
+    let mut under_32 = Assumptions::new();
+    let lt_32 = cx.parse("x <u 32", &o).unwrap();
+    under_32
+        .assume(&mut cx, lt_32, Facts::constant(&one))
+        .unwrap();
+
+    let miters: Vec<(Expr, Expr)> = (0..6)
+        .map(|k| {
+            let l = cx.parse(&udiv_wrap(SH_MASKED_4, k), &o).unwrap();
+            let r = cx.parse(&udiv_wrap(SH_PLAIN_4, k), &o).unwrap();
+            (l, r)
+        })
+        .collect();
+    let simp = cx
+        .parse(
+            &format!(
+                "{} + {}",
+                udiv_wrap(SH_MASKED_4, 0),
+                udiv_wrap(SH_PLAIN_4, 0)
+            ),
+            &o,
+        )
+        .unwrap();
+
+    let prove_cfg = small().with_sweeping(false).with_max_conflicts(400);
+    for split in [Split::eager(), Split::shared()] {
+        let session = Session::new(
+            Config::default()
+                .with_prove(prove_cfg)
+                .with_split(split)
+                .with_threads(4),
+        );
+        let mut under_asks: Vec<Ask<'_>> = miters
+            .iter()
+            .map(|&(l, r)| Ask::equal(l, r).under(&under_16))
+            .collect();
+        under_asks.push(Ask::simplify(simp).under(&under_16));
+        let got = session.run(&mut cx, &under_asks).unwrap();
+        for (k, r) in got[..6].iter().enumerate() {
+            assert_eq!(r.answer, Answer::Proved, "{split:?} assumed miter {k}");
+        }
+        let Answer::Simplified {
+            expr: simp_under, ..
+        } = got[6].answer
+        else {
+            panic!("{split:?} assumed simplify: {:?}", got[6].answer);
+        };
+        let stats = session.stats();
+        // Assumed equivalence hubs (`(x & 0xf) << (y & 7)`? Note `SH_MASKED_4` only has
+        // `x & 0xf` of size 3 < min_nodes, so `SH_MASKED_4 == SH_PLAIN_4` is the ONLY
+        // equivalence hub!) proved once across all 7 questions!
+        assert_eq!(stats.hubs, 1, "{split:?}: {stats:?}");
+        assert_eq!(stats.hubs_assumed, 1, "{split:?}: {stats:?}");
+        assert_eq!(stats.hubs_proved, 1, "{split:?}: {stats:?}");
+
+        // Now ask in the SAME warm session WITHOUT `x <u 16` and under the weaker `x <u 32`:
+        // the assumed equivalence hub must NEVER be substituted!
+        let outside = session
+            .run(
+                &mut cx,
+                &[
+                    Ask::equal(h1, h2),
+                    Ask::equal(h1, h2).under(&under_32),
+                    Ask::equal(miters[0].0, miters[0].1),
+                    Ask::simplify(simp),
+                ],
+            )
+            .unwrap();
+        for (idx, r) in [&outside[0], &outside[1]].into_iter().enumerate() {
+            let Answer::Refuted(m) = &r.answer else {
+                panic!(
+                    "{split:?} outside[{idx}]: expected Refuted, got {:?}",
+                    r.answer
+                );
+            };
+            assert_ne!(value_at(&mut cx, h1, m), value_at(&mut cx, h2, m));
+        }
+        assert!(
+            !matches!(outside[2].answer, Answer::Proved),
+            "{split:?}: unassumed miter must never be proved, got {:?}",
+            outside[2].answer
+        );
+        let Answer::Simplified {
+            expr: simp_outside, ..
+        } = outside[3].answer
+        else {
+            panic!(
+                "{split:?}: expected Simplified, got {:?}",
+                outside[3].answer
+            );
+        };
+        assert!(
+            cx.tree_size(simp_under).unwrap() < cx.tree_size(simp_outside).unwrap(),
+            "{split:?}: unassumed simplify must keep both unmerged arms"
+        );
+    }
+}
+
+#[test]
+fn equivalence_hub_answers_and_costs_do_not_depend_on_threads_order_or_the_store() {
+    let run = |config: Config, order: &[usize], runs: usize| {
+        let mut cx = Context::new();
+        let o = w64();
+        let mut under_16 = Assumptions::new();
+        let lt_16 = cx.parse("x <u 16", &o).unwrap();
+        under_16
+            .assume(&mut cx, lt_16, Facts::constant(&BitVec::one(Width::W1)))
+            .unwrap();
+
+        let e0_l = cx.parse(&udiv_wrap(DIV_PLAIN, 1), &o).unwrap();
+        let e0_r = cx.parse(&udiv_wrap(DIV_SCALED, 1), &o).unwrap();
+        let e1_l = cx.parse(&udiv_wrap(DIV_PLAIN, 2), &o).unwrap();
+        let e1_r = cx
+            .parse(&udiv_wrap(&format!("zext<64>(~{Q12_COMP})"), 2), &o)
+            .unwrap();
+        let e2 = cx
+            .parse(
+                &format!(
+                    "({} ^ {}) + q",
+                    udiv_wrap(DIV_PLAIN, 3),
+                    udiv_wrap(DIV_SCALED, 3)
+                ),
+                &o,
+            )
+            .unwrap();
+        let e3_l = cx.parse(&udiv_wrap(SH_MASKED_4, 1), &o).unwrap();
+        let e3_r = cx.parse(&udiv_wrap(SH_PLAIN_4, 1), &o).unwrap();
+
+        let all = [
+            Ask::equal(e0_l, e0_r),
+            Ask::equal(e1_l, e1_r),
+            Ask::simplify(e2),
+            Ask::equal(e3_l, e3_r).under(&under_16),
+        ];
+        let picked: Vec<Ask<'_>> = order.iter().map(|&k| all[k].clone()).collect();
+        let session = Session::new(config);
+        let mut got = Vec::new();
+        for _ in 0..runs {
+            got = session.run(&mut cx, &picked).unwrap();
+        }
+        let mut out = vec![String::new(); all.len()];
+        for (&k, r) in order.iter().zip(&got) {
+            out[k] = shown(&cx, r);
+        }
+        out
+    };
+    let forward = [0, 1, 2, 3];
+    let reverse = [3, 2, 1, 0];
+    let rotated = [2, 3, 0, 1];
+    let prove_cfg = small().with_sweeping(false).with_max_conflicts(400);
+    for split in [Split::eager(), Split::shared()] {
+        let base = Config::default().with_prove(prove_cfg).with_split(split);
+        let want = run(base.with_threads(1), &forward, 1);
+        assert!(want[0].starts_with("Proved"), "{}", want[0]);
+        assert!(want[1].starts_with("Proved"), "{}", want[1]);
+        assert!(want[2].starts_with("simplified q:64"), "{}", want[2]);
+        assert!(want[3].starts_with("Proved"), "{}", want[3]);
+        for threads in [1, 2, 8] {
+            for order in [&forward, &reverse, &rotated] {
+                let got = run(base.with_threads(threads), order, 1);
+                assert_eq!(got, want, "{split:?}, {threads} threads, {order:?}");
+            }
+        }
+        assert_eq!(
+            run(base.with_threads(4), &reverse, 3),
+            want,
+            "{split:?}, warm"
+        );
+        let tiny = base.with_threads(4).with_store_nodes(0);
+        assert_eq!(run(tiny, &rotated, 2), want, "{split:?}, flushed");
+        for (k, wanted) in want.iter().enumerate() {
+            let got = run(base, &[k], 1);
+            assert_eq!(&got[k], wanted, "{split:?}, question {k} alone");
+        }
+    }
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.32.30
+
+- Added optimization modulo bit-vectors (`Solver::minimize`, `Solver::maximize`, `Solver::minimize_signed`, `Solver::maximize_signed`, plus `*_within` variants) with MSB-to-LSB bit-binary search and model-guided fast-forwarding, exact solver-tightened abstract-domain facts (`Solver::tighten_facts` / `tighten_facts_within`), and SMT-LIB `(minimize …)`, `(maximize …)`, and `(get-objectives)` support in `smtlib::Session`.
+- Added a causal 2-adic Hensel root-lifting solver (`invert::hensel`) across `1..=512` bits for single- and multi-symbol T-function systems, wired into `Solver` (`DecidedBy::Hensel`, `Config::hensel`) and `Solver::enumerate_values_within`, and lifted `invert` pivot-recovery hole regions from `128` bits to `512` bits (`HoleMask([u64; 8])`).
+- Added implicit functional-dependency checking (`Solver::is_determined_by` / `is_determined_by_within`) via prime-rename miters and closed-form witness extraction + CEGIS synthesis (`Solver::functional_def` / `functional_def_within`).
+- Extended `engine::pass::carries` across `1..=512` bits with 3:2/2:2 carry-save and borrow-save compressor folding and 6-atom carry networks, and added Wallace-tree 3:2 carry-save blasting (`blast::sum_csa`, compact `sum_csa_compact`, Wallace partial-product compression in `blast::mul`, and shared-vs-private summand factoring in `Blaster::blast`) in `prove`.
+- Added sub-miter word equivalence and bitwise-complement hub partitioning (`Split::equivalences` / `Split::with_equivalences`) in `batch::Session`, and exposed the new `Solver` optimization, fact-tightening, functional-dependency, and closed-form witness APIs across C/C++ (`bitwright-ffi`), Python (`bitwright-py` and `_bitwright.pyi`), and WebAssembly (`bitwright-wasm`).
+
 ## 0.32.29
 
 - Added native `QF_UFBV` and `QF_ABV` theory support across `prove`, `solve`, and `smtlib`: Ackermann functional-consistency axioms, declared `ExtOp::invertible` injectivity axioms, UF-consistent circuit sampling, and lazy `ExtOp::eval` CEGAR point-evaluation refinement in `prove` and `Incremental`; `ExtOp::inverse` and constant-RHS `ExtOp::invert` equation isolation in `Solver`; and `Array` (`(store ((as const …) …) …)`) and uninterpreted-function (`declare-fun`) reconstruction in `smtlib::Session` (`get-model` and `get-value`).

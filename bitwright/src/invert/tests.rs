@@ -1126,3 +1126,635 @@ fn wide_gf2_bijection_and_preimage_up_to_512_bits() {
         assert_eq!(simp, want, "width {bits}: {}", cx.display(simp));
     }
 }
+
+#[test]
+fn hole_mask_operations_across_512_bits() {
+    assert!(HoleMask::ZERO.is_zero());
+    assert_eq!(HoleMask::ZERO.count_ones(), 0);
+    assert_eq!(HoleMask::ZERO.first_one(), None);
+
+    for b in [0u16, 1, 63, 64, 65, 127, 128, 191, 255, 256, 383, 510, 511] {
+        let m = HoleMask::single(b);
+        assert!(!m.is_zero());
+        assert!(m.test(b));
+        assert!(!m.test(b.wrapping_add(1) % 512));
+        assert_eq!(m.count_ones(), 1);
+        assert_eq!(m.first_one(), Some(b));
+        let mut c = m;
+        c.clear(b);
+        assert!(c.is_zero());
+    }
+    assert!(HoleMask::single(512).is_zero());
+
+    for n in [0u16, 1, 7, 63, 64, 65, 128, 256, 511, 512] {
+        let low = HoleMask::low_ones(n);
+        assert_eq!(low.count_ones(), u32::from(n));
+        assert_eq!(low.first_one(), (n > 0).then_some(0));
+        for b in [0u16, 63, 64, 127, 128, 255, 256, 510, 511] {
+            assert_eq!(low.test(b), b < n);
+        }
+    }
+
+    let a = HoleMask::single(5) | HoleMask::single(300);
+    let b = HoleMask::single(300) | HoleMask::single(511);
+    assert_eq!((a & b), HoleMask::single(300));
+    assert_eq!((a ^ b), HoleMask::single(5) | HoleMask::single(511));
+    let mut x = a;
+    x |= b;
+    assert_eq!(x.count_ones(), 3);
+    x &= !HoleMask::single(5);
+    assert_eq!(x.first_one(), Some(300));
+    x ^= HoleMask::single(300);
+    assert_eq!(x, HoleMask::single(511));
+}
+
+fn deterministic_wide(w: Width, seed: u64) -> BitVec {
+    let mut rng = Rng(seed);
+    let mut limbs = [0u64; 8];
+    for l in &mut limbs {
+        *l = rng.next();
+    }
+    BitVec::wrapping_from_limbs(w, &limbs)
+}
+
+#[test]
+fn wide_pivot_regions_256_and_512_bits() {
+    use crate::ParseOptions;
+
+    // 1. Xorshift involutions and variable-shift mixers at 256 and 512 bits.
+    for (bits, expr_src, cancel_rhs) in [
+        (256u16, "h ^ (h >>u 128)", "g ^ (g >>u 128)"),
+        (
+            256,
+            "h ^ ((h >>u 96) >>u (h >>u 252))",
+            "g ^ ((g >>u 96) >>u (g >>u 252))",
+        ),
+        (
+            512,
+            "h ^ (h >>u 200) ^ (h >>u 400)",
+            "g ^ (g >>u 200) ^ (g >>u 400)",
+        ),
+        (
+            512,
+            "h ^ ((h >>u 200) >>u (h >>u 508))",
+            "g ^ ((g >>u 200) >>u (g >>u 508))",
+        ),
+    ] {
+        let w = Width::new(bits).unwrap();
+        let o = ParseOptions::width(w);
+        let mut cx = Context::new();
+        let h = cx.parse("h", &o).unwrap();
+        let g = cx.parse("g", &o).unwrap();
+        let e1 = cx.parse(expr_src, &o).unwrap();
+        let e2 = cx.parse(cancel_rhs, &o).unwrap();
+
+        assert_eq!(
+            cx.prove(Query::Bijective { e: e1, of: h }).unwrap(),
+            Truth::True,
+            "{expr_src} @ {bits}"
+        );
+        assert_eq!(
+            cx.prove(Query::Injective { e: e1, of: h }).unwrap(),
+            Truth::True,
+            "{expr_src} @ {bits}"
+        );
+
+        let (i1, i2) = (cx.id(e1).unwrap(), cx.id(e2).unwrap());
+        let cancelled = cancel_layer(&mut cx, &mut plain(), i1, i2).unwrap();
+        assert_eq!(cancelled, Some((cx.id(h).unwrap(), cx.id(g).unwrap())));
+
+        let secret = deterministic_wide(w, 0x1234_5678 ^ u64::from(bits));
+        let target = eval(&mut cx, e1, &[("h", secret)]);
+        let got = solve_eq(&mut cx, &mut plain(), i1, &target).unwrap();
+        assert_eq!(got, Some(Solved::Eq(cx.id(h).unwrap(), secret)));
+    }
+
+    // 2. Permutation polynomials (`2 * x * x + x` and `(x << 1) * x + x`) at 256 and 512 bits.
+    for bits in [256u16, 512] {
+        let w = Width::new(bits).unwrap();
+        let o = ParseOptions::width(w);
+        for poly_src in ["2 * x * x + x", "2 * (x * x) + x", "(x << 1) * x + x + 7"] {
+            let mut cx = Context::new();
+            let x = cx.parse("x", &o).unwrap();
+            let y = cx.parse("y", &o).unwrap();
+            let e = cx.parse(poly_src, &o).unwrap();
+            let ey = cx.substitute(&[e], &[(x, y)]).unwrap()[0];
+
+            assert_eq!(
+                cx.prove(Query::Bijective { e, of: x }).unwrap(),
+                Truth::True,
+                "{poly_src} @ {bits}"
+            );
+
+            let (ie, iey) = (cx.id(e).unwrap(), cx.id(ey).unwrap());
+            let (mut ca, mut cb) = (ie, iey);
+            while let Some((p, q)) = cancel_layer(&mut cx, &mut plain(), ca, cb).unwrap() {
+                (ca, cb) = (p, q);
+            }
+            assert_eq!((ca, cb), (cx.id(x).unwrap(), cx.id(y).unwrap()));
+
+            let secret = deterministic_wide(w, 0xfeed_cafe ^ u64::from(bits));
+            let target = eval(&mut cx, e, &[("x", secret)]);
+            assert_eq!(
+                solve_eq(&mut cx, &mut plain(), ie, &target).unwrap(),
+                Some(Solved::Eq(cx.id(x).unwrap(), secret))
+            );
+        }
+
+        // Injective widening (`zext` over a 256-bit permutation polynomial into 512 bits)
+        // both recovers valid preimages and refutes out-of-range targets.
+        if bits == 256 {
+            let mut cx = Context::new();
+            let x = cx.parse("x", &o).unwrap();
+            let poly = cx.parse("2 * x * x + x", &o).unwrap();
+            let wide = cx.zext(poly, Width::W512).unwrap();
+            assert_eq!(
+                cx.prove(Query::Injective { e: wide, of: x }).unwrap(),
+                Truth::True
+            );
+            assert_eq!(
+                cx.prove(Query::Bijective { e: wide, of: x }).unwrap(),
+                Truth::False
+            );
+            let secret = deterministic_wide(Width::W256, 0x7777);
+            let valid_target = eval(&mut cx, wide, &[("x", secret)]);
+            let wi = cx.id(wide).unwrap();
+            assert_eq!(
+                solve_eq(&mut cx, &mut plain(), wi, &valid_target).unwrap(),
+                Some(Solved::Eq(cx.id(x).unwrap(), secret))
+            );
+            let invalid_target = BitVec::smin(Width::W512);
+            assert_eq!(
+                solve_eq(&mut cx, &mut plain(), wi, &invalid_target).unwrap(),
+                Some(Solved::Const(false))
+            );
+        }
+    }
+
+    // 3. Parametric T-functions `u - (((u << 1) | b) & h)` and block-triangular maps at 256 & 512 bits.
+    for bits in [256u16, 512] {
+        let w = Width::new(bits).unwrap();
+        let o = ParseOptions::width(w);
+        let mut cx = Context::new();
+        let u = cx.parse("u", &o).unwrap();
+        let v = cx.parse("v", &o).unwrap();
+        let tf = cx.parse("u - (((u << 1) | b) & h)", &o).unwrap();
+        let tf_v = cx.parse("v - (((v << 1) | b) & h)", &o).unwrap();
+
+        assert_eq!(
+            cx.prove(Query::Bijective { e: tf, of: u }).unwrap(),
+            Truth::True,
+            "T-function @ {bits}"
+        );
+        let (tf_id, tf_v_id) = (cx.id(tf).unwrap(), cx.id(tf_v).unwrap());
+        assert_eq!(
+            cancel_layer(&mut cx, &mut plain(), tf_id, tf_v_id).unwrap(),
+            Some((cx.id(u).unwrap(), cx.id(v).unwrap()))
+        );
+
+        let b_const = cx.constant(&deterministic_wide(w, 0xaaaa_1111)).unwrap();
+        let h_const = cx.constant(&deterministic_wide(w, 0xbbbb_2222)).unwrap();
+        let b_sym = cx.parse("b", &o).unwrap();
+        let h_sym = cx.parse("h", &o).unwrap();
+        let tf_const = cx
+            .substitute(&[tf], &[(b_sym, b_const), (h_sym, h_const)])
+            .unwrap()[0];
+        let secret = deterministic_wide(w, 0xcccc_3333 ^ u64::from(bits));
+        let target = eval(&mut cx, tf_const, &[("u", secret)]);
+        let tf_const_id = cx.id(tf_const).unwrap();
+        assert_eq!(
+            solve_eq(&mut cx, &mut plain(), tf_const_id, &target).unwrap(),
+            Some(Solved::Eq(cx.id(u).unwrap(), secret))
+        );
+
+        // Block-triangular map splitting at `half = bits / 2`: low half is an odd-affine + xorshift
+        // bijection, high half subtracts shifted low bits and adds low-half carry.
+        let half = bits / 2;
+        let low_mask = {
+            let mut m = BitVec::ones(w);
+            let sh = BitVec::wrapping_from_u64(w, u64::from(half));
+            m = BitVec::un_unchecked(UnOp::Not, &BitVec::bin_unchecked(BinOp::Shl, &m, &sh));
+            m
+        };
+        let mask_e = cx.constant(&low_mask).unwrap();
+        let k_param = cx.symbol("k_p", w).unwrap();
+        let h_param = cx.symbol("h_p", w).unwrap();
+        let x = cx.symbol("x_blk", w).unwrap();
+        let sh_half = cx.constant_u64(w, u64::from(half)).unwrap();
+        let sh_near = cx.constant_u64(w, u64::from(half - 8)).unwrap();
+        let three = cx.constant_u64(w, 3).unwrap();
+
+        let x_mul = cx.bin(BinOp::Mul, x, three).unwrap();
+        let x_add = cx.bin(BinOp::Add, x_mul, k_param).unwrap();
+        let lo_part = cx.bin(BinOp::And, x_add, mask_e).unwrap();
+        let carry = cx.cmp(CmpOp::Ult, lo_part, k_param).unwrap();
+        let carry_w = cx.zext(carry, w).unwrap();
+
+        let x_hi = cx.bin(BinOp::LShr, x, sh_half).unwrap();
+        let x_near = cx.bin(BinOp::LShr, x, sh_near).unwrap();
+        let masked_near = cx.bin(BinOp::And, x_near, h_param).unwrap();
+        let hi_step = cx.bin(BinOp::Sub, x_hi, masked_near).unwrap();
+        let hi_with_carry = cx.bin(BinOp::Add, hi_step, carry_w).unwrap();
+        let hi_shifted = cx.bin(BinOp::Shl, hi_with_carry, sh_half).unwrap();
+        let blk = cx.bin(BinOp::Or, hi_shifted, lo_part).unwrap();
+
+        assert_eq!(
+            cx.prove(Query::Bijective { e: blk, of: x }).unwrap(),
+            Truth::True,
+            "block-triangular @ {bits}"
+        );
+
+        let kc = cx.constant(&deterministic_wide(w, 0x5151)).unwrap();
+        let hc = cx.constant(&deterministic_wide(w, 0x6262)).unwrap();
+        let blk_const = cx
+            .substitute(&[blk], &[(k_param, kc), (h_param, hc)])
+            .unwrap()[0];
+        let secret_x = deterministic_wide(w, 0x9999_8888 ^ u64::from(bits));
+        let blk_target = eval(&mut cx, blk_const, &[("x_blk", secret_x)]);
+        let blk_const_id = cx.id(blk_const).unwrap();
+        assert_eq!(
+            solve_eq(&mut cx, &mut plain(), blk_const_id, &blk_target).unwrap(),
+            Some(Solved::Eq(cx.id(x).unwrap(), secret_x))
+        );
+    }
+}
+
+#[test]
+fn hensel_refutes_nonlinear_opaque_predicates_up_to_512_bits() {
+    use super::hensel::{HenselLimits, HenselOutcome, solve};
+    use crate::ParseOptions;
+
+    let limits = HenselLimits::default();
+    for bits in [64u16, 128, 256, 512] {
+        let w = Width::new(bits).unwrap();
+        let o = ParseOptions::width(w);
+
+        for src in [
+            "(x * (x + 1)) & 1 == 1",
+            "x * x + x + 1 == 0",
+            "(x * (x | 1)) ^ ((x << 1) + 2) == 3",
+            // Survives mod 2, mod 4, and mod 8; obstructed at bit 3 (mod 16).
+            "(x * (x | 1)) ^ ((x << 1) + 6) == 1",
+            // Wrapped in outer non-causal bijections.
+            "bswap(x * x + x + 1) == 0",
+            "rotl(x * x + 4 * y, 13) == rotl(3, 13)",
+        ] {
+            let mut cx = Context::new();
+            let p = cx.parse(src, &o).unwrap();
+            assert_eq!(
+                solve(&cx, &[p], &limits).unwrap(),
+                HenselOutcome::Unsat,
+                "{src} @ {bits}"
+            );
+        }
+
+        // Coupled 2-variable T-function systems obstructed at mod 4 and mod 8.
+        for (p1_src, p2_src) in [
+            ("(x * x + 2 * y) == 5", "(y * y + 2 * x) == 5"),
+            ("(x * x + 2 * y) == 7", "(y * y + 4 * x) == 1"),
+        ] {
+            let mut cx = Context::new();
+            let p1 = cx.parse(p1_src, &o).unwrap();
+            let p2 = cx.parse(p2_src, &o).unwrap();
+            assert_eq!(
+                solve(&cx, &[p1, p2], &limits).unwrap(),
+                HenselOutcome::Unsat,
+                "{p1_src} && {p2_src} @ {bits}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hensel_solves_and_enumerates_roots_with_known_bits_and_side_filters() {
+    use super::hensel::{HenselLimits, HenselOutcome, enumerate, solve};
+    use crate::ParseOptions;
+
+    let limits = HenselLimits::default();
+
+    // 1. Satisfiable nonlinear T-functions across 64, 128, 256, and 512 bits.
+    for bits in [64u16, 128, 256, 512] {
+        let w = Width::new(bits).unwrap();
+        let o = ParseOptions::width(w);
+        let mut cx = Context::new();
+        let _x = cx.parse("x", &o).unwrap();
+        let lhs = cx.parse("x * (x ^ 0x55) + (x << 3)", &o).unwrap();
+
+        let secret = deterministic_wide(w, 0x4242_1337 ^ u64::from(bits));
+        let target = eval(&mut cx, lhs, &[("x", secret)]);
+        let tc = cx.constant(&target).unwrap();
+        let pred = cx.eq(lhs, tc).unwrap();
+
+        match solve(&cx, &[pred], &limits).unwrap() {
+            HenselOutcome::Sat(model) => {
+                assert_eq!(
+                    cx.eval(&[pred], &model[..]).unwrap(),
+                    [BitVec::from_bool(true)]
+                );
+            }
+            other => panic!("expected Sat at {bits} bits, got {other:?}"),
+        }
+
+        // Coupled 2-variable Hensel system with invertible Jacobian mod 2 -> unique root!
+        let mut cx2 = Context::new();
+        let _x2 = cx2.parse("x", &o).unwrap();
+        let _y2 = cx2.parse("y", &o).unwrap();
+        let f1 = cx2.parse("x + 2 * y * y", &o).unwrap();
+        let f2 = cx2.parse("y + 2 * x * x + (x << 2)", &o).unwrap();
+        let sx = deterministic_wide(w, 0x1111_2222 ^ u64::from(bits));
+        let sy = deterministic_wide(w, 0x3333_4444 ^ u64::from(bits));
+        let c1 = eval(&mut cx2, f1, &[("x", sx), ("y", sy)]);
+        let c2 = eval(&mut cx2, f2, &[("x", sx), ("y", sy)]);
+        let c1e = cx2.constant(&c1).unwrap();
+        let c2e = cx2.constant(&c2).unwrap();
+        let eq1 = cx2.eq(f1, c1e).unwrap();
+        let eq2 = cx2.eq(f2, c2e).unwrap();
+
+        match solve(&cx2, &[eq1, eq2], &limits).unwrap() {
+            HenselOutcome::Sat(model) => {
+                assert_eq!(
+                    model,
+                    vec![(SymbolKey::from("x"), sx), (SymbolKey::from("y"), sy)]
+                );
+            }
+            other => panic!("coupled system @ {bits}: {other:?}"),
+        }
+    }
+
+    // 2. Multi-root modular quadratic `x * x == 25`: 4 roots mod 2^W (`5, -5, 2^(W-1)-5, 2^(W-1)+5`).
+    for bits in [64u16, 128, 256, 512] {
+        let w = Width::new(bits).unwrap();
+        let o = ParseOptions::width(w);
+        let mut cx = Context::new();
+        let x = cx.parse("x", &o).unwrap();
+        let eq = cx.parse("x * x == 25", &o).unwrap();
+
+        let five = BitVec::wrapping_from_u64(w, 5);
+        let neg_five = BitVec::un_unchecked(UnOp::Neg, &five);
+        let half = BitVec::smin(w);
+        let r3 = BitVec::bin_unchecked(BinOp::Sub, &half, &five);
+        let r4 = BitVec::bin_unchecked(BinOp::Add, &half, &five);
+        let mut expected = vec![five, neg_five, r3, r4];
+        expected.sort();
+
+        let got = enumerate(&cx, &[eq], x, 4, &limits).unwrap();
+        assert_eq!(got, Some(expected.clone()), "quadratic roots @ {bits}");
+        // Asking with limit = 3 must return None since 4 > 3 distinct roots exist.
+        assert_eq!(enumerate(&cx, &[eq], x, 3, &limits).unwrap(), None);
+
+        // End-of-lift non-causal filter `x <u 1000` selects `x == 5` uniquely.
+        let small = cx.parse("x <u 1000", &o).unwrap();
+        assert_eq!(
+            solve(&cx, &[eq, small], &limits).unwrap(),
+            HenselOutcome::Sat(vec![(SymbolKey::from("x"), five)])
+        );
+        assert_eq!(
+            enumerate(&cx, &[eq, small], x, 4, &limits).unwrap(),
+            Some(vec![five])
+        );
+
+        // End-of-lift non-causal filter `x >u 10` && `x <u 100` eliminates all 4 roots -> Unsat!
+        let gt10 = cx.parse("x >u 10", &o).unwrap();
+        let lt100 = cx.parse("x <u 100", &o).unwrap();
+        assert_eq!(
+            solve(&cx, &[eq, gt10, lt100], &limits).unwrap(),
+            HenselOutcome::Unsat
+        );
+        assert_eq!(
+            enumerate(&cx, &[eq, gt10, lt100], x, 4, &limits).unwrap(),
+            Some(Vec::new())
+        );
+
+        // `declared_known`: pinning MSB = 1 and bit 1 = 1 selects the unique matching root or Unsat.
+        let mut cx_kb = Context::new();
+        let xk = cx_kb.parse("x", &o).unwrap();
+        let eqk = cx_kb.parse("x * x == 25", &o).unwrap();
+        // Force MSB = 0 and bit 1 = 0: among `{5 (..0101), 2^(W-1)-5 (..1011)}`, only `5` has MSB=0 and bit1=0.
+        let zero_mask = BitVec::bin_unchecked(
+            BinOp::Or,
+            &BitVec::smin(w),
+            &BitVec::wrapping_from_u64(w, 2),
+        );
+        let kb = KnownBits::new(zero_mask, BitVec::zero(w)).unwrap();
+        cx_kb.declare_known(xk, kb).unwrap();
+        assert_eq!(
+            enumerate(&cx_kb, &[eqk], xk, 4, &limits).unwrap(),
+            Some(vec![five])
+        );
+
+        // Force bit 0 = 0 on `x * x == 25` -> immediate Unsat at bit 0!
+        let even_kb = KnownBits::new(BitVec::one(w), BitVec::zero(w)).unwrap();
+        cx_kb.declare_known(xk, even_kb).unwrap();
+        assert_eq!(
+            solve(&cx_kb, &[eqk], &limits).unwrap(),
+            HenselOutcome::Unsat
+        );
+    }
+}
+
+/// Random causal T-function builder over `syms` at width `w` (for differential fuzzing).
+fn random_causal_expr(rng: &mut Rng, cx: &mut Context, syms: &[Expr], w: u16, depth: u32) -> Expr {
+    let wd = width(w);
+    let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    if depth == 0 || rng.chance(1, 4) {
+        let idx = rng.below((syms.len() + 2) as u64) as usize;
+        if idx < syms.len() {
+            return syms[idx];
+        }
+        return cx.constant_u64(wd, rng.next() & mask).unwrap();
+    }
+    let d = depth - 1;
+    match rng.below(13) {
+        0 => {
+            let a = random_causal_expr(rng, cx, syms, w, d);
+            let op = if rng.chance(1, 2) {
+                UnOp::Not
+            } else {
+                UnOp::Neg
+            };
+            cx.un(op, a).unwrap()
+        }
+        1..=6 => {
+            let op = [
+                BinOp::Add,
+                BinOp::Sub,
+                BinOp::Mul,
+                BinOp::And,
+                BinOp::Or,
+                BinOp::Xor,
+            ][rng.below(6) as usize];
+            let a = random_causal_expr(rng, cx, syms, w, d);
+            let b = random_causal_expr(rng, cx, syms, w, d);
+            cx.bin(op, a, b).unwrap()
+        }
+        7 => {
+            let a = random_causal_expr(rng, cx, syms, w, d);
+            let s = cx.constant_u64(wd, rng.below(u64::from(w) + 1)).unwrap();
+            cx.bin(BinOp::Shl, a, s).unwrap()
+        }
+        8 if w > 1 => {
+            // Narrow causal expression extended via zext or sext.
+            let nw = 1 + rng.below(u64::from(w - 1)) as u16;
+            let a = random_causal_expr(rng, cx, syms, w, d);
+            let trunc = cx.extract(a, 0, width(nw)).unwrap();
+            if rng.chance(1, 2) {
+                cx.zext(trunc, wd).unwrap()
+            } else {
+                cx.sext(trunc, wd).unwrap()
+            }
+        }
+        9 if w > 1 => {
+            // Concat of two narrower causal truncations.
+            let lw = 1 + rng.below(u64::from(w - 1)) as u16;
+            let hw = w - lw;
+            let a = random_causal_expr(rng, cx, syms, w, d);
+            let b = random_causal_expr(rng, cx, syms, w, d);
+            let hi = cx.extract(a, 0, width(hw)).unwrap();
+            let lo = cx.extract(b, 0, width(lw)).unwrap();
+            cx.concat(hi, lo).unwrap()
+        }
+        10 => {
+            // Select with a bit-0 causal condition.
+            let src = random_causal_expr(rng, cx, syms, w, d);
+            let cond = cx.extract(src, 0, Width::W1).unwrap();
+            let t = random_causal_expr(rng, cx, syms, w, d);
+            let e = random_causal_expr(rng, cx, syms, w, d);
+            cx.select(cond, t, e).unwrap()
+        }
+        _ => {
+            let a = random_causal_expr(rng, cx, syms, w, d);
+            let k = cx.constant_u64(wd, rng.next() & mask).unwrap();
+            cx.bin(BinOp::Add, a, k).unwrap()
+        }
+    }
+}
+
+#[test]
+fn hensel_differential_soundness_against_truth_tables() {
+    use super::hensel::{HenselLimits, HenselOutcome, enumerate, solve};
+
+    let mut rng = Rng(0x2ad1_c001);
+    let limits = HenselLimits::default();
+    let (mut sat_cnt, mut unsat_cnt, mut enum_cnt) = (0u32, 0u32, 0u32);
+
+    for case in 0..800 {
+        let two_vars = case % 3 == 0;
+        let w: u16 = if two_vars || case % 2 == 0 { 4 } else { 6 };
+        let wd = width(w);
+        let mask = (1u64 << w) - 1;
+        let mut cx = Context::new();
+        let x = cx.symbol("x", wd).unwrap();
+        let syms = if two_vars {
+            let y = cx.symbol("y", wd).unwrap();
+            vec![x, y]
+        } else {
+            vec![x]
+        };
+
+        // Optionally declare 1 known bit on `x`.
+        let x_kb = if rng.chance(1, 3) {
+            let bit = rng.below(u64::from(w));
+            let m = BitVec::wrapping_from_u64(wd, 1u64 << bit);
+            let kb = if rng.chance(1, 2) {
+                KnownBits::new(m, BitVec::zero(wd)).unwrap()
+            } else {
+                KnownBits::new(BitVec::zero(wd), m).unwrap()
+            };
+            cx.declare_known(x, kb).unwrap();
+            Some(kb)
+        } else {
+            None
+        };
+
+        let mut preds = Vec::new();
+        let lhs1 = random_causal_expr(&mut rng, &mut cx, &syms, w, 3);
+        let rhs1 = if rng.chance(2, 3) {
+            cx.constant_u64(wd, rng.next() & mask).unwrap()
+        } else {
+            random_causal_expr(&mut rng, &mut cx, &syms, w, 2)
+        };
+        preds.push(cx.eq(lhs1, rhs1).unwrap());
+
+        if rng.chance(1, 2) {
+            let lhs2 = random_causal_expr(&mut rng, &mut cx, &syms, w, 2);
+            let rhs2 = cx.constant_u64(wd, rng.next() & mask).unwrap();
+            preds.push(cx.eq(lhs2, rhs2).unwrap());
+        }
+
+        // Occasionally add a non-causal side filter (`Ult`, `Slt`, or `Ne`).
+        if rng.chance(1, 3) {
+            let bound = cx.constant_u64(wd, rng.next() & mask).unwrap();
+            let op = [CmpOp::Ult, CmpOp::Ule, CmpOp::Slt, CmpOp::Ne][rng.below(4) as usize];
+            preds.push(cx.cmp(op, x, bound).unwrap());
+        }
+
+        let target = random_causal_expr(&mut rng, &mut cx, &syms, w, 2);
+
+        // Exhaustive truth table over all valid assignments (`2^4 = 16`, `2^6 = 64`, or `2^8 = 256`).
+        let mut valid_models = Vec::new();
+        let mut target_vals = Vec::new();
+        let y_limit = if two_vars { 1u64 << w } else { 1 };
+        for xv in 0..(1u64 << w) {
+            let xbv = val(w, xv);
+            if x_kb.is_some_and(|kb| !kb.contains(&xbv)) {
+                continue;
+            }
+            for yv in 0..y_limit {
+                let env: Vec<(SymbolKey, BitVec)> = if two_vars {
+                    vec![
+                        (SymbolKey::from("x"), xbv),
+                        (SymbolKey::from("y"), val(w, yv)),
+                    ]
+                } else {
+                    vec![(SymbolKey::from("x"), xbv)]
+                };
+                let evals = cx.eval(&preds, &env[..]).unwrap();
+                if evals.iter().all(|v| v.bit(0) == Some(true)) {
+                    valid_models.push(env.clone());
+                    target_vals.push(cx.eval(&[target], &env[..]).unwrap()[0]);
+                }
+            }
+        }
+        target_vals.sort();
+        target_vals.dedup();
+
+        match solve(&cx, &preds, &limits).unwrap() {
+            HenselOutcome::Sat(model) => {
+                sat_cnt += 1;
+                assert!(
+                    !valid_models.is_empty(),
+                    "Hensel returned Sat on an unsatisfiable system: {model:?}"
+                );
+                if let Some(kb) = x_kb
+                    && let Some(&(_, xv)) = model.iter().find(|(k, _)| *k == SymbolKey::from("x"))
+                {
+                    assert!(kb.contains(&xv), "model violated declared_known");
+                }
+                let check = cx.eval(&preds, &model[..]).unwrap();
+                assert!(
+                    check.iter().all(|v| v.bit(0) == Some(true)),
+                    "model failed predicate evaluation"
+                );
+            }
+            HenselOutcome::Unsat => {
+                unsat_cnt += 1;
+                assert!(
+                    valid_models.is_empty(),
+                    "SOUNDNESS BUG: Hensel returned Unsat when valid models exist: {:?}",
+                    valid_models[0]
+                );
+            }
+            HenselOutcome::Unknown => {}
+        }
+
+        if let Some(got_vals) = enumerate(&cx, &preds, target, 16, &limits).unwrap() {
+            enum_cnt += 1;
+            assert!(got_vals.len() <= 16);
+            assert_eq!(got_vals, target_vals, "enumerate mismatch on case {case}");
+        }
+    }
+
+    assert!(sat_cnt > 100, "too few Sat cases: {sat_cnt}");
+    assert!(unsat_cnt > 200, "too few Unsat cases: {unsat_cnt}");
+    assert!(enum_cnt > 300, "too few enumerated cases: {enum_cnt}");
+}

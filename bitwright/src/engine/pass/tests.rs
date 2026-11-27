@@ -10135,3 +10135,226 @@ fn lifted_cpu_signed_flag_idioms_recover_canonical_comparisons() {
     assert_ne!(simp, slt);
     assert!(equivalent(&mut cx, near_miss, simp, &mut rng));
 }
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_folds_csa_across_majority_encodings_shifts_and_wide_widths() {
+    let carries_only = engine(vec![Phase::Carries]);
+    let deobf = deobfuscator();
+    let mut rng = Rng(0xc5a_3201);
+
+    let maj_encodings = [
+        "(a & b) | (a & c) | (b & c)",
+        "(b & c) | ((a & c) | (a & b))",
+        "(a & b) | ((a ^ b) & c)",
+        "(a & b) | ((a | b) & c)",
+        "(a & b) ^ ((a ^ b) & c)",
+        "(a & b) ^ (a & c) ^ (b & c)",
+        "(a & (b | c)) | (b & c)",
+        "(a & (b | c)) | (~a & (b & c))",
+        "~((~a & ~b) | (~a & ~c) | (~b & ~c))",
+    ];
+
+    // 1. Every majority spelling folds at narrow, 64-bit, and wide (128, 256, 512) widths
+    //    with zero SAT proofs (`proofs == 0`).
+    for &bits in &[8u16, 32, 64, 128, 256, 512] {
+        let o = ParseOptions::width(Width::new(bits).unwrap());
+        for maj in maj_encodings {
+            let src = format!("(a ^ b ^ c) + (({maj}) << 1)");
+            let mut cx = Context::new();
+            let e = cx.parse(&src, &o).unwrap();
+            let want = cx.parse("a + b + c", &o).unwrap();
+            let out = carries_only.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0].expr;
+            assert_eq!(r, want, "{bits} bits ({maj}): got {}", cx.display(r));
+            assert_eq!(out.stats.passes["carries"].proofs, 0);
+            assert!(equivalent(&mut cx, e, r, &mut rng));
+
+            // Reversed operand order and `* 2` carry scaling.
+            let src_mul = format!("(({maj}) * 2) + (c ^ (a ^ b))");
+            let e_mul = cx.parse(&src_mul, &o).unwrap();
+            let out_mul = carries_only.run(&mut cx, &[e_mul], Run::default()).unwrap();
+            assert_eq!(out_mul.roots[0].expr, want, "{bits} bits ({maj}) * 2");
+        }
+
+        // 2. Shifted CSA `((a ^ b ^ c) << k) + (maj(a, b, c) << (k + 1)) == (a + b + c) << k`.
+        let k = (bits / 4).max(1);
+        let k1 = k + 1;
+        let sh_src = format!("(((a ^ b ^ c) << {k}) + ((((a & b) ^ ((a ^ b) & c)) << {k1})))");
+        let mut cx = Context::new();
+        let e = cx.parse(&sh_src, &o).unwrap();
+        let want = cx.parse(&format!("(a + b + c) << {k}"), &o).unwrap();
+        let out = carries_only.run(&mut cx, &[e], Run::default()).unwrap();
+        assert_eq!(
+            out.roots[0].expr,
+            want,
+            "{bits} bits shifted: got {}",
+            cx.display(out.roots[0].expr)
+        );
+        assert_eq!(out.stats.passes["carries"].proofs, 0);
+        assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+
+        // 3. Borrow-save / complemented carry variants and constant third leaf.
+        for (src, want_src) in [
+            (
+                "(~(a ^ b ^ c)) + (((a & b) | (a & ~c) | (b & ~c)) << 1) + 1",
+                "a + b - c",
+            ),
+            (
+                "(a ^ b ^ c) - ((~((a & b) | ((a ^ b) & c))) << 1) - 2",
+                "a + b + c",
+            ),
+            (
+                "(a ^ b ^ c) - (~(((a & b) | (a & c) | (b & c)) << 1)) - 1",
+                "a + b + c",
+            ),
+            (
+                "(a ^ b ^ 0x55) + ((~((~a & ~b) | (~a & ~0x55) | (~b & ~0x55))) << 1)",
+                "a + b + 0x55",
+            ),
+        ] {
+            let mut cx = Context::new();
+            let e = cx.parse(src, &o).unwrap();
+            let out = deobf.run(&mut cx, &[e], Run::default()).unwrap();
+            let want_raw = cx.parse(want_src, &o).unwrap();
+            let want = deobf.simplify(&mut cx, want_raw).unwrap().expr;
+            assert_eq!(
+                out.roots[0].expr,
+                want,
+                "{bits} bits ({src}): got {}",
+                cx.display(out.roots[0].expr)
+            );
+            assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+        }
+    }
+
+    // 4. Adversarial near-misses are never rewritten to `a + b + c`.
+    for bad in [
+        "(a ^ b ^ c) + (((a & b) | (a & c)) << 1)",
+        "(a ^ b ^ c) + (((a & b) | (a & c) | (b & c)) << 2)",
+    ] {
+        for &bits in &[16u16, 128, 512] {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(Width::new(bits).unwrap());
+            let e = cx.parse(bad, &o).unwrap();
+            let sum = cx.parse("a + b + c", &o).unwrap();
+            let out = carries_only.run(&mut cx, &[e], Run::default()).unwrap();
+            assert_ne!(out.roots[0].expr, sum);
+            assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+        }
+    }
+}
+
+#[cfg(feature = "prove")]
+#[test]
+fn carries_collapses_cascaded_wallace_trees_and_six_atom_mixed_regions() {
+    let carries_only = engine(vec![Phase::Carries]);
+    let deobf = deobfuscator();
+    let mut rng = Rng(0xca5c_ade6);
+
+    // 1. 4-operand, 5-operand, and 6-operand cascaded Wallace CSA networks across widths up to 512.
+    let wallace6 = "\
+        let s0 = x0 ^ x1 ^ x2; \
+        let c0 = ((x0 & x1) | ((x0 ^ x1) & x2)) << 1; \
+        let s1 = x3 ^ x4 ^ x5; \
+        let c1 = (~((~x3 & ~x4) | (~x3 & ~x5) | (~x4 & ~x5))) << 1; \
+        let s2 = s0 ^ c0 ^ s1; \
+        let c2 = ((s0 & c0) ^ (s0 & s1) ^ (c0 & s1)) << 1; \
+        let s3 = s2 ^ c2 ^ c1; \
+        let c3 = ((s2 & (c2 | c1)) | (~s2 & (c2 & c1))) << 1; \
+        s3 + c3";
+    let wallace4 = "\
+        let s0 = x0 ^ x1 ^ x2; \
+        let c0 = ((x0 & x1) | (x0 & x2) | (x1 & x2)) << 1; \
+        (s0 ^ c0 ^ x3) + ((((s0 & c0) | ((s0 ^ c0) & x3))) << 1)";
+    let wallace5 = "\
+        let s0 = x0 ^ x1 ^ x2; \
+        let c0 = ((x0 & x1) | (x0 & x2) | (x1 & x2)) << 1; \
+        let s1 = s0 ^ c0 ^ x3; \
+        let c1 = ((s0 & c0) | ((s0 ^ c0) & x3)) << 1; \
+        (s1 ^ c1 ^ x4) + (((s1 & c1) ^ ((s1 ^ c1) & x4)) << 1)";
+
+    for &bits in &[8u16, 32, 64, 128, 256, 512] {
+        let o = ParseOptions::width(Width::new(bits).unwrap());
+        for (src, want_src) in [
+            (wallace4, "x0 + x1 + x2 + x3"),
+            (wallace5, "x0 + x1 + x2 + x3 + x4"),
+            (wallace6, "x0 + x1 + x2 + x3 + x4 + x5"),
+        ] {
+            let mut cx = Context::new();
+            let e = cx.parse(src, &o).unwrap();
+            let out = carries_only.run(&mut cx, &[e], Run::default()).unwrap();
+            let r = out.roots[0].expr;
+            let want_raw = cx.parse(want_src, &o).unwrap();
+            let want = carries_only.simplify(&mut cx, want_raw).unwrap().expr;
+            assert_eq!(r, want, "{bits} bits: got {}", cx.display(r));
+            assert_eq!(out.stats.passes["carries"].proofs, 0);
+            assert!(equivalent(&mut cx, e, r, &mut rng));
+            cx.memo.clear();
+            let again = carries_only.run(&mut cx, &[r], Run::default()).unwrap();
+            assert!(!again.roots[0].changed);
+        }
+    }
+
+    // 2. Irreducible 6-atom `Mode::Mixed` carry region (`MAX_ATOMS = 6`) where no proper
+    //    subexpression is affine on its own, plus composition with a parallel-prefix subtractor.
+    let irreducible6 = "\
+        (((a ^ b ^ c) + (d ^ e ^ f)) + (((a & b) | (a & c)) << 1)) \
+        + (((~a & b & c) << 1) + (((d & e) | (d & f)) << 1)) \
+        + ((~d & e & f) << 1)";
+    let o16 = ParseOptions::width(Width::W16);
+    {
+        let mut cx = Context::new();
+        let e6 = cx.parse(irreducible6, &o16).unwrap();
+        let want6 = cx.parse("a + b + c + d + e + f", &o16).unwrap();
+        let out6 = carries_only.run(&mut cx, &[e6], Run::default()).unwrap();
+        assert_eq!(
+            out6.roots[0].expr,
+            want6,
+            "got {}",
+            cx.display(out6.roots[0].expr)
+        );
+        assert_eq!(out6.stats.passes["carries"].proved, 1);
+        assert!(equivalent(&mut cx, e6, out6.roots[0].expr, &mut rng));
+    }
+
+    let sub_de = {
+        let mut s = String::from("let sd = d ^ e; let p0 = ~sd; let g0 = ~d & e; ");
+        for k in 0..4 {
+            s += &format!(
+                "let g{n} = g{k} | (p{k} & (g{k} << {sh})); let p{n} = p{k} & (p{k} << {sh}); ",
+                n = k + 1,
+                sh = 1u32 << k
+            );
+        }
+        s + "let sub_part = sd ^ (g4 << 1);"
+    };
+    let mixed6 = format!(
+        "{sub_de} \
+         (a ^ b ^ c) + (((a & b) | (a & c)) << 1) + ((~a & b & c) << 1) + sub_part - f"
+    );
+    let mut cx = Context::new();
+    let e = cx.parse(&mixed6, &o16).unwrap();
+    let out = carries_only.run(&mut cx, &[e], Run::default()).unwrap();
+    let want = cx.parse("a + b + c + (d - e) - f", &o16).unwrap();
+    assert_eq!(
+        out.roots[0].expr,
+        want,
+        "got {}",
+        cx.display(out.roots[0].expr)
+    );
+    assert!(out.stats.passes["carries"].proved >= 2);
+    assert!(equivalent(&mut cx, e, out.roots[0].expr, &mut rng));
+
+    // Derivation check certifies the 6-operand Wallace reduction step.
+    let mut cx_der = Context::new();
+    let e_der = cx_der
+        .parse(wallace6, &ParseOptions::width(Width::W32))
+        .unwrap();
+    let (_, deriv) = deobf.derive(&mut cx_der, e_der, Run::default()).unwrap();
+    let checked = deriv.check(&crate::prove::Config::default()).unwrap();
+    assert!(
+        checked.certified() && checked.unproved.is_empty(),
+        "{checked:?}"
+    );
+}

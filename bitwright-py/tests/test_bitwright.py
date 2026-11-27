@@ -964,6 +964,14 @@ def test_solver_enumerate_memory_merge_site_queries_and_smtlib_run():
     s = bw.Solver(x.ult(4))
     assert s.enumerate(x, 8) == ([0, 1, 2, 3], True)
     assert s.enumerate(x, 2) == ([0, 1], False)
+    assert s.minimize(x) == 0 and s.maximize(x) == 3
+    tf = s.tighten_facts(x)
+    assert tf is not None and (tf.umin, tf.umax) == (0, 3)
+    y = cx.symbol("y", 8)
+    s.add(y.eq(x ^ 5))
+    assert s.is_determined_by(y, [x]) is True
+    fdef = s.functional_def(y, [x])
+    assert fdef is not None and str(fdef) == "x ^ 5"
 
     # Symbolic memory snapshot / restore / merge / memset / memcpy
     mem = bw.Memory(cx, addr_width=64, cell_width=8)

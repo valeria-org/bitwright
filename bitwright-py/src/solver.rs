@@ -2,11 +2,12 @@
 
 use std::sync::Mutex;
 
-use bitwright::solve::{CoreItem, Solver, Status, Values};
+use bitwright::solve::{CoreItem, Optimum, Solver, Status, Values};
+use bitwright::{Reliance, Truth};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use super::{OrRaise, PyContext, PyExpr, lock, to_int};
+use super::{Facts, OrRaise, PyContext, PyExpr, lock, py_facts, to_int, to_signed_int, wrap};
 
 /// 1-bit predicates asserted on a stack, and whether they hold together: `check()` answers
 /// True (with `value()` reading the model), False (with `core()` naming what conflicts) or
@@ -150,6 +151,121 @@ impl PySolver {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Finds the exact minimum value `e` can take under the assertions (unsigned, or signed with
+    /// `signed=True`), setting the solver's model to an optimal witness; None when unsatisfiable
+    /// or undecided.
+    #[pyo3(signature = (e, *, signed = false))]
+    fn minimize<'py>(
+        &self,
+        py: Python<'py>,
+        e: PyRef<'_, PyExpr>,
+        signed: bool,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.context(py, Some(&e))?;
+        let mut s = lock(py, &self.s)?;
+        let mut c = e.cx.bind(py).get().lock(py)?;
+        let opt = if signed {
+            s.minimize_signed(&mut c, e.e).or_raise()?
+        } else {
+            s.minimize(&mut c, e.e).or_raise()?
+        };
+        match opt {
+            Optimum::Found(v) => Ok(Some(if signed {
+                to_signed_int(py, &v)?
+            } else {
+                to_int(py, &v)?
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// Finds the exact maximum value `e` can take under the assertions (unsigned, or signed with
+    /// `signed=True`), setting the solver's model to an optimal witness; None when unsatisfiable
+    /// or undecided.
+    #[pyo3(signature = (e, *, signed = false))]
+    fn maximize<'py>(
+        &self,
+        py: Python<'py>,
+        e: PyRef<'_, PyExpr>,
+        signed: bool,
+    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.context(py, Some(&e))?;
+        let mut s = lock(py, &self.s)?;
+        let mut c = e.cx.bind(py).get().lock(py)?;
+        let opt = if signed {
+            s.maximize_signed(&mut c, e.e).or_raise()?
+        } else {
+            s.maximize(&mut c, e.e).or_raise()?
+        };
+        match opt {
+            Optimum::Found(v) => Ok(Some(if signed {
+                to_signed_int(py, &v)?
+            } else {
+                to_int(py, &v)?
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// Solver-tightened facts of `e` under the assertions, or None when unsatisfiable.
+    fn tighten_facts(&self, py: Python<'_>, e: PyRef<'_, PyExpr>) -> PyResult<Option<Facts>> {
+        self.context(py, Some(&e))?;
+        let mut s = lock(py, &self.s)?;
+        let f = {
+            let mut c = e.cx.bind(py).get().lock(py)?;
+            s.tighten_facts(&mut c, e.e).or_raise()?
+        };
+        f.map(|f| py_facts(py, &f, e.width, Reliance::NONE))
+            .transpose()
+    }
+
+    /// Whether `target` is uniquely determined by `inputs` under the assertions: True, False, or
+    /// None when undecided.
+    fn is_determined_by(
+        &self,
+        py: Python<'_>,
+        target: PyRef<'_, PyExpr>,
+        inputs: Vec<PyRef<'_, PyExpr>>,
+    ) -> PyResult<Option<bool>> {
+        self.context(py, Some(&target))?;
+        for inp in &inputs {
+            self.context(py, Some(inp))?;
+        }
+        let ins: Vec<_> = inputs.iter().map(|x| x.e).collect();
+        let mut s = lock(py, &self.s)?;
+        let mut c = target.cx.bind(py).get().lock(py)?;
+        Ok(
+            match s.is_determined_by(&mut c, target.e, &ins).or_raise()? {
+                Truth::True => Some(true),
+                Truth::False => Some(false),
+                Truth::Unknown => None,
+            },
+        )
+    }
+
+    /// Closed-form expression over `inputs` proved equal to `target` under the assertions, or
+    /// None.
+    fn functional_def(
+        &self,
+        py: Python<'_>,
+        target: PyRef<'_, PyExpr>,
+        inputs: Vec<PyRef<'_, PyExpr>>,
+    ) -> PyResult<Option<PyExpr>> {
+        self.context(py, Some(&target))?;
+        for inp in &inputs {
+            self.context(py, Some(inp))?;
+        }
+        let ins: Vec<_> = inputs.iter().map(|x| x.e).collect();
+        let cxb = target.cx.bind(py);
+        let def = {
+            let mut s = lock(py, &self.s)?;
+            let mut c = cxb.get().lock(py)?;
+            s.functional_def(&mut c, target.e, &ins).or_raise()?
+        };
+        let c = cxb.get().lock(py)?;
+        def.map(|d| wrap(cxb, &c, d)).transpose()
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {

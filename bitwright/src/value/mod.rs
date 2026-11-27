@@ -292,7 +292,10 @@ impl BitVec {
     }
 
     #[inline]
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the arena from M1"))]
+    #[cfg_attr(
+        not(any(feature = "prove", test)),
+        expect(dead_code, reason = "used by Hensel lifting under prove")
+    )]
     pub(crate) fn raw(&self) -> &Limbs {
         &self.limbs
     }

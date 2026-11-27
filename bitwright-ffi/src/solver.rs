@@ -2,9 +2,12 @@
 
 use core::ffi::c_int;
 
-use bw::solve::{CoreItem, Solver, Status, Values};
+use bw::solve::{CoreItem, Optimum, Solver, Status, Values};
 
-use super::{BwContext, BwValue, Out, expr, exprs, get_mut, invalid, run, run_new, slice, value};
+use super::{
+    BwContext, BwFacts, BwValue, Out, c_facts, expr, exprs, get_mut, invalid, run, run_new, slice,
+    value,
+};
 
 /// `bw_solver`.
 #[derive(Debug, Default)]
@@ -199,6 +202,137 @@ pub unsafe extern "C" fn bw_solver_enumerate(
                 count.set(0);
                 exact.set(false);
                 answer.set(BW_UNKNOWN);
+            },
+        }
+        Ok(())
+    })
+}
+
+fn finish_optimum(opt: Optimum, out: Out<BwValue>, answer: Out<c_int>) {
+    match opt {
+        Optimum::Found(v) => unsafe {
+            out.set(value(&v));
+            answer.set(BW_SAT);
+        },
+        Optimum::Unsat => unsafe {
+            answer.set(BW_UNSAT);
+        },
+        _ => unsafe {
+            answer.set(BW_UNKNOWN);
+        },
+    }
+}
+
+/// # Safety
+/// `s` and `cx` are live; `out` and `answer` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_solver_minimize(
+    s: *mut BwSolver,
+    cx: *mut BwContext,
+    e: u64,
+    signed_cmp: bool,
+    out: *mut BwValue,
+    answer: *mut c_int,
+) -> c_int {
+    run(|| {
+        let s = &mut unsafe { get_mut(s, "s") }?.solver;
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let out = Out::new(out, "out")?;
+        let answer = Out::new(answer, "answer")?;
+        let e = expr(e)?;
+        let opt = if signed_cmp {
+            s.minimize_signed(cx, e)?
+        } else {
+            s.minimize(cx, e)?
+        };
+        finish_optimum(opt, out, answer);
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `s` and `cx` are live; `out` and `answer` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_solver_maximize(
+    s: *mut BwSolver,
+    cx: *mut BwContext,
+    e: u64,
+    signed_cmp: bool,
+    out: *mut BwValue,
+    answer: *mut c_int,
+) -> c_int {
+    run(|| {
+        let s = &mut unsafe { get_mut(s, "s") }?.solver;
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let out = Out::new(out, "out")?;
+        let answer = Out::new(answer, "answer")?;
+        let e = expr(e)?;
+        let opt = if signed_cmp {
+            s.maximize_signed(cx, e)?
+        } else {
+            s.maximize(cx, e)?
+        };
+        finish_optimum(opt, out, answer);
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `s` and `cx` are live; `out` and `satisfiable` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_solver_tighten_facts(
+    s: *mut BwSolver,
+    cx: *mut BwContext,
+    e: u64,
+    out: *mut BwFacts,
+    satisfiable: *mut bool,
+) -> c_int {
+    run(|| {
+        let s = &mut unsafe { get_mut(s, "s") }?.solver;
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let out = Out::new(out, "out")?;
+        let satisfiable = Out::new(satisfiable, "satisfiable")?;
+        let e = expr(e)?;
+        match s.tighten_facts(cx, e)? {
+            Some(f) => unsafe {
+                out.set(c_facts(&f, 0));
+                satisfiable.set(true);
+            },
+            None => unsafe {
+                satisfiable.set(false);
+            },
+        }
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `s` and `cx` are live, `inputs` holds `n` handles, `out` and `found` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bw_solver_functional_def(
+    s: *mut BwSolver,
+    cx: *mut BwContext,
+    target: u64,
+    inputs: *const u64,
+    n: usize,
+    out: *mut u64,
+    found: *mut bool,
+) -> c_int {
+    run(|| {
+        let s = &mut unsafe { get_mut(s, "s") }?.solver;
+        let cx = &mut unsafe { get_mut(cx, "cx") }?.cx;
+        let out = Out::new(out, "out")?;
+        let found = Out::new(found, "found")?;
+        let target = expr(target)?;
+        let inputs = exprs(unsafe { slice(inputs, n, "inputs") }?)?;
+        match s.functional_def(cx, target, &inputs)? {
+            Some(def) => unsafe {
+                out.set(def.to_bits());
+                found.set(true);
+            },
+            None => unsafe {
+                out.set(0);
+                found.set(false);
             },
         }
         Ok(())

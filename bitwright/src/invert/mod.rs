@@ -51,7 +51,7 @@
 //! (a multiplication mixes every bit below, so `S((x ^ k) * k)` is proved over `(x ^ k) * k`, not
 //! over `x`). For `f(a) == f(b)` the sides are anti-unified first: one function of a pair of
 //! different subterms, found as deep as the structure allows. At most [`MAX_REGION`] nodes, and
-//! holes of at most 128 bits, are examined.
+//! holes of at most 512 bits, are examined.
 //!
 //! Orderings see through a different kind of layer, a strictly monotone one (`zext`, `sext`,
 //! `concat`, `~v`, and `v + k`, `v * k`, `v << s` where the facts show no wrap): see
@@ -60,9 +60,13 @@
 //! [`ExtOp::invert`]: crate::ext::ExtOp::invert
 
 pub(crate) mod gf2;
+#[cfg(any(feature = "prove", test))]
+pub(crate) mod hensel;
 pub(crate) mod monotone;
 #[cfg(test)]
 mod tests;
+
+use core::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not};
 
 use crate::error::Error;
 use crate::expr::{Context, Expr, OpCode, count_mod};
@@ -80,8 +84,8 @@ const MAX_CANDIDATES: usize = 8;
 const MAX_MATCH: u32 = 1024;
 /// The deepest the anti-unification recursion goes.
 const MAX_MATCH_DEPTH: u32 = 256;
-/// The widest hole of a region (dependencies are 128-bit masks).
-const MAX_HOLE_BITS: u16 = 128;
+/// The widest hole of a region (dependencies are 512-bit masks).
+const MAX_HOLE_BITS: u16 = 512;
 /// The most leaves of an or-tree split by [`solve_eq`]'s callers.
 pub(crate) const MAX_SPLIT: usize = 16;
 
@@ -155,7 +159,7 @@ pub(crate) struct Layer {
 
 /// A recovery plan: per level, the hole bits recovered together, each with the output bit it
 /// flips.
-type Plan = Vec<Vec<(u8, u16)>>;
+type Plan = Vec<Vec<(u16, u16)>>;
 
 /// A layer of several nodes: the node is a function of the hole (the layer's inner value)
 /// computed by `nodes`, and injective because every bit of the hole can be recovered from the
@@ -268,29 +272,163 @@ pub(crate) fn mul_inverse(k: &BitVec) -> Option<BitVec> {
 
 // ----- regions ----------------------------------------------------------------------------------
 
+/// Zero-heap-allocation 512-bit mask over a region's hole bits (`0..512`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct HoleMask([u64; 8]);
+
+impl HoleMask {
+    const ZERO: Self = Self([0; 8]);
+
+    #[inline]
+    fn single(bit: u16) -> Self {
+        let mut m = Self::ZERO;
+        if bit < MAX_HOLE_BITS {
+            m.0[(bit >> 6) as usize] = 1u64 << (bit & 63);
+        }
+        m
+    }
+
+    #[inline]
+    fn low_ones(n: u16) -> Self {
+        if n == 0 {
+            return Self::ZERO;
+        }
+        if n >= MAX_HOLE_BITS {
+            return Self([u64::MAX; 8]);
+        }
+        let mut m = Self::ZERO;
+        let full = (n >> 6) as usize;
+        let rem = n & 63;
+        m.0[..full].fill(u64::MAX);
+        if rem != 0 {
+            m.0[full] = (1u64 << rem) - 1;
+        }
+        m
+    }
+
+    #[inline]
+    fn is_zero(&self) -> bool {
+        (self.0[0]
+            | self.0[1]
+            | self.0[2]
+            | self.0[3]
+            | self.0[4]
+            | self.0[5]
+            | self.0[6]
+            | self.0[7])
+            == 0
+    }
+
+    #[inline]
+    fn test(&self, bit: u16) -> bool {
+        bit < MAX_HOLE_BITS && ((self.0[(bit >> 6) as usize] >> (bit & 63)) & 1 != 0)
+    }
+
+    #[inline]
+    fn clear(&mut self, bit: u16) {
+        if bit < MAX_HOLE_BITS {
+            self.0[(bit >> 6) as usize] &= !(1u64 << (bit & 63));
+        }
+    }
+
+    #[inline]
+    fn count_ones(&self) -> u32 {
+        self.0.iter().map(|w| w.count_ones()).sum()
+    }
+
+    #[inline]
+    fn first_one(&self) -> Option<u16> {
+        for (i, &w) in self.0.iter().enumerate() {
+            if w != 0 {
+                return Some((i as u16) * 64 + w.trailing_zeros() as u16);
+            }
+        }
+        None
+    }
+}
+
+impl BitOr for HoleMask {
+    type Output = Self;
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self {
+        Self(core::array::from_fn(|i| self.0[i] | rhs.0[i]))
+    }
+}
+
+impl BitOrAssign for HoleMask {
+    #[inline]
+    fn bitor_assign(&mut self, rhs: Self) {
+        for i in 0..8 {
+            self.0[i] |= rhs.0[i];
+        }
+    }
+}
+
+impl BitAnd for HoleMask {
+    type Output = Self;
+    #[inline]
+    fn bitand(self, rhs: Self) -> Self {
+        Self(core::array::from_fn(|i| self.0[i] & rhs.0[i]))
+    }
+}
+
+impl BitAndAssign for HoleMask {
+    #[inline]
+    fn bitand_assign(&mut self, rhs: Self) {
+        for i in 0..8 {
+            self.0[i] &= rhs.0[i];
+        }
+    }
+}
+
+impl BitXor for HoleMask {
+    type Output = Self;
+    #[inline]
+    fn bitxor(self, rhs: Self) -> Self {
+        Self(core::array::from_fn(|i| self.0[i] ^ rhs.0[i]))
+    }
+}
+
+impl BitXorAssign for HoleMask {
+    #[inline]
+    fn bitxor_assign(&mut self, rhs: Self) {
+        for i in 0..8 {
+            self.0[i] ^= rhs.0[i];
+        }
+    }
+}
+
+impl Not for HoleMask {
+    type Output = Self;
+    #[inline]
+    fn not(self) -> Self {
+        Self(core::array::from_fn(|i| !self.0[i]))
+    }
+}
+
 /// Per bit of a node: the bits of the hole it can depend on (`dep`), and its *pivots* (`piv`,
 /// among them): the hole bits `j` such that the bit is `hole_j ^ φ`, with `φ` a function of its
 /// other dependencies only. An output bit can have several (`x_k ^ x_{k+4}` has two), and each
 /// one alone satisfies that.
 #[derive(Clone, Debug)]
 struct Bits {
-    dep: Vec<u128>,
-    piv: Vec<u128>,
+    dep: Vec<HoleMask>,
+    piv: Vec<HoleMask>,
 }
 
 impl Bits {
-    fn opaque(dep: Vec<u128>) -> Bits {
-        let piv = vec![0; dep.len()];
+    fn opaque(dep: Vec<HoleMask>) -> Bits {
+        let piv = vec![HoleMask::ZERO; dep.len()];
         Bits { dep, piv }
     }
 
-    fn all(&self) -> u128 {
+    fn all(&self) -> HoleMask {
         all(&self.dep)
     }
 }
 
-fn all(d: &[u128]) -> u128 {
-    d.iter().fold(0, |a, x| a | x)
+fn all(d: &[HoleMask]) -> HoleMask {
+    d.iter().fold(HoleMask::ZERO, |a, &x| a | x)
 }
 
 /// The counts a shift or rotation of width `w` by a count with facts `f` acts as: `n` in a row
@@ -312,7 +450,7 @@ fn count_span(op: OpCode, f: &Facts, w: usize) -> (u64, u64) {
 
 /// Dependencies of a shift or rotation of `a` by a count whose facts are `cf` and whose own
 /// dependencies are `cd` (all zero for a parameter).
-fn shift_deps(op: OpCode, a: &[u128], cf: &Facts, cd: u128) -> Vec<u128> {
+fn shift_deps(op: OpCode, a: &[HoleMask], cf: &Facts, cd: HoleMask) -> Vec<HoleMask> {
     let w = a.len();
     let wu = w as u64;
     let (first, n) = count_span(op, cf, w);
@@ -344,7 +482,7 @@ fn shift_deps(op: OpCode, a: &[u128], cf: &Facts, cd: u128) -> Vec<u128> {
                         OpCode::Shl if t <= i && t < w => a[i - t],
                         OpCode::LShr if i + t < w => a[i + t],
                         OpCode::AShr => a[(i + t).min(w - 1)],
-                        _ => 0,
+                        _ => HoleMask::ZERO,
                     };
                 }
             }
@@ -358,11 +496,11 @@ fn shift_deps(op: OpCode, a: &[u128], cf: &Facts, cd: u128) -> Vec<u128> {
 /// that does not vary (`a_k * c_0` plus terms of lower bits).
 fn carry_chain(a: &Bits, c: Option<&Bits>) -> Bits {
     let w = a.dep.len();
-    let mut out = Bits::opaque(vec![0; w]);
-    let mut low = 0u128;
+    let mut out = Bits::opaque(vec![HoleMask::ZERO; w]);
+    let mut low = HoleMask::ZERO;
     for k in 0..w {
         let (da, pa) = (a.dep[k], a.piv[k]);
-        let (dc, pc) = c.map_or((0, 0), |c| (c.dep[k], c.piv[k]));
+        let (dc, pc) = c.map_or((HoleMask::ZERO, HoleMask::ZERO), |c| (c.dep[k], c.piv[k]));
         out.dep[k] = low | da | dc;
         // A pivot of one side that neither the other side nor the carry reads.
         out.piv[k] = (pa & !(low | dc)) | (pc & !(low | da));
@@ -413,20 +551,22 @@ fn doubled_facts(cx: &Context, i: u32, f: Facts, fa: &Facts) -> Facts {
 /// `x_k` flipped by lower bits.
 fn product(a: &Bits, c: &Bits, t: [usize; 2], odd: [bool; 2], square: bool) -> Bits {
     let w = a.dep.len();
-    let prefix = |d: &[u128]| {
-        let mut acc = 0u128;
+    let prefix = |d: &[HoleMask]| {
+        let mut acc = HoleMask::ZERO;
         d.iter()
             .map(|&x| {
                 acc |= x;
                 acc
             })
-            .collect::<Vec<u128>>()
+            .collect::<Vec<HoleMask>>()
     };
     let (pa, pc) = (prefix(&a.dep), prefix(&c.dep));
     // The dependencies of bits `0..=i` (none when `i` is below 0).
-    let upto = |p: &[u128], i: usize, less: usize| i.checked_sub(less).map_or(0, |j| p[j]);
+    let upto = |p: &[HoleMask], i: usize, less: usize| {
+        i.checked_sub(less).map_or(HoleMask::ZERO, |j| p[j])
+    };
     let [ta, tc] = t;
-    let mut out = Bits::opaque(vec![0; w]);
+    let mut out = Bits::opaque(vec![HoleMask::ZERO; w]);
     for k in 0..w {
         if square {
             if k == 2 * ta {
@@ -456,7 +596,7 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
     // Bit `k` is bit `src(k)` of `a` (a constant where there is none).
     let pick = |a: u32, src: &dyn Fn(usize) -> Option<usize>| {
         let ba = &b[&a];
-        let mut out = Bits::opaque(vec![0; w]);
+        let mut out = Bits::opaque(vec![HoleMask::ZERO; w]);
         for k in 0..w {
             if let Some(s) = src(k) {
                 out.dep[k] = ba.dep[s];
@@ -467,7 +607,7 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
     };
     let known = |c: u32, k: usize| f[&c].known().bit(k as u16);
     match n.op {
-        OpCode::Const | OpCode::Sym => Bits::opaque(vec![0; w]),
+        OpCode::Const | OpCode::Sym => Bits::opaque(vec![HoleMask::ZERO; w]),
         OpCode::Not => b[&n.a].clone(),
         OpCode::Neg => carry_chain(&b[&n.a], None),
         // `a + a` is `a << 1` (the linear pass writes it so), and `a − ~a` is `(a << 1) | 1`.
@@ -477,7 +617,7 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
             // With a factor `m` that does not vary and has `t` low bits known zero, the product
             // is `(y * (m >> t)) << t`: bit `k` reads `y`'s bits up to `k - t`, and when
             // `m >> t` is odd, it is `y_(k-t)` flipped by lower bits.
-            let fixed = |m: u32| b[&m].all() == 0;
+            let fixed = |m: u32| b[&m].all().is_zero();
             let (y, m) = if fixed(n.b) { (n.a, n.b) } else { (n.b, n.a) };
             if !fixed(m) {
                 let tz = |c: u32| f[&c].known().trailing_known_zeros() as usize;
@@ -491,19 +631,19 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
             }
             let t = f[&m].known().trailing_known_zeros() as usize;
             let base = carry_chain(&b[&y], None);
-            let mut out = Bits::opaque(vec![0; w]);
+            let mut out = Bits::opaque(vec![HoleMask::ZERO; w]);
             for k in t..w {
                 out.dep[k] = base.dep[k - t];
                 out.piv[k] = base.piv[k - t];
             }
             if t >= w || known(m, t) != Some(true) {
-                out.piv.iter_mut().for_each(|p| *p = 0);
+                out.piv.fill(HoleMask::ZERO);
             }
             out
         }
         OpCode::And | OpCode::Or | OpCode::Xor => {
             let (ba, bc) = (&b[&n.a], &b[&n.b]);
-            let mut out = Bits::opaque(vec![0; w]);
+            let mut out = Bits::opaque(vec![HoleMask::ZERO; w]);
             for k in 0..w {
                 out.dep[k] = ba.dep[k] | bc.dep[k];
                 // An operand's bit passes through when the other's is known to let it.
@@ -520,7 +660,7 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
                 } else if through(n.a) {
                     pc
                 } else {
-                    0
+                    HoleMask::ZERO
                 };
             }
             out
@@ -557,7 +697,7 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
         OpCode::Concat => {
             let (h, l) = (&b[&n.a], &b[&n.b]);
             let wl = l.dep.len();
-            let mut out = Bits::opaque(vec![0; w]);
+            let mut out = Bits::opaque(vec![HoleMask::ZERO; w]);
             for k in 0..w {
                 let (x, s) = if k < wl { (l, k) } else { (h, k - wl) };
                 out.dep[k] = x.dep[s];
@@ -570,10 +710,10 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
             // both arms share.
             let (c, t, e) = (&b[&n.a], &b[&n.b], &b[&n.c]);
             let cond = c.all();
-            let mut out = Bits::opaque(vec![0; w]);
+            let mut out = Bits::opaque(vec![HoleMask::ZERO; w]);
             for k in 0..w {
                 out.dep[k] = cond | t.dep[k] | e.dep[k];
-                if cond == 0 {
+                if cond.is_zero() {
                     out.piv[k] = t.piv[k] & e.piv[k];
                 }
             }
@@ -581,7 +721,11 @@ fn node_bits(cx: &Context, i: u32, b: &IdMap<u32, Bits>, f: &IdMap<u32, Facts>) 
         }
         // Every bit may read every bit of every operand: high products, divisions, counts,
         // comparisons, deposits and extractions, extension outputs.
-        _ => Bits::opaque(vec![n.children().fold(0, |acc, c| acc | b[&c].all()); w]),
+        _ => Bits::opaque(vec![
+            n.children()
+                .fold(HoleMask::ZERO, |acc, c| acc | b[&c].all());
+            w
+        ]),
     }
 }
 
@@ -630,8 +774,8 @@ fn recover_levels<O: Oracle>(
     bits.insert(
         hole,
         Bits {
-            dep: (0..wv).map(|k| 1u128 << k).collect(),
-            piv: (0..wv).map(|k| 1u128 << k).collect(),
+            dep: (0..wv).map(|k| HoleMask::single(k as u16)).collect(),
+            piv: (0..wv).map(|k| HoleMask::single(k as u16)).collect(),
         },
     );
     facts.insert(hole, Facts::top(cx.width_of(hole)));
@@ -648,7 +792,10 @@ fn recover_levels<O: Oracle>(
                     .facts(cx, c)?
                     .unwrap_or_else(|| Facts::top(cx.width_of(c))),
             };
-            bits.insert(c, Bits::opaque(vec![0; usize::from(cx.wid(c))]));
+            bits.insert(
+                c,
+                Bits::opaque(vec![HoleMask::ZERO; usize::from(cx.wid(c))]),
+            );
             facts.insert(c, f);
         }
         // A variable shift reads, for every result bit, the source bit of every count it acts as.
@@ -670,8 +817,8 @@ fn recover_levels<O: Oracle>(
         let known = f.known().known();
         for k in 0..nb.dep.len() {
             if known.bit(k as u16) == Some(true) {
-                nb.dep[k] = 0;
-                nb.piv[k] = 0;
+                nb.dep[k] = HoleMask::ZERO;
+                nb.piv[k] = HoleMask::ZERO;
             }
         }
         bits.insert(i, nb);
@@ -687,28 +834,31 @@ fn recover_levels<O: Oracle>(
 /// if a hole bit is never recovered (injectivity is not proved). Recovering a bit only makes
 /// more output bits usable, so this closure finds every bit that can be recovered.
 fn levels(top: &Bits, wv: usize) -> Option<Plan> {
-    let full = if wv >= 128 {
-        u128::MAX
-    } else {
-        (1u128 << wv) - 1
-    };
-    let mut done = 0u128;
+    let mut rem = HoleMask::low_ones(wv as u16);
     let mut out = Vec::new();
-    while done != full {
+    while !rem.is_zero() {
         let mut level = Vec::new();
-        let mut got = 0u128;
+        let mut got = HoleMask::ZERO;
         for (k, (&d, &p)) in top.dep.iter().zip(&top.piv).enumerate() {
-            let open = d & !done;
-            if open.count_ones() != 1 || p & open == 0 || got & open != 0 {
+            let open = d & rem;
+            if open.count_ones() != 1 {
                 continue;
             }
-            level.push((open.trailing_zeros() as u8, k as u16));
-            got |= open;
+            let Some(bit) = open.first_one() else {
+                continue;
+            };
+            if !p.test(bit) || got.test(bit) {
+                continue;
+            }
+            level.push((bit, k as u16));
+            got |= HoleMask::single(bit);
         }
         if level.is_empty() {
             return None;
         }
-        done |= got;
+        for &(bit, _) in &level {
+            rem.clear(bit);
+        }
         out.push(level);
     }
     Some(out)

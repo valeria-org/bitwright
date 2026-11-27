@@ -45,14 +45,14 @@
 //! unsatisfiable together: the slice that is, less each member the quick attempt shows is
 //! not needed ([`Config::minimize_cores`]). A core is sound, not minimal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::engine::Deadline;
 use crate::error::Error;
 use crate::expr::{Context, Expr};
-use crate::ops::{BinOp, UnOp};
+use crate::ops::{BinOp, CmpOp, UnOp};
 use crate::prove::{self, Limits, Model, Outcome, Question, Unknown};
-use crate::{BitVec, FnEnv, SymbolId, Width};
+use crate::{BitVec, Facts, FnEnv, KnownBits, SRange, SymbolId, Truth, URange, Width};
 
 /// How a [`Solver`] checks.
 #[derive(Clone, Debug)]
@@ -110,6 +110,9 @@ pub struct Config {
     /// (the cheaper stages before it see the assertions as given). A model then has `x` at
     /// the value of `t`.
     pub solve_equations: bool,
+    /// Whether causal 2-adic T-function equations are solved by Hensel root-lifting before
+    /// bit-blasting.
+    pub hensel: bool,
     /// A simplifier of the host's, if any, run on what is left of a slice before the prover
     /// is asked: an engine linked with the host's rules (its own, or theorems imported from
     /// Lean with [`rules::lean_import`](crate::rules::lean_import)) makes them take part in
@@ -162,6 +165,7 @@ impl Default for Config {
             incremental: true,
             incremental_nodes: 1 << 21,
             solve_equations: true,
+            hensel: true,
             simplifier: None,
             backend: None,
             backend_after: 2_000,
@@ -184,6 +188,7 @@ setters!(Config {
     with_incremental: incremental: bool,
     with_incremental_nodes: incremental_nodes: usize,
     with_solve_equations: solve_equations: bool,
+    with_hensel: hensel: bool,
     with_simplifier: simplifier: Option<crate::engine::Engine>,
     with_backend: backend: Option<Backend>,
     with_backend_after: backend_after: u64,
@@ -263,6 +268,19 @@ pub enum Values {
     Unknown(Unknown),
 }
 
+/// Result of optimizing an expression under a [`Solver`]'s assertions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Optimum {
+    /// Exact optimal value achieved by at least one satisfying model (which [`Solver::value`]
+    /// and [`Solver::model`] now hold).
+    Found(BitVec),
+    /// The assertions (and assumptions) are unsatisfiable.
+    Unsat,
+    /// Optimization stopped before proving optimality.
+    Unknown(Unknown),
+}
+
 /// What decided a check: of what its slices needed, the last in this order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
@@ -282,6 +300,8 @@ pub enum DecidedBy {
     /// [`Config::abstraction`]: products and divisions as unknowns, defined where a model
     /// needed it.
     Abstraction,
+    /// 2-adic Hensel root-lifting on causal T-function equations.
+    Hensel,
     /// [`Config::quick`].
     Quick,
     /// [`Config::prove`].
@@ -825,6 +845,61 @@ impl Solver {
             left = rest;
             trail.extend(taken);
         }
+        let abstract_ = match self.cfg.quick {
+            Some(quick) if self.cfg.abstraction && kept.is_none() => {
+                abstracted(cx, es, quick.limits())?
+            }
+            _ => None,
+        };
+        let can_search = self.cfg.quick.is_some() || self.cfg.prove.max_conflicts > 0;
+        if self.cfg.hensel
+            && can_search
+            && kept.is_none()
+            && abstract_.is_none()
+            && !left.is_empty()
+        {
+            use crate::invert::hensel::{HenselLimits, HenselOutcome, solve as hensel_solve};
+            match hensel_solve(cx, &left, &HenselLimits::default())? {
+                HenselOutcome::Sat(mut found) => {
+                    if !trail.is_empty() {
+                        let ts: Vec<Expr> = trail.iter().map(|&(_, t)| t).collect();
+                        let values = eval_in(cx, &ts, &found)?;
+                        for ((k_sym, _), v) in trail.iter().zip(values) {
+                            found.retain(|(k, _)| k != k_sym);
+                            found.push((k_sym.clone(), v));
+                        }
+                    }
+                    let m = complete(cx, es, &found)?;
+                    if holds(cx, es, &m)? {
+                        let answer = Some(m);
+                        if caching {
+                            if self.cache.exact.len() >= self.cfg.cache_entries {
+                                self.cache = Cache::default();
+                            }
+                            self.cache.exact.insert(key, answer.clone());
+                        }
+                        if let (Some(answers), Some(name)) = (&mut self.answers, named) {
+                            answers.learn(name, &answer, DecidedBy::Hensel, None);
+                        }
+                        return Ok((Ok(answer), DecidedBy::Hensel, None));
+                    }
+                }
+                HenselOutcome::Unsat => {
+                    if caching {
+                        if self.cache.exact.len() >= self.cfg.cache_entries {
+                            self.cache = Cache::default();
+                        }
+                        self.cache.unsat.push(key.clone());
+                        self.cache.exact.insert(key, None);
+                    }
+                    if let (Some(answers), Some(name)) = (&mut self.answers, named) {
+                        answers.learn(name, &None, DecidedBy::Hensel, None);
+                    }
+                    return Ok((Ok(None), DecidedBy::Hensel, None));
+                }
+                HenselOutcome::Unknown => {}
+            }
+        }
         let left = match self.cfg.simplifier.clone() {
             Some(engine) => {
                 // Each conjunct under the ones before it, as given: a rule whose guard is
@@ -877,12 +952,6 @@ impl Solver {
                 DecidedBy::Backend,
             ),
         ];
-        let abstract_ = match self.cfg.quick {
-            Some(quick) if self.cfg.abstraction && kept.is_none() => {
-                abstracted(cx, es, quick.limits())?
-            }
-            _ => None,
-        };
         let attempts = (kept
             .into_iter()
             .map(|a| (None, DecidedBy::Incremental, Some(a))))
@@ -1038,7 +1107,13 @@ impl Solver {
             (_, DecidedBy::Constants) => Tier::Folding,
             (_, DecidedBy::Remembered) => Tier::Remembered,
             (_, DecidedBy::Cache | DecidedBy::LastModel | DecidedBy::Probe) => Tier::Earlier,
-            (_, DecidedBy::Incremental | DecidedBy::Quick | DecidedBy::Abstraction) => Tier::Search,
+            (
+                _,
+                DecidedBy::Incremental
+                | DecidedBy::Quick
+                | DecidedBy::Abstraction
+                | DecidedBy::Hensel,
+            ) => Tier::Search,
             (_, DecidedBy::Prover | DecidedBy::Backend) => Tier::Simplifier,
         })
     }
@@ -1107,6 +1182,22 @@ impl Solver {
                 Status::Unknown(why) => Values::Unknown(why),
             });
         }
+        if self.cfg.hensel && deadline.is_none_or(|d| d.clock.now_ticks() < d.at) {
+            let mut all_preds = Vec::with_capacity(self.assertions.len() + assumptions.len());
+            all_preds.extend_from_slice(&self.assertions);
+            all_preds.extend_from_slice(assumptions);
+            if !all_preds.is_empty()
+                && let Some(exact) = crate::invert::hensel::enumerate(
+                    cx,
+                    &all_preds,
+                    expr,
+                    limit,
+                    &crate::invert::hensel::HenselLimits::default(),
+                )?
+            {
+                return Ok(Values::Exact(exact));
+            }
+        }
         self.push();
         let res = (|| -> Result<Values, Error> {
             for &a in assumptions {
@@ -1146,6 +1237,1148 @@ impl Solver {
         })();
         let _ = self.pop(1);
         res
+    }
+
+    /// Finds the minimum unsigned value `expr` can take under the current assertions.
+    ///
+    /// When [`Optimum::Found`] is returned, [`Solver::model`] and [`Solver::value`] hold a
+    /// satisfying assignment achieving that exact minimum.
+    pub fn minimize(&mut self, cx: &mut Context, expr: Expr) -> Result<Optimum, Error> {
+        self.minimize_within(cx, expr, &[], None)
+    }
+
+    /// [`minimize`](Self::minimize) under temporary 1-bit `assumptions` and an optional
+    /// `deadline`.
+    pub fn minimize_within(
+        &mut self,
+        cx: &mut Context,
+        expr: Expr,
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<Optimum, Error> {
+        self.optimize_unsigned(cx, expr, false, assumptions, deadline, None)
+    }
+
+    /// Finds the maximum unsigned value `expr` can take under the current assertions.
+    ///
+    /// When [`Optimum::Found`] is returned, [`Solver::model`] and [`Solver::value`] hold a
+    /// satisfying assignment achieving that exact maximum.
+    pub fn maximize(&mut self, cx: &mut Context, expr: Expr) -> Result<Optimum, Error> {
+        self.maximize_within(cx, expr, &[], None)
+    }
+
+    /// [`maximize`](Self::maximize) under temporary 1-bit `assumptions` and an optional
+    /// `deadline`.
+    pub fn maximize_within(
+        &mut self,
+        cx: &mut Context,
+        expr: Expr,
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<Optimum, Error> {
+        self.optimize_unsigned(cx, expr, true, assumptions, deadline, None)
+    }
+
+    /// Finds the minimum two's-complement signed value `expr` can take under the current
+    /// assertions.
+    ///
+    /// When [`Optimum::Found`] is returned, [`Solver::model`] and [`Solver::value`] hold a
+    /// satisfying assignment achieving that exact signed minimum.
+    pub fn minimize_signed(&mut self, cx: &mut Context, expr: Expr) -> Result<Optimum, Error> {
+        self.minimize_signed_within(cx, expr, &[], None)
+    }
+
+    /// [`minimize_signed`](Self::minimize_signed) under temporary 1-bit `assumptions` and an
+    /// optional `deadline`.
+    pub fn minimize_signed_within(
+        &mut self,
+        cx: &mut Context,
+        expr: Expr,
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<Optimum, Error> {
+        self.optimize_signed(cx, expr, false, assumptions, deadline, None)
+    }
+
+    /// Finds the maximum two's-complement signed value `expr` can take under the current
+    /// assertions.
+    ///
+    /// When [`Optimum::Found`] is returned, [`Solver::model`] and [`Solver::value`] hold a
+    /// satisfying assignment achieving that exact signed maximum.
+    pub fn maximize_signed(&mut self, cx: &mut Context, expr: Expr) -> Result<Optimum, Error> {
+        self.maximize_signed_within(cx, expr, &[], None)
+    }
+
+    /// [`maximize_signed`](Self::maximize_signed) under temporary 1-bit `assumptions` and an
+    /// optional `deadline`.
+    pub fn maximize_signed_within(
+        &mut self,
+        cx: &mut Context,
+        expr: Expr,
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<Optimum, Error> {
+        self.optimize_signed(cx, expr, true, assumptions, deadline, None)
+    }
+
+    fn optimize_unsigned(
+        &mut self,
+        cx: &mut Context,
+        expr: Expr,
+        maximize: bool,
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+        mut on_witness: Option<&mut dyn FnMut(&BitVec)>,
+    ) -> Result<Optimum, Error> {
+        let w = cx.width(expr)?;
+        for &a in assumptions {
+            if cx.width(a)? != Width::W1 {
+                return Err(Error::Unsupported("an assumption must be 1 bit".into()));
+            }
+        }
+        if let Some(c) = cx.as_const(expr)? {
+            return Ok(match self.check_within(cx, assumptions, deadline)? {
+                Status::Sat => {
+                    if let Some(cb) = on_witness.as_deref_mut() {
+                        cb(&c);
+                    }
+                    Optimum::Found(c)
+                }
+                Status::Unsat => Optimum::Unsat,
+                Status::Unknown(why) => Optimum::Unknown(why),
+            });
+        }
+        match self.check_within(cx, assumptions, deadline)? {
+            Status::Unsat => return Ok(Optimum::Unsat),
+            Status::Unknown(why) => return Ok(Optimum::Unknown(why)),
+            Status::Sat => {}
+        }
+        let Some(mut best_val) = self.value(cx, expr)? else {
+            return Ok(Optimum::Unknown(Unknown::Unsupported(
+                "missing model value".into(),
+            )));
+        };
+        if let Some(cb) = on_witness.as_deref_mut() {
+            cb(&best_val);
+        }
+        let mut best_model = self.model.clone();
+        let mut best_last = self.last.clone();
+
+        let facts = cx.facts(expr)?;
+        let bound = if maximize {
+            facts.urange().hi()
+        } else {
+            facts.urange().lo()
+        };
+        if best_val == bound {
+            return Ok(Optimum::Found(best_val));
+        }
+        let kb = facts.known();
+
+        let mut active: Vec<Expr> = Vec::with_capacity(assumptions.len() + usize::from(w.bits()));
+        active.extend_from_slice(assumptions);
+
+        for bit in (0..w.bits()).rev() {
+            let bit_one = cx.extract(expr, bit, Width::W1)?;
+            let bit_zero = cx.un(UnOp::Not, bit_one)?;
+            let (prefer, fallback) = if maximize {
+                (bit_one, bit_zero)
+            } else {
+                (bit_zero, bit_one)
+            };
+            if (best_val.bit(bit) == Some(true)) == maximize {
+                active.push(prefer);
+                continue;
+            }
+            let impossible = if maximize {
+                kb.known_zero().bit(bit) == Some(true)
+            } else {
+                kb.known_one().bit(bit) == Some(true)
+            };
+            if impossible {
+                active.push(fallback);
+                continue;
+            }
+            active.push(prefer);
+            match self.check_within(cx, &active, deadline)? {
+                Status::Sat => {
+                    let Some(v) = self.value(cx, expr)? else {
+                        self.model = best_model;
+                        return Ok(Optimum::Unknown(Unknown::Unsupported(
+                            "missing model value".into(),
+                        )));
+                    };
+                    if let Some(cb) = on_witness.as_deref_mut() {
+                        cb(&v);
+                    }
+                    best_val = v;
+                    best_model = self.model.clone();
+                    if let (Some(bl), Some(nl)) = (&mut best_last, &self.last) {
+                        bl.by = bl.by.max(nl.by);
+                    }
+                    if best_val == bound {
+                        break;
+                    }
+                }
+                Status::Unsat => {
+                    if let Some(slot) = active.last_mut() {
+                        *slot = fallback;
+                    }
+                }
+                Status::Unknown(why) => {
+                    self.model = best_model;
+                    return Ok(Optimum::Unknown(why));
+                }
+            }
+        }
+        self.model = best_model;
+        self.last = best_last;
+        Ok(Optimum::Found(best_val))
+    }
+
+    fn optimize_signed(
+        &mut self,
+        cx: &mut Context,
+        expr: Expr,
+        maximize: bool,
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+        on_witness: Option<&mut dyn FnMut(&BitVec)>,
+    ) -> Result<Optimum, Error> {
+        let w = cx.width(expr)?;
+        let smin = BitVec::smin(w);
+        let smin_e = cx.constant(&smin)?;
+        let shifted = cx.bin(BinOp::Xor, expr, smin_e)?;
+        let opt = match on_witness {
+            Some(cb) => {
+                let mut unshift = |sv: &BitVec| {
+                    cb(&crate::facts::known::bv_xor(sv, &smin));
+                };
+                self.optimize_unsigned(
+                    cx,
+                    shifted,
+                    maximize,
+                    assumptions,
+                    deadline,
+                    Some(&mut unshift),
+                )?
+            }
+            None => self.optimize_unsigned(cx, shifted, maximize, assumptions, deadline, None)?,
+        };
+        Ok(match opt {
+            Optimum::Found(sv) => Optimum::Found(crate::facts::known::bv_xor(&sv, &smin)),
+            Optimum::Unsat => Optimum::Unsat,
+            Optimum::Unknown(why) => Optimum::Unknown(why),
+        })
+    }
+
+    /// Computes solver-tightened [`Facts`] for `expr` under the current assertions, or `None` when
+    /// the assertions are unsatisfiable.
+    pub fn tighten_facts(&mut self, cx: &mut Context, expr: Expr) -> Result<Option<Facts>, Error> {
+        self.tighten_facts_within(cx, expr, &[], None)
+    }
+
+    /// [`tighten_facts`](Self::tighten_facts) under temporary 1-bit `assumptions` and an optional
+    /// `deadline`.
+    pub fn tighten_facts_within(
+        &mut self,
+        cx: &mut Context,
+        expr: Expr,
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<Option<Facts>, Error> {
+        let w = cx.width(expr)?;
+        for &a in assumptions {
+            if cx.width(a)? != Width::W1 {
+                return Err(Error::Unsupported("an assumption must be 1 bit".into()));
+            }
+        }
+        let base = cx.facts(expr)?;
+        if base.as_constant().is_some() || cx.as_const(expr)?.is_some() {
+            return Ok(match self.check_within(cx, assumptions, deadline)? {
+                Status::Unsat => None,
+                Status::Sat | Status::Unknown(_) => Some(base),
+            });
+        }
+
+        let mut seen_zero = BitVec::zero(w);
+        let mut seen_one = BitVec::zero(w);
+        let mut any_witness = false;
+        let record_into = |v: &BitVec, sz: &mut BitVec, so: &mut BitVec, seen_any: &mut bool| {
+            *seen_any = true;
+            *so = crate::facts::known::bv_or(so, v);
+            *sz = crate::facts::known::bv_or(sz, &crate::facts::known::bv_not(v));
+        };
+
+        let (umin, umin_exact) = {
+            let mut rec =
+                |v: &BitVec| record_into(v, &mut seen_zero, &mut seen_one, &mut any_witness);
+            match self.optimize_unsigned(cx, expr, false, assumptions, deadline, Some(&mut rec))? {
+                Optimum::Unsat => return Ok(None),
+                Optimum::Unknown(_) if !any_witness => return Ok(Some(base)),
+                Optimum::Unknown(_) => (base.urange().lo(), false),
+                Optimum::Found(v) => (v, true),
+            }
+        };
+        let saved_model = self.model.clone();
+        let saved_last = self.last.clone();
+
+        if umin_exact && umin == base.urange().hi() {
+            return Ok(Some(Facts::constant(&umin)));
+        }
+
+        let (umax, umax_exact) = {
+            let mut rec =
+                |v: &BitVec| record_into(v, &mut seen_zero, &mut seen_one, &mut any_witness);
+            match self.optimize_unsigned(cx, expr, true, assumptions, deadline, Some(&mut rec))? {
+                Optimum::Unsat => return Ok(None),
+                Optimum::Unknown(_) => (base.urange().hi(), false),
+                Optimum::Found(v) => (v, true),
+            }
+        };
+        if umin == umax {
+            return Ok(Some(Facts::constant(&umin)));
+        }
+
+        let (smin, smax) = if umin_exact && umax_exact && umin.msb() == umax.msb() {
+            (umin, umax)
+        } else {
+            let s_lo = {
+                let mut rec =
+                    |v: &BitVec| record_into(v, &mut seen_zero, &mut seen_one, &mut any_witness);
+                match self.optimize_signed(
+                    cx,
+                    expr,
+                    false,
+                    assumptions,
+                    deadline,
+                    Some(&mut rec),
+                )? {
+                    Optimum::Unsat => return Ok(None),
+                    Optimum::Unknown(_) => base.srange().lo(),
+                    Optimum::Found(v) => v,
+                }
+            };
+            let s_hi = {
+                let mut rec =
+                    |v: &BitVec| record_into(v, &mut seen_zero, &mut seen_one, &mut any_witness);
+                match self.optimize_signed(cx, expr, true, assumptions, deadline, Some(&mut rec))? {
+                    Optimum::Unsat => return Ok(None),
+                    Optimum::Unknown(_) => base.srange().hi(),
+                    Optimum::Found(v) => v,
+                }
+            };
+            (s_lo, s_hi)
+        };
+
+        let ur = URange::new(umin, umax).unwrap_or_else(|| base.urange());
+        let sr = SRange::new(smin, smax).unwrap_or_else(|| base.srange());
+        let prelim = Facts::new(base.known(), ur, sr)
+            .and_then(|f| f.meet(&base))
+            .unwrap_or(base);
+
+        let mut kz = prelim.known().known_zero();
+        let mut ko = prelim.known().known_one();
+        let mut probe_assumptions: Vec<Expr> = Vec::with_capacity(assumptions.len() + 1);
+        probe_assumptions.extend_from_slice(assumptions);
+
+        let mut probed = 0u32;
+        for k in 0..w.bits() {
+            if prelim.known().known().bit(k) == Some(true) {
+                continue;
+            }
+            let s0 = seen_zero.bit(k) == Some(true);
+            let s1 = seen_one.bit(k) == Some(true);
+            if s0 && s1 {
+                continue;
+            }
+            if probed >= 64 {
+                break;
+            }
+            probed += 1;
+
+            let bit_one = cx.extract(expr, k, Width::W1)?;
+            let test_lit = if s0 {
+                bit_one
+            } else {
+                cx.un(UnOp::Not, bit_one)?
+            };
+            probe_assumptions.truncate(assumptions.len());
+            probe_assumptions.push(test_lit);
+
+            match self.check_within(cx, &probe_assumptions, deadline)? {
+                Status::Unsat => {
+                    let mask = crate::facts::known::bv_shl(&BitVec::one(w), u32::from(k));
+                    if s0 {
+                        kz = crate::facts::known::bv_or(&kz, &mask);
+                    } else {
+                        ko = crate::facts::known::bv_or(&ko, &mask);
+                    }
+                }
+                Status::Sat => {
+                    if let Some(v) = self.value(cx, expr)? {
+                        record_into(&v, &mut seen_zero, &mut seen_one, &mut any_witness);
+                    }
+                }
+                Status::Unknown(Unknown::Deadline) => break,
+                Status::Unknown(_) => {}
+            }
+        }
+
+        if saved_model.is_some() {
+            self.model = saved_model;
+            self.last = saved_last;
+        }
+
+        let kb = KnownBits::new(kz, ko).unwrap_or_else(|| prelim.known());
+        let tightened = Facts::new(kb, ur, sr)
+            .and_then(|f| f.meet(&prelim))
+            .unwrap_or(prelim);
+        Ok(Some(tightened))
+    }
+
+    /// Checks whether `target` is uniquely determined by `inputs` under the current assertions:
+    /// whether every pair of satisfying models that agree on all `inputs` also agree on `target`.
+    pub fn is_determined_by(
+        &mut self,
+        cx: &mut Context,
+        target: Expr,
+        inputs: &[Expr],
+    ) -> Result<Truth, Error> {
+        self.is_determined_by_within(cx, target, inputs, &[], None)
+    }
+
+    /// [`is_determined_by`](Self::is_determined_by) under temporary 1-bit `assumptions` and an
+    /// optional `deadline`.
+    pub fn is_determined_by_within(
+        &mut self,
+        cx: &mut Context,
+        target: Expr,
+        inputs: &[Expr],
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<Truth, Error> {
+        let _tw = cx.width(target)?;
+        for &inp in inputs {
+            let _ = cx.width(inp)?;
+        }
+        for &a in assumptions {
+            if cx.width(a)? != Width::W1 {
+                return Err(Error::Unsupported("an assumption must be 1 bit".into()));
+            }
+        }
+        if cx.as_const(target)?.is_some() || inputs.contains(&target) {
+            return Ok(Truth::True);
+        }
+        let target_syms = cx.symbols_in(&[target])?;
+        if target_syms.is_empty() {
+            return Ok(Truth::True);
+        }
+        let mut direct_input_syms = HashSet::new();
+        for &inp in inputs {
+            if let Some(id) = cx.symbol_id(inp)? {
+                direct_input_syms.insert(id);
+            }
+        }
+        if target_syms.iter().all(|s| direct_input_syms.contains(s)) {
+            return Ok(Truth::True);
+        }
+
+        let cp = cx.checkpoint();
+        let res = (|| -> Result<Truth, Error> {
+            let mut all_roots: Vec<Expr> =
+                Vec::with_capacity(self.assertions.len() + assumptions.len() + inputs.len() + 1);
+            all_roots.extend_from_slice(&self.assertions);
+            all_roots.extend_from_slice(assumptions);
+            all_roots.extend_from_slice(inputs);
+            all_roots.push(target);
+
+            let syms = cx.symbols_in(&all_roots)?;
+            let mut subst_map: Vec<(Expr, Expr)> = Vec::with_capacity(syms.len());
+            let mut kb_preds: Vec<Expr> = Vec::new();
+            let mut seen = HashSet::with_capacity(syms.len());
+            for sym in syms {
+                if !seen.insert(sym) {
+                    continue;
+                }
+                let (Some(key), Some(sw)) = (cx.symbol_key(sym).cloned(), cx.symbol_width(sym))
+                else {
+                    continue;
+                };
+                let Some(sym1) = cx.find_symbol(&key) else {
+                    continue;
+                };
+                let sym2 = cx.fresh_symbol(sw)?;
+                if let Some(kb) = cx.declared_known(sym1)? {
+                    let mask = cx.constant(&kb.known())?;
+                    let ones = cx.constant(&kb.known_one())?;
+                    let m1 = cx.bin(BinOp::And, sym1, mask)?;
+                    let m2 = cx.bin(BinOp::And, sym2, mask)?;
+                    kb_preds.push(cx.cmp(crate::CmpOpExt::Eq, m1, ones)?);
+                    kb_preds.push(cx.cmp(crate::CmpOpExt::Eq, m2, ones)?);
+                }
+                subst_map.push((sym1, sym2));
+            }
+
+            let copy2 = if subst_map.is_empty() {
+                all_roots.clone()
+            } else {
+                cx.substitute(&all_roots, &subst_map)?
+            };
+            let n_assert = self.assertions.len();
+            let n_assume = assumptions.len();
+            let n_in = inputs.len();
+            let assertions_2 = &copy2[..n_assert];
+            let assumptions_2 = &copy2[n_assert..n_assert + n_assume];
+            let inputs_2 = &copy2[n_assert + n_assume..n_assert + n_assume + n_in];
+            let target_2 = copy2[n_assert + n_assume + n_in];
+
+            let mut miter = Solver::new(self.cfg.clone());
+            for &p in &self.assertions {
+                miter.assert(cx, p)?;
+            }
+            for &p in assumptions {
+                miter.assert(cx, p)?;
+            }
+            for &p in assertions_2 {
+                miter.assert(cx, p)?;
+            }
+            for &p in assumptions_2 {
+                miter.assert(cx, p)?;
+            }
+            for p in kb_preds {
+                miter.assert(cx, p)?;
+            }
+            for (&i1, &i2) in inputs.iter().zip(inputs_2) {
+                let eq = cx.cmp(crate::CmpOpExt::Eq, i1, i2)?;
+                miter.assert(cx, eq)?;
+            }
+            let diff = cx.cmp(crate::CmpOpExt::Ne, target, target_2)?;
+            miter.assert(cx, diff)?;
+
+            Ok(match miter.check_within(cx, &[], deadline)? {
+                Status::Unsat => Truth::True,
+                Status::Sat => Truth::False,
+                Status::Unknown(_) => Truth::Unknown,
+            })
+        })();
+        let _ = cx.rollback(cp);
+        res
+    }
+
+    /// Synthesizes a closed-form expression built solely from `inputs` and constants that equals
+    /// `target` under every model of the current assertions.
+    ///
+    /// Returns `Ok(None)` when the assertions are unsatisfiable, when `target` is not uniquely
+    /// determined by `inputs`, or when no closed-form expression is found within the solver's
+    /// budgets. Every returned `Some(expr)` is solver-verified (`target != expr` is
+    /// [`Status::Unsat`]).
+    pub fn functional_def(
+        &mut self,
+        cx: &mut Context,
+        target: Expr,
+        inputs: &[Expr],
+    ) -> Result<Option<Expr>, Error> {
+        self.functional_def_within(cx, target, inputs, &[], None)
+    }
+
+    /// [`functional_def`](Self::functional_def) under temporary 1-bit `assumptions` and an
+    /// optional `deadline`.
+    pub fn functional_def_within(
+        &mut self,
+        cx: &mut Context,
+        target: Expr,
+        inputs: &[Expr],
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<Option<Expr>, Error> {
+        let tw = cx.width(target)?;
+        for &inp in inputs {
+            let _ = cx.width(inp)?;
+        }
+        for &a in assumptions {
+            if cx.width(a)? != Width::W1 {
+                return Err(Error::Unsupported("an assumption must be 1 bit".into()));
+            }
+        }
+
+        // 1. Constant target fast-path and satisfiability + singleton-value check.
+        if let Some(c) = cx.as_const(target)? {
+            return Ok(match self.check_within(cx, assumptions, deadline)? {
+                Status::Sat => Some(cx.constant(&c)?),
+                Status::Unsat | Status::Unknown(_) => None,
+            });
+        }
+
+        let mut samples: Vec<(Vec<BitVec>, BitVec)> = Vec::new();
+        match self.check_within(cx, assumptions, deadline)? {
+            Status::Unsat | Status::Unknown(_) => return Ok(None),
+            Status::Sat => {
+                if let Some(sample) = self.read_io_sample(cx, inputs, target)? {
+                    samples.push(sample);
+                }
+            }
+        }
+        let saved_model = self.model.clone();
+        let saved_last = self.last.clone();
+
+        // Check whether `target` is constant under `self.assertions` + `assumptions`.
+        if let Some((_, v0)) = samples.first().cloned() {
+            let c0 = cx.constant(&v0)?;
+            let ne0 = cx.cmp(crate::CmpOpExt::Ne, target, c0)?;
+            let mut probe_a = assumptions.to_vec();
+            probe_a.push(ne0);
+            match self.check_within(cx, &probe_a, deadline)? {
+                Status::Unsat => {
+                    self.model = saved_model;
+                    self.last = saved_last;
+                    return Ok(Some(c0));
+                }
+                Status::Sat => {
+                    if let Some(s1) = self.read_io_sample(cx, inputs, target)?
+                        && !samples.iter().any(|(ins, _)| *ins == s1.0)
+                    {
+                        samples.push(s1);
+                    }
+                }
+                Status::Unknown(_) => {
+                    if deadline.is_some_and(|d| d.clock.now_ticks() >= d.at) {
+                        self.model = saved_model;
+                        self.last = saved_last;
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
+        // 2. Empty `inputs`: since `target` takes >= 2 values, it cannot be a function of `[]`.
+        if inputs.is_empty() {
+            self.model = saved_model;
+            self.last = saved_last;
+            return Ok(None);
+        }
+
+        // 3. Direct syntactic membership or symbol subset check.
+        if inputs.contains(&target) {
+            self.model = saved_model;
+            self.last = saved_last;
+            return Ok(Some(target));
+        }
+        let target_syms = cx.symbols_in(&[target])?;
+        let mut direct_in_syms = HashSet::new();
+        for &inp in inputs {
+            if let Some(id) = cx.symbol_id(inp)? {
+                direct_in_syms.insert(id);
+            }
+        }
+        if !target_syms.is_empty() && target_syms.iter().all(|s| direct_in_syms.contains(s)) {
+            let simp = crate::engine::Engine::standard().simplify(cx, target)?.expr;
+            if let CheckCand::Verified(out) =
+                self.verify_functional_cand(cx, target, simp, inputs, assumptions, deadline)?
+            {
+                self.model = saved_model;
+                self.last = saved_last;
+                return Ok(Some(out));
+            }
+        }
+
+        // 4. Implicit functional dependency gate.
+        let det = self.is_determined_by_within(cx, target, inputs, assumptions, deadline)?;
+        if det == Truth::False {
+            self.model = saved_model;
+            self.last = saved_last;
+            return Ok(None);
+        }
+        if det == Truth::Unknown && deadline.is_some_and(|d| d.clock.now_ticks() >= d.at) {
+            self.model = saved_model;
+            self.last = saved_last;
+            return Ok(None);
+        }
+
+        // Fresh proxy symbols `p_i` representing `inputs[i]` so candidates are guaranteed by
+        // construction to depend solely on `inputs`.
+        let mut proxies: Vec<Expr> = Vec::with_capacity(inputs.len());
+        let mut keep_ids: HashSet<SymbolId> = HashSet::with_capacity(inputs.len());
+        let mut proxy_to_input: Vec<(Expr, Expr)> = Vec::with_capacity(inputs.len());
+        for &inp in inputs {
+            let p = cx.fresh_symbol(cx.width(inp)?)?;
+            if let Some(pid) = cx.symbol_id(p)? {
+                keep_ids.insert(pid);
+            }
+            proxies.push(p);
+            proxy_to_input.push((p, inp));
+        }
+
+        // 5. Tier A: Equation isolation in terms of `proxies`.
+        if let Some(cand_p) = try_algebraic_isolation(
+            cx,
+            &self.assertions,
+            assumptions,
+            target,
+            inputs,
+            &proxies,
+            &keep_ids,
+        )? {
+            let cand_p = crate::engine::Engine::standard().simplify(cx, cand_p)?.expr;
+            let cand = cx.substitute(&[cand_p], &proxy_to_input)?[0];
+            match self.verify_functional_cand(cx, target, cand, inputs, assumptions, deadline)? {
+                CheckCand::Verified(out) => {
+                    self.model = saved_model;
+                    self.last = saved_last;
+                    return Ok(Some(out));
+                }
+                CheckCand::Counterexample(cex) => {
+                    if !samples.iter().any(|(ins, _)| *ins == cex.0) {
+                        samples.push(cex);
+                    }
+                }
+                CheckCand::Undecided => {}
+            }
+        }
+
+        if det != Truth::True {
+            self.model = saved_model;
+            self.last = saved_last;
+            return Ok(None);
+        }
+
+        // 6. Tier B.0: Modular-affine interpolation `c_0 + sum_i c_i * cast(inputs[i]) (mod 2^tw)`
+        // with CEGIS counterexample refinement.
+        if let Some(out) = self.try_modular_affine_def(
+            cx,
+            target,
+            tw,
+            inputs,
+            &proxies,
+            &proxy_to_input,
+            assumptions,
+            deadline,
+            &mut samples,
+        )? {
+            self.model = saved_model;
+            self.last = saved_last;
+            return Ok(Some(out));
+        }
+
+        // 7. Tier B.1: GF(2)-affine interpolation with diagonal shift-mask-XOR emission + CEGIS.
+        if let Some(out) = self.try_gf2_affine_def(
+            cx,
+            target,
+            tw,
+            inputs,
+            &proxies,
+            &proxy_to_input,
+            assumptions,
+            deadline,
+            &mut samples,
+        )? {
+            self.model = saved_model;
+            self.last = saved_last;
+            return Ok(Some(out));
+        }
+
+        // 8. Tier B.2: Finite-domain `select` tree + observational synthesis CEGIS.
+        if let Some(out) = self.try_observational_def(
+            cx,
+            target,
+            tw,
+            inputs,
+            &proxies,
+            &proxy_to_input,
+            assumptions,
+            deadline,
+            &mut samples,
+        )? {
+            self.model = saved_model;
+            self.last = saved_last;
+            return Ok(Some(out));
+        }
+
+        self.model = saved_model;
+        self.last = saved_last;
+        Ok(None)
+    }
+
+    fn read_io_sample(
+        &self,
+        cx: &mut Context,
+        inputs: &[Expr],
+        target: Expr,
+    ) -> Result<Option<(Vec<BitVec>, BitVec)>, Error> {
+        let Some(m) = self.model() else {
+            return Ok(None);
+        };
+        let mut all = Vec::with_capacity(inputs.len() + 1);
+        all.extend_from_slice(inputs);
+        all.push(target);
+        let mut vals = eval_in(cx, &all, m)?;
+        let out_v = vals.pop().expect("target appended");
+        Ok(Some((vals, out_v)))
+    }
+
+    fn probe_input_point(
+        &mut self,
+        cx: &mut Context,
+        inputs: &[Expr],
+        target: Expr,
+        point: &[BitVec],
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<Option<(Vec<BitVec>, BitVec)>, Error> {
+        if deadline.is_some_and(|d| d.clock.now_ticks() >= d.at) {
+            return Ok(None);
+        }
+        let mut probe_a: Vec<Expr> = Vec::with_capacity(assumptions.len() + inputs.len());
+        probe_a.extend_from_slice(assumptions);
+        for (&inp, val) in inputs.iter().zip(point) {
+            let k = cx.constant(val)?;
+            probe_a.push(cx.cmp(crate::CmpOpExt::Eq, inp, k)?);
+        }
+        if self.check_within(cx, &probe_a, deadline)? == Status::Sat {
+            self.read_io_sample(cx, inputs, target)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn verify_functional_cand(
+        &mut self,
+        cx: &mut Context,
+        target: Expr,
+        cand: Expr,
+        inputs: &[Expr],
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<CheckCand, Error> {
+        let simp = crate::engine::Engine::standard().simplify(cx, cand)?.expr;
+        let ne = cx.cmp(crate::CmpOpExt::Ne, target, simp)?;
+        let mut check_a = Vec::with_capacity(assumptions.len() + 1);
+        check_a.extend_from_slice(assumptions);
+        check_a.push(ne);
+        match self.check_within(cx, &check_a, deadline)? {
+            Status::Unsat => Ok(CheckCand::Verified(simp)),
+            Status::Sat => match self.read_io_sample(cx, inputs, target)? {
+                Some(cex) => Ok(CheckCand::Counterexample(cex)),
+                None => Ok(CheckCand::Undecided),
+            },
+            Status::Unknown(_) => Ok(CheckCand::Undecided),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_modular_affine_def(
+        &mut self,
+        cx: &mut Context,
+        target: Expr,
+        tw: Width,
+        inputs: &[Expr],
+        proxies: &[Expr],
+        proxy_to_input: &[(Expr, Expr)],
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+        samples: &mut Vec<(Vec<BitVec>, BitVec)>,
+    ) -> Result<Option<Expr>, Error> {
+        let m = inputs.len();
+        if m > 8 {
+            return Ok(None);
+        }
+        let widths: Vec<Width> = inputs
+            .iter()
+            .map(|&e| cx.width(e))
+            .collect::<Result<_, _>>()?;
+
+        // Probe `(0, ..., 0)` and unit vectors `(0, ..., 1, ..., 0)` when not yet sampled.
+        let zeros: Vec<BitVec> = widths.iter().map(|&w| BitVec::zero(w)).collect();
+        if !samples.iter().any(|(ins, _)| *ins == zeros)
+            && let Some(s) =
+                self.probe_input_point(cx, inputs, target, &zeros, assumptions, deadline)?
+        {
+            samples.push(s);
+        }
+        for i in 0..m {
+            let mut unit = zeros.clone();
+            unit[i] = BitVec::one(widths[i]);
+            if !samples.iter().any(|(ins, _)| *ins == unit)
+                && let Some(s) =
+                    self.probe_input_point(cx, inputs, target, &unit, assumptions, deadline)?
+            {
+                samples.push(s);
+            }
+        }
+
+        let max_rounds = m + 4;
+        for _ in 0..max_rounds {
+            if deadline.is_some_and(|d| d.clock.now_ticks() >= d.at) {
+                return Ok(None);
+            }
+            let Some(coeffs) = fit_modular_affine(tw, samples) else {
+                return Ok(None);
+            };
+            let cand_p = build_modular_affine_expr(cx, tw, proxies, &coeffs)?;
+            let cand_p = crate::engine::Engine::standard().simplify(cx, cand_p)?.expr;
+            let cand = cx.substitute(&[cand_p], proxy_to_input)?[0];
+            match self.verify_functional_cand(cx, target, cand, inputs, assumptions, deadline)? {
+                CheckCand::Verified(out) => return Ok(Some(out)),
+                CheckCand::Counterexample(cex) => {
+                    if samples.iter().any(|(ins, _)| *ins == cex.0) {
+                        return Ok(None);
+                    }
+                    samples.push(cex);
+                }
+                CheckCand::Undecided => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_gf2_affine_def(
+        &mut self,
+        cx: &mut Context,
+        target: Expr,
+        tw: Width,
+        inputs: &[Expr],
+        proxies: &[Expr],
+        proxy_to_input: &[(Expr, Expr)],
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+        samples: &mut Vec<(Vec<BitVec>, BitVec)>,
+    ) -> Result<Option<Expr>, Error> {
+        if tw.bits() > 128 {
+            return Ok(None);
+        }
+        let widths: Vec<Width> = inputs
+            .iter()
+            .map(|&e| cx.width(e))
+            .collect::<Result<_, _>>()?;
+        let total_in_bits: usize = widths.iter().map(|w| usize::from(w.bits())).sum();
+        if total_in_bits == 0 || total_in_bits > 128 {
+            return Ok(None);
+        }
+
+        // Fast GF(2)-affine quartet filter: for any GF(2)-affine `f`,
+        // `f(a) ^ f(b) ^ f(c) ^ f(a ^ b ^ c) == 0`.
+        if samples.len() < 3 {
+            let alt: Vec<BitVec> = widths
+                .iter()
+                .enumerate()
+                .map(|(i, &w)| {
+                    BitVec::wrapping_from_u64(
+                        w,
+                        0x5555_5555_5555_5555u64.wrapping_add(i as u64 * 3),
+                    )
+                })
+                .collect();
+            if !samples.iter().any(|(ins, _)| *ins == alt)
+                && let Some(s) =
+                    self.probe_input_point(cx, inputs, target, &alt, assumptions, deadline)?
+            {
+                samples.push(s);
+            }
+        }
+        if samples.len() >= 3 {
+            let fourth: Vec<BitVec> = (0..inputs.len())
+                .map(|i| {
+                    let ab = crate::facts::known::bv_xor(&samples[0].0[i], &samples[1].0[i]);
+                    crate::facts::known::bv_xor(&ab, &samples[2].0[i])
+                })
+                .collect();
+            if !samples.iter().any(|(ins, _)| *ins == fourth)
+                && let Some(s) =
+                    self.probe_input_point(cx, inputs, target, &fourth, assumptions, deadline)?
+            {
+                samples.push(s);
+            }
+        }
+
+        // Check consistency on initial samples before probing bit columns.
+        if fit_gf2_affine(tw, &widths, samples).is_none() {
+            return Ok(None);
+        }
+
+        // Passed quartet check: probe single-bit flips from `samples[0]` if `total_in_bits <= 64`.
+        if total_in_bits <= 64
+            && let Some(base) = samples.first().map(|(ins, _)| ins.clone())
+        {
+            for (i, &w) in widths.iter().enumerate() {
+                for b in 0..w.bits() {
+                    if deadline.is_some_and(|d| d.clock.now_ticks() >= d.at) {
+                        return Ok(None);
+                    }
+                    let mut pt = base.clone();
+                    let mask = crate::facts::known::bv_shl(&BitVec::one(w), u32::from(b));
+                    pt[i] = crate::facts::known::bv_xor(&pt[i], &mask);
+                    if !samples.iter().any(|(ins, _)| *ins == pt)
+                        && let Some(s) =
+                            self.probe_input_point(cx, inputs, target, &pt, assumptions, deadline)?
+                    {
+                        samples.push(s);
+                    }
+                }
+            }
+        }
+
+        let max_cegis = total_in_bits.min(64) + 2;
+        for _ in 0..max_cegis {
+            if deadline.is_some_and(|d| d.clock.now_ticks() >= d.at) {
+                return Ok(None);
+            }
+            let Some((c0, cols)) = fit_gf2_affine(tw, &widths, samples) else {
+                return Ok(None);
+            };
+            let cand_p = build_gf2_affine_expr(cx, tw, proxies, &widths, &c0, &cols)?;
+            let cand_p = crate::engine::Engine::standard().simplify(cx, cand_p)?.expr;
+            let cand = cx.substitute(&[cand_p], proxy_to_input)?[0];
+            match self.verify_functional_cand(cx, target, cand, inputs, assumptions, deadline)? {
+                CheckCand::Verified(out) => return Ok(Some(out)),
+                CheckCand::Counterexample(cex) => {
+                    if samples.iter().any(|(ins, _)| *ins == cex.0) {
+                        return Ok(None);
+                    }
+                    samples.push(cex);
+                }
+                CheckCand::Undecided => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_observational_def(
+        &mut self,
+        cx: &mut Context,
+        target: Expr,
+        tw: Width,
+        inputs: &[Expr],
+        proxies: &[Expr],
+        proxy_to_input: &[(Expr, Expr)],
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+        samples: &mut Vec<(Vec<BitVec>, BitVec)>,
+    ) -> Result<Option<Expr>, Error> {
+        let m = inputs.len();
+        let widths: Vec<Width> = inputs
+            .iter()
+            .map(|&e| cx.width(e))
+            .collect::<Result<_, _>>()?;
+
+        // Try to exhaust up to 9 distinct input tuples to detect small finite domains (`<= 8`).
+        let mut exhausted_domain = false;
+        if samples.len() <= 8 {
+            let mut block_a = assumptions.to_vec();
+            for (ins, _) in samples.iter() {
+                block_a.push(neq_tuple(cx, inputs, ins)?);
+            }
+            while samples.len() < 9 {
+                if deadline.is_some_and(|d| d.clock.now_ticks() >= d.at) {
+                    return Ok(None);
+                }
+                match self.check_within(cx, &block_a, deadline)? {
+                    Status::Unsat => {
+                        exhausted_domain = true;
+                        break;
+                    }
+                    Status::Sat => {
+                        let Some(s) = self.read_io_sample(cx, inputs, target)? else {
+                            break;
+                        };
+                        block_a.push(neq_tuple(cx, inputs, &s.0)?);
+                        samples.push(s);
+                    }
+                    Status::Unknown(_) => break,
+                }
+            }
+        }
+
+        // Seed a handful of diverse boundary/random probes when domain is larger.
+        if !exhausted_domain && samples.len() < 12 && m <= 4 {
+            let mut rng = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(tw.bits());
+            for step in 0..8u64 {
+                if deadline.is_some_and(|d| d.clock.now_ticks() >= d.at) {
+                    break;
+                }
+                let pt: Vec<BitVec> = widths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &w)| {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        let v = match step {
+                            0 => 2,
+                            1 => 3,
+                            2 => 7,
+                            3 => u64::MAX,
+                            _ => rng.wrapping_add(i as u64 * 17),
+                        };
+                        BitVec::wrapping_from_u64(w, v)
+                    })
+                    .collect();
+                if !samples.iter().any(|(ins, _)| *ins == pt)
+                    && let Some(s) =
+                        self.probe_input_point(cx, inputs, target, &pt, assumptions, deadline)?
+                {
+                    samples.push(s);
+                }
+            }
+        }
+
+        // Bottom-up observational synthesis + CEGIS when `tw <= 64` and `m <= 4`.
+        if tw.bits() <= 64 && m <= 4 && !samples.is_empty() {
+            let extra_consts =
+                problem_constants_u64(cx, &self.assertions, assumptions, target, tw)?;
+            for _round in 0..5 {
+                if deadline.is_some_and(|d| d.clock.now_ticks() >= d.at) {
+                    break;
+                }
+                let Some(cand_p) =
+                    observational_enumerate(cx, tw, proxies, &widths, samples, &extra_consts)?
+                else {
+                    break;
+                };
+                let cand_p = crate::engine::Engine::standard().simplify(cx, cand_p)?.expr;
+                let cand = cx.substitute(&[cand_p], proxy_to_input)?[0];
+                match self.verify_functional_cand(
+                    cx,
+                    target,
+                    cand,
+                    inputs,
+                    assumptions,
+                    deadline,
+                )? {
+                    CheckCand::Verified(out) => return Ok(Some(out)),
+                    CheckCand::Counterexample(cex) => {
+                        if samples.iter().any(|(ins, _)| *ins == cex.0) {
+                            break;
+                        }
+                        samples.push(cex);
+                    }
+                    CheckCand::Undecided => break,
+                }
+            }
+        }
+
+        // Exact finite-domain `select` tree when total distinct reachable input tuples `<= 8`
+        // (and `synth::synthesize` shrinkage when all inputs match `tw`).
+        if exhausted_domain && !samples.is_empty() && samples.len() <= 8 {
+            let sel_p = build_select_lut(cx, proxies, samples)?;
+            let mut best_p = crate::engine::Engine::standard().simplify(cx, sel_p)?.expr;
+            if m <= 4
+                && widths.iter().all(|&w| w == tw)
+                && let Some(shrunk) =
+                    crate::synth::synthesize(cx, best_p, &crate::synth::Config::extended())?
+            {
+                best_p = shrunk;
+            }
+            let cand = cx.substitute(&[best_p], proxy_to_input)?[0];
+            if let CheckCand::Verified(out) =
+                self.verify_functional_cand(cx, target, cand, inputs, assumptions, deadline)?
+            {
+                return Ok(Some(out));
+            }
+        }
+
+        Ok(None)
     }
 
     /// After a check answered [`Status::Unsat`]: assertions and assumptions of that check that
@@ -2749,6 +3982,1253 @@ fn holds(cx: &mut Context, ps: &[Expr], model: &Model) -> Result<bool, Error> {
     Ok(eval_in(cx, ps, model)?.iter().all(|v| !v.is_zero()))
 }
 
+enum CheckCand {
+    Verified(Expr),
+    Counterexample((Vec<BitVec>, BitVec)),
+    Undecided,
+}
+
+fn neq_tuple(cx: &mut Context, inputs: &[Expr], vals: &[BitVec]) -> Result<Expr, Error> {
+    let mut disj = cx.bool(false)?;
+    for (&inp, val) in inputs.iter().zip(vals) {
+        let k = cx.constant(val)?;
+        let ne = cx.cmp(crate::CmpOpExt::Ne, inp, k)?;
+        disj = cx.bin(BinOp::Or, disj, ne)?;
+    }
+    Ok(disj)
+}
+
+fn cast_expr_to(cx: &mut Context, e: Expr, tw: Width) -> Result<Expr, Error> {
+    let w = cx.width(e)?;
+    if w == tw {
+        Ok(e)
+    } else if w < tw {
+        cx.zext(e, tw)
+    } else {
+        cx.trunc(e, tw)
+    }
+}
+
+fn cast_bv_to(v: &BitVec, tw: Width) -> BitVec {
+    let w = v.width();
+    if w == tw {
+        *v
+    } else if w < tw {
+        v.zext(tw).unwrap_or_else(|_| BitVec::zero(tw))
+    } else {
+        v.trunc(tw).unwrap_or_else(|_| BitVec::zero(tw))
+    }
+}
+
+/// Tier A: Isolates `target` in terms of `proxies` (`keep_ids`) across assertions + assumptions.
+fn try_algebraic_isolation(
+    cx: &mut Context,
+    assertions: &[Expr],
+    assumptions: &[Expr],
+    target: Expr,
+    inputs: &[Expr],
+    proxies: &[Expr],
+    keep_ids: &HashSet<SymbolId>,
+) -> Result<Option<Expr>, Error> {
+    let tw = cx.width(target)?;
+    let t_out = cx.fresh_symbol(tw)?;
+    let Some(t_out_id) = cx.symbol_id(t_out)? else {
+        return Ok(None);
+    };
+
+    // Map bare-symbol inputs directly to their proxy symbols (deduplicated).
+    let mut sym_in_map: Vec<(Expr, Expr)> = Vec::new();
+    let mut non_sym_eqs: Vec<Expr> = Vec::new();
+    for (&inp, &p) in inputs.iter().zip(proxies) {
+        if cx.symbol_id(inp)?.is_some() {
+            if !sym_in_map.iter().any(|&(from, _)| from == inp) {
+                sym_in_map.push((inp, p));
+            } else if let Some(&(_, first_p)) = sym_in_map.iter().find(|&&(from, _)| from == inp) {
+                non_sym_eqs.push(cx.cmp(crate::CmpOpExt::Eq, p, first_p)?);
+            }
+        }
+    }
+
+    let mut raw_preds: Vec<Expr> = Vec::with_capacity(assertions.len() + assumptions.len() + 2);
+    raw_preds.extend_from_slice(assertions);
+    raw_preds.extend_from_slice(assumptions);
+    if !sym_in_map.is_empty() {
+        raw_preds = cx.substitute(&raw_preds, &sym_in_map)?;
+    }
+    let target_sub = if sym_in_map.is_empty() {
+        target
+    } else {
+        cx.substitute(&[target], &sym_in_map)?[0]
+    };
+    raw_preds.push(cx.cmp(crate::CmpOpExt::Eq, t_out, target_sub)?);
+    raw_preds.extend(non_sym_eqs);
+    for (&inp, &p) in inputs.iter().zip(proxies) {
+        if cx.symbol_id(inp)?.is_none() {
+            let inp_sub = if sym_in_map.is_empty() {
+                inp
+            } else {
+                cx.substitute(&[inp], &sym_in_map)?[0]
+            };
+            raw_preds.push(cx.cmp(crate::CmpOpExt::Eq, p, inp_sub)?);
+        }
+    }
+
+    // Flatten top-level `And` conjuncts.
+    let mut current: Vec<Expr> = Vec::with_capacity(raw_preds.len());
+    let mut stack: Vec<Expr> = raw_preds.into_iter().rev().collect();
+    while let Some(e) = stack.pop() {
+        match cx.view(e)? {
+            crate::View::Bin(BinOp::And, a, b) => stack.extend([b, a]),
+            _ => current.push(e),
+        }
+    }
+
+    struct Sol {
+        id: SymbolId,
+        equals: Expr,
+        reads: Vec<SymbolId>,
+    }
+    let mut solutions: Vec<Sol> = Vec::new();
+    let mut map: Vec<(Expr, Expr)> = Vec::new();
+    let mut simplified_once = false;
+
+    for round in 0..8 {
+        if current.is_empty() || solutions.len() >= SOLVED_SYMBOLS {
+            break;
+        }
+        // Eliminate intermediate non-keep, non-`t_out` symbols first; allow `t_out` once no
+        // intermediate symbol made progress or after round 2.
+        let allow_target = round >= 2;
+        let prev_len = solutions.len();
+        let mut kept: Vec<Expr> = Vec::with_capacity(current.len());
+        let mut queue: std::collections::VecDeque<Expr> = current.into_iter().collect();
+
+        while let Some(e) = queue.pop_front() {
+            let now = if map.is_empty() {
+                e
+            } else {
+                cx.substitute(&[e], &map)?[0]
+            };
+            if cx.as_const(now)? == Some(BitVec::from_bool(true)) {
+                continue;
+            }
+            if let Some((eq_hi, eq_lo)) = split_concat_eq(cx, now)? {
+                queue.push_front(eq_lo);
+                queue.push_front(eq_hi);
+                continue;
+            }
+            let mut forbid = keep_ids.clone();
+            if !allow_target {
+                forbid.insert(t_out_id);
+            }
+            let Some((sym_expr, id, equals, reads)) = definition_keeping(cx, now, &forbid)? else {
+                kept.push(now);
+                continue;
+            };
+            if map.iter().any(|&(f, _)| f == sym_expr) {
+                kept.push(now);
+                continue;
+            }
+            for (k, s) in solutions.iter_mut().enumerate() {
+                if s.reads.contains(&id) {
+                    s.equals = cx.substitute(&[s.equals], &[(sym_expr, equals)])?[0];
+                    s.reads = cx.symbols_in(&[s.equals])?;
+                    map[k].1 = s.equals;
+                }
+            }
+            map.push((sym_expr, equals));
+            solutions.push(Sol { id, equals, reads });
+        }
+
+        current = if map.is_empty() {
+            kept
+        } else {
+            cx.substitute(&kept, &map)?
+        };
+
+        if solutions.len() == prev_len && allow_target {
+            if !simplified_once {
+                simplified_once = true;
+                let eng = crate::engine::Engine::standard();
+                let mut next_cur = Vec::with_capacity(current.len());
+                for c in current {
+                    next_cur.push(eng.simplify(cx, c)?.expr);
+                }
+                current = next_cur;
+                continue;
+            }
+            break;
+        }
+    }
+
+    if let Some(sol) = solutions.iter().find(|s| s.id == t_out_id) {
+        let mut cand = sol.equals;
+        if !sol.reads.iter().all(|r| keep_ids.contains(r)) {
+            cand = crate::engine::Engine::standard().simplify(cx, cand)?.expr;
+        }
+        let reads = cx.symbols_in(&[cand])?;
+        if reads.iter().all(|r| keep_ids.contains(r)) {
+            return Ok(Some(cand));
+        }
+    }
+    Ok(None)
+}
+
+#[allow(clippy::type_complexity)]
+fn definition_keeping(
+    cx: &mut Context,
+    p: Expr,
+    forbid: &HashSet<SymbolId>,
+) -> Result<Option<(Expr, SymbolId, Expr, Vec<SymbolId>)>, Error> {
+    use crate::View;
+    let free = |cx: &Context, e: Expr| -> Result<Option<SymbolId>, Error> {
+        Ok(match cx.view(e)? {
+            View::Sym(id) if !forbid.contains(&id) => Some(id),
+            _ => None,
+        })
+    };
+    match cx.view(p)? {
+        View::Sym(_) => {
+            if let Some(id) = free(cx, p)? {
+                return Ok(Some((p, id, cx.bool(true)?, Vec::new())));
+            }
+        }
+        View::Un(UnOp::Not, a) => {
+            if let Some(id) = free(cx, a)? {
+                return Ok(Some((a, id, cx.bool(false)?, Vec::new())));
+            }
+            if let View::Cmp(CmpOp::Ne, l, r) = cx.view(a)? {
+                for (lhs, rhs) in [(l, r), (r, l)] {
+                    if let Some(sol) = isolate_from_eq_keeping(cx, lhs, rhs, forbid)? {
+                        return Ok(Some(sol));
+                    }
+                }
+            }
+        }
+        View::Cmp(CmpOp::Eq, a, b) => {
+            for (lhs, rhs) in [(a, b), (b, a)] {
+                if let Some(sol) = isolate_from_eq_keeping(cx, lhs, rhs, forbid)? {
+                    return Ok(Some(sol));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+#[allow(clippy::type_complexity)]
+fn isolate_from_eq_keeping(
+    cx: &mut Context,
+    mut lhs: Expr,
+    mut rhs: Expr,
+    forbid: &HashSet<SymbolId>,
+) -> Result<Option<(Expr, SymbolId, Expr, Vec<SymbolId>)>, Error> {
+    use crate::View;
+    let free = |cx: &Context, e: Expr| -> Result<Option<SymbolId>, Error> {
+        Ok(match cx.view(e)? {
+            View::Sym(id) if !forbid.contains(&id) => Some(id),
+            _ => None,
+        })
+    };
+    let only_forbidden = |cx: &mut Context, e: Expr| -> Result<bool, Error> {
+        Ok(cx.symbols_in(&[e])?.iter().all(|s| forbid.contains(s)))
+    };
+    for _depth in 0..24 {
+        if let Some(id) = free(cx, lhs)? {
+            let reads = cx.symbols_in(&[rhs])?;
+            if !reads.contains(&id) {
+                return Ok(Some((lhs, id, rhs, reads)));
+            }
+            return Ok(None);
+        }
+        if only_forbidden(cx, lhs)? {
+            return Ok(None);
+        }
+        if let Some((u, is_left, step)) = peel_xorshift(cx, lhs)? {
+            rhs = invert_xorshift_expr(cx, rhs, is_left, step)?;
+            lhs = u;
+            continue;
+        }
+        match cx.view(lhs)? {
+            View::Un(op @ (UnOp::Not | UnOp::Neg | UnOp::Bswap | UnOp::BitRev), u) => {
+                rhs = cx.un(op, rhs)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::Add, a, b) => {
+                let prefer_b = free(cx, b)?.is_some() || only_forbidden(cx, a)?;
+                let (u, other) = if prefer_b { (b, a) } else { (a, b) };
+                rhs = cx.bin(BinOp::Sub, rhs, other)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::Sub, a, b) => {
+                let prefer_b = free(cx, b)?.is_some() || only_forbidden(cx, a)?;
+                if prefer_b {
+                    rhs = cx.bin(BinOp::Sub, a, rhs)?;
+                    lhs = b;
+                } else {
+                    rhs = cx.bin(BinOp::Add, rhs, b)?;
+                    lhs = a;
+                }
+            }
+            View::Bin(BinOp::Xor, a, b) => {
+                let prefer_b = free(cx, b)?.is_some() || only_forbidden(cx, a)?;
+                let (u, other) = if prefer_b { (b, a) } else { (a, b) };
+                rhs = cx.bin(BinOp::Xor, rhs, other)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::Mul, a, b) => {
+                let (u, c) = match (cx.as_const(a)?, cx.as_const(b)?) {
+                    (None, Some(c)) => (a, c),
+                    (Some(c), None) => (b, c),
+                    _ => return Ok(None),
+                };
+                let Some(inv) = odd_inverse(&c) else {
+                    return Ok(None);
+                };
+                let inv_e = cx.constant(&inv)?;
+                rhs = cx.bin(BinOp::Mul, rhs, inv_e)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::RotL, u, cnt) if only_forbidden(cx, cnt)? => {
+                rhs = cx.bin(BinOp::RotR, rhs, cnt)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::RotR, u, cnt) if only_forbidden(cx, cnt)? => {
+                rhs = cx.bin(BinOp::RotL, rhs, cnt)?;
+                lhs = u;
+            }
+            View::Zext(u) => {
+                let w_in = cx.width(u)?;
+                rhs = cx.extract(rhs, 0, w_in)?;
+                lhs = u;
+            }
+            View::Sext(u) => {
+                let w_in = cx.width(u)?;
+                rhs = cx.extract(rhs, 0, w_in)?;
+                lhs = u;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// Solves `c_0 + sum_{i=1}^m c_i * cast(x_i) == y (mod 2^tw)` across all `samples` via `ctz`-pivot
+/// elimination over `Z / 2^tw Z`. Returns `None` if no modular-affine tuple fits all `samples`.
+fn fit_modular_affine(tw: Width, samples: &[(Vec<BitVec>, BitVec)]) -> Option<Vec<BitVec>> {
+    let first = samples.first()?;
+    let m = first.0.len();
+    let cols = m + 1;
+    let wb = u32::from(tw.bits());
+
+    // Build augmented rows `[1, x_1, ..., x_m, y]`.
+    let mut rows: Vec<Vec<BitVec>> = Vec::with_capacity(samples.len());
+    for (ins, out) in samples {
+        let mut row = Vec::with_capacity(cols + 1);
+        row.push(BitVec::one(tw));
+        for v in ins {
+            row.push(cast_bv_to(v, tw));
+        }
+        row.push(*out);
+        rows.push(row);
+    }
+
+    let mut pivots: Vec<(usize, u32, BitVec)> = Vec::new();
+    let mut rank = 0usize;
+    for col in 0..cols {
+        let mut best: Option<(usize, u32)> = None;
+        for (r, row) in rows.iter().enumerate().skip(rank) {
+            if !row[col].is_zero() {
+                let tz = crate::facts::known::trailing_zeros(&row[col]);
+                if best.is_none_or(|(_, btz)| tz < btz) {
+                    best = Some((r, tz));
+                    if tz == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        let Some((piv_r, p_tz)) = best else {
+            continue;
+        };
+        rows.swap(rank, piv_r);
+        let p_odd = crate::facts::known::bv_lshr(&rows[rank][col], p_tz);
+        let p_inv = odd_inverse(&p_odd)?;
+
+        let piv_row = rows[rank].clone();
+        for row in rows.iter_mut().skip(rank + 1) {
+            if row[col].is_zero() {
+                continue;
+            }
+            let r_tz = crate::facts::known::trailing_zeros(&row[col]);
+            if r_tz < p_tz {
+                return None;
+            }
+            let r_shifted = crate::facts::known::bv_lshr(&row[col], p_tz);
+            let factor = BitVec::apply_bin(BinOp::Mul, &r_shifted, &p_inv).ok()?;
+            for (cell, pv) in row.iter_mut().zip(&piv_row).skip(col) {
+                let prod = BitVec::apply_bin(BinOp::Mul, &factor, pv).ok()?;
+                *cell = BitVec::apply_bin(BinOp::Sub, cell, &prod).ok()?;
+            }
+        }
+        pivots.push((col, p_tz, p_inv));
+        rank += 1;
+        if rank == rows.len() {
+            break;
+        }
+    }
+
+    let mut coeffs = vec![BitVec::zero(tw); cols];
+    for (r, &(col, p_tz, ref p_inv)) in pivots.iter().enumerate().rev() {
+        let mut rhs = rows[r][cols];
+        for j in (col + 1)..cols {
+            if !rows[r][j].is_zero() && !coeffs[j].is_zero() {
+                let prod = BitVec::apply_bin(BinOp::Mul, &rows[r][j], &coeffs[j]).ok()?;
+                rhs = BitVec::apply_bin(BinOp::Sub, &rhs, &prod).ok()?;
+            }
+        }
+        if rhs.is_zero() {
+            coeffs[col] = BitVec::zero(tw);
+        } else {
+            let r_tz = crate::facts::known::trailing_zeros(&rhs);
+            if r_tz < p_tz || p_tz >= wb {
+                return None;
+            }
+            let r_shifted = crate::facts::known::bv_lshr(&rhs, p_tz);
+            coeffs[col] = BitVec::apply_bin(BinOp::Mul, &r_shifted, p_inv).ok()?;
+        }
+    }
+
+    // Verify `[c_0, ..., c_m]` matches every sample exactly.
+    for (ins, out) in samples {
+        let mut acc = coeffs[0];
+        for (i, v) in ins.iter().enumerate() {
+            let xv = cast_bv_to(v, tw);
+            let prod = BitVec::apply_bin(BinOp::Mul, &coeffs[i + 1], &xv).ok()?;
+            acc = BitVec::apply_bin(BinOp::Add, &acc, &prod).ok()?;
+        }
+        if acc != *out {
+            return None;
+        }
+    }
+    Some(coeffs)
+}
+
+fn build_modular_affine_expr(
+    cx: &mut Context,
+    tw: Width,
+    proxies: &[Expr],
+    coeffs: &[BitVec],
+) -> Result<Expr, Error> {
+    let mut acc = cx.constant(&coeffs[0])?;
+    let one = BitVec::one(tw);
+    let ones = BitVec::ones(tw);
+    for (i, &p) in proxies.iter().enumerate() {
+        let c = &coeffs[i + 1];
+        if c.is_zero() {
+            continue;
+        }
+        let xp = cast_expr_to(cx, p, tw)?;
+        if *c == one {
+            acc = cx.bin(BinOp::Add, acc, xp)?;
+        } else if *c == ones {
+            acc = cx.bin(BinOp::Sub, acc, xp)?;
+        } else {
+            let ce = cx.constant(c)?;
+            let term = cx.bin(BinOp::Mul, ce, xp)?;
+            acc = cx.bin(BinOp::Add, acc, term)?;
+        }
+    }
+    Ok(acc)
+}
+
+/// Solves `y = c_0 ^ XOR_j (col_j * in_bit_j)` over GF(2) for `tw <= 128` and `N <= 128` input
+/// bits. Returns `(c_0, cols)` where `cols[j]` is the `u128` output-bit column for input bit `j`.
+fn fit_gf2_affine(
+    tw: Width,
+    widths: &[Width],
+    samples: &[(Vec<BitVec>, BitVec)],
+) -> Option<(u128, Vec<u128>)> {
+    let n_bits: usize = widths.iter().map(|w| usize::from(w.bits())).sum();
+    let n_cols = n_bits + 1;
+    if n_cols > 192 || samples.is_empty() {
+        return None;
+    }
+
+    let get_bit = |row: &[u64; 3], c: usize| -> bool { (row[c / 64] >> (c % 64)) & 1 != 0 };
+    let set_bit = |row: &mut [u64; 3], c: usize| {
+        row[c / 64] |= 1u64 << (c % 64);
+    };
+
+    let mut mat: Vec<([u64; 3], u128)> = Vec::with_capacity(samples.len());
+    for (ins, out) in samples {
+        let mut lhs = [0u64; 3];
+        set_bit(&mut lhs, 0);
+        let mut col = 1usize;
+        for (v, &w) in ins.iter().zip(widths) {
+            let u = v.to_u128().unwrap_or(0);
+            for b in 0..usize::from(w.bits()) {
+                if (u >> b) & 1 != 0 {
+                    set_bit(&mut lhs, col);
+                }
+                col += 1;
+            }
+        }
+        mat.push((lhs, out.to_u128()?));
+    }
+
+    let mut piv_cols: Vec<usize> = Vec::new();
+    let mut rank = 0usize;
+    for col in 0..n_cols {
+        let Some(piv) = (rank..mat.len()).find(|&r| get_bit(&mat[r].0, col)) else {
+            continue;
+        };
+        mat.swap(rank, piv);
+        let (piv_lhs, piv_rhs) = mat[rank];
+        for (r, (lhs, rhs)) in mat.iter_mut().enumerate() {
+            if r != rank && get_bit(lhs, col) {
+                lhs[0] ^= piv_lhs[0];
+                lhs[1] ^= piv_lhs[1];
+                lhs[2] ^= piv_lhs[2];
+                *rhs ^= piv_rhs;
+            }
+        }
+        piv_cols.push(col);
+        rank += 1;
+        if rank == mat.len() {
+            break;
+        }
+    }
+
+    // Any remaining row with zero LHS and non-zero RHS proves GF(2) inconsistency.
+    for &(lhs, rhs) in mat.iter().skip(rank) {
+        if lhs == [0, 0, 0] && rhs != 0 {
+            return None;
+        }
+    }
+
+    let mut sol = vec![0u128; n_cols];
+    for (r, &col) in piv_cols.iter().enumerate() {
+        sol[col] = mat[r].1;
+    }
+    debug_assert!(tw.bits() <= 128);
+    Some((sol[0], sol[1..].to_vec()))
+}
+
+/// Emits a compact word-level shift-mask-XOR expression for a GF(2)-affine map `c0 ^ M(proxies)`
+/// via diagonal decomposition of each input's binary matrix block.
+fn build_gf2_affine_expr(
+    cx: &mut Context,
+    tw: Width,
+    proxies: &[Expr],
+    widths: &[Width],
+    c0: &u128,
+    cols: &[u128],
+) -> Result<Expr, Error> {
+    let out_bits = usize::from(tw.bits());
+    let full_mask: u128 = if out_bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << out_bits) - 1
+    };
+    let mut acc = cx.constant(&BitVec::wrapping_from_u128(tw, *c0 & full_mask))?;
+
+    let mut offset = 0usize;
+    for (&p, &pw) in proxies.iter().zip(widths) {
+        let in_bits = usize::from(pw.bits());
+        let p_cols = &cols[offset..offset + in_bits];
+        offset += in_bits;
+        if p_cols.iter().all(|&c| c == 0) {
+            continue;
+        }
+
+        // Split wide inputs (`in_bits > out_bits`) into `<= out_bits` slices so each slice is at
+        // most `tw` wide before `zext` to `tw`.
+        let mut slice_lo = 0usize;
+        while slice_lo < in_bits {
+            let chunk_len = (in_bits - slice_lo).min(out_bits);
+            let chunk_cols = &p_cols[slice_lo..slice_lo + chunk_len];
+            if chunk_cols.iter().any(|&c| c != 0) {
+                let slice_e = if slice_lo == 0 && chunk_len == in_bits {
+                    cast_expr_to(cx, p, tw)?
+                } else {
+                    let cw = Width::new(chunk_len as u16)?;
+                    let ex = cx.extract(p, slice_lo as u16, cw)?;
+                    cast_expr_to(cx, ex, tw)?
+                };
+                // Natural non-zero bit mask of `slice_e`: bits `0..chunk_len`.
+                let src_mask: u128 = if chunk_len == 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << chunk_len) - 1
+                };
+
+                // Main diagonal (`s == 0`): output bit `r` reads chunk bit `r`.
+                let mut m0 = 0u128;
+                for (c, &col_bits) in chunk_cols.iter().enumerate() {
+                    if (col_bits >> c) & 1 != 0 {
+                        m0 |= 1u128 << c;
+                    }
+                }
+                if m0 != 0 {
+                    let term = if m0 == src_mask {
+                        slice_e
+                    } else {
+                        let me = cx.constant(&BitVec::wrapping_from_u128(tw, m0))?;
+                        cx.bin(BinOp::And, slice_e, me)?
+                    };
+                    acc = cx.bin(BinOp::Xor, acc, term)?;
+                }
+
+                // Sub-diagonals (`slice_e << s`, `1 <= s < out_bits`): output bit `r` reads `r - s`.
+                for s in 1..out_bits {
+                    let mut ms = 0u128;
+                    for (c, &col_bits) in chunk_cols.iter().enumerate() {
+                        let r = c + s;
+                        if r < out_bits && (col_bits >> r) & 1 != 0 {
+                            ms |= 1u128 << r;
+                        }
+                    }
+                    if ms != 0 {
+                        let sc = cx.constant_u64(tw, s as u64)?;
+                        let sh = cx.bin(BinOp::Shl, slice_e, sc)?;
+                        let natural = (src_mask << s) & full_mask;
+                        let term = if ms == natural {
+                            sh
+                        } else {
+                            let me = cx.constant(&BitVec::wrapping_from_u128(tw, ms))?;
+                            cx.bin(BinOp::And, sh, me)?
+                        };
+                        acc = cx.bin(BinOp::Xor, acc, term)?;
+                    }
+                }
+
+                // Super-diagonals (`slice_e >>u s`, `1 <= s < chunk_len`): output bit `r` reads `r + s`.
+                for s in 1..chunk_len {
+                    let mut ms = 0u128;
+                    for r in 0..(chunk_len - s) {
+                        if (chunk_cols[r + s] >> r) & 1 != 0 {
+                            ms |= 1u128 << r;
+                        }
+                    }
+                    if ms != 0 {
+                        let sc = cx.constant_u64(tw, s as u64)?;
+                        let sh = cx.bin(BinOp::LShr, slice_e, sc)?;
+                        let natural = src_mask >> s;
+                        let term = if ms == natural {
+                            sh
+                        } else {
+                            let me = cx.constant(&BitVec::wrapping_from_u128(tw, ms))?;
+                            cx.bin(BinOp::And, sh, me)?
+                        };
+                        acc = cx.bin(BinOp::Xor, acc, term)?;
+                    }
+                }
+            }
+            slice_lo += chunk_len;
+        }
+    }
+    Ok(acc)
+}
+
+fn problem_constants_u64(
+    cx: &mut Context,
+    assertions: &[Expr],
+    assumptions: &[Expr],
+    target: Expr,
+    tw: Width,
+) -> Result<Vec<u64>, Error> {
+    let mut roots = Vec::with_capacity(assertions.len() + assumptions.len() + 1);
+    roots.extend_from_slice(assertions);
+    roots.extend_from_slice(assumptions);
+    roots.push(target);
+    let mask = if tw.bits() == 64 {
+        u64::MAX
+    } else {
+        (1u64 << tw.bits()) - 1
+    };
+    let mut out = Vec::new();
+    for e in cx.post_order(&roots)? {
+        if let Some(bv) = cx.as_const(e)?
+            && cx.width(e)? != Width::W1
+            && let Some(v) = bv.to_u64()
+        {
+            let vm = v & mask;
+            if vm != 0 && !out.contains(&vm) {
+                out.push(vm);
+                if out.len() >= 10 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Copy, Clone)]
+enum ObsTerm {
+    Var(usize),
+    Const(u64),
+    Un(UnOp, u32),
+    Bin(BinOp, u32, u32),
+    Cmp(CmpOp, u32, u32),
+    Sel(u32, u32, u32),
+}
+
+struct ObsLanes {
+    w: u32,
+    mask: u64,
+}
+
+impl ObsLanes {
+    fn sx(&self, a: u64) -> i64 {
+        let s = 64 - self.w;
+        ((a << s) as i64) >> s
+    }
+
+    fn un(&self, op: UnOp, a: u64) -> u64 {
+        match op {
+            UnOp::Not => !a & self.mask,
+            UnOp::Neg => a.wrapping_neg() & self.mask,
+            UnOp::Popcnt => u64::from(a.count_ones()) & self.mask,
+            UnOp::Clz => u64::from(a.leading_zeros() - (64 - self.w)) & self.mask,
+            UnOp::Ctz => {
+                (if a == 0 {
+                    u64::from(self.w)
+                } else {
+                    u64::from(a.trailing_zeros())
+                }) & self.mask
+            }
+            UnOp::Bswap => a.swap_bytes() >> (64 - self.w),
+            UnOp::BitRev => a.reverse_bits() >> (64 - self.w),
+        }
+    }
+
+    fn cmp(&self, op: CmpOp, a: u64, b: u64) -> u64 {
+        u64::from(match op {
+            CmpOp::Eq => a == b,
+            CmpOp::Ne => a != b,
+            CmpOp::Ult => a < b,
+            CmpOp::Ule => a <= b,
+            CmpOp::Slt => self.sx(a) < self.sx(b),
+            CmpOp::Sle => self.sx(a) <= self.sx(b),
+        })
+    }
+
+    fn bin(&self, op: BinOp, a: u64, b: u64) -> u64 {
+        let w = u64::from(self.w);
+        let m = self.mask;
+        match op {
+            BinOp::Add => a.wrapping_add(b) & m,
+            BinOp::Sub => a.wrapping_sub(b) & m,
+            BinOp::Mul => a.wrapping_mul(b) & m,
+            BinOp::And => a & b,
+            BinOp::Or => a | b,
+            BinOp::Xor => a ^ b,
+            BinOp::Shl => {
+                if b >= w {
+                    0
+                } else {
+                    (a << b) & m
+                }
+            }
+            BinOp::LShr => {
+                if b >= w {
+                    0
+                } else {
+                    a >> b
+                }
+            }
+            BinOp::AShr => {
+                let s = self.sx(a);
+                (if b >= w { s >> 63 } else { s >> b }) as u64 & m
+            }
+            BinOp::UDiv => a.checked_div(b).unwrap_or(m),
+            BinOp::URem => a.checked_rem(b).unwrap_or(a),
+            BinOp::RotL => {
+                let r = (b % w) as u32;
+                if r == 0 {
+                    a
+                } else {
+                    ((a << r) | (a >> (self.w - r))) & m
+                }
+            }
+            BinOp::RotR => {
+                let r = (b % w) as u32;
+                let l = (self.w - r) % self.w;
+                if l == 0 {
+                    a
+                } else {
+                    ((a << l) | (a >> (self.w - l))) & m
+                }
+            }
+            _ => 0,
+        }
+    }
+}
+
+fn obs_hash(v: &[u64]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &x in v {
+        h ^= x;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3).rotate_left(17);
+    }
+    h
+}
+
+/// Bottom-up observational enumerator over collected `(inputs, target)` samples (`tw <= 64`).
+fn observational_enumerate(
+    cx: &mut Context,
+    tw: Width,
+    proxies: &[Expr],
+    widths: &[Width],
+    samples: &[(Vec<BitVec>, BitVec)],
+    extra_consts: &[u64],
+) -> Result<Option<Expr>, Error> {
+    let w = u32::from(tw.bits());
+    let mask = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let lanes = ObsLanes { w, mask };
+    let n = samples.len();
+
+    let mut leaf_exprs: Vec<Expr> = Vec::with_capacity(proxies.len() + 1);
+    let mut var_rows: Vec<Vec<u64>> = Vec::with_capacity(proxies.len() + 1);
+    for (i, (&p, &pw)) in proxies.iter().zip(widths).enumerate() {
+        leaf_exprs.push(cast_expr_to(cx, p, tw)?);
+        var_rows.push(
+            samples
+                .iter()
+                .map(|(ins, _)| cast_bv_to(&ins[i], tw).to_u64().unwrap_or(0) & mask)
+                .collect(),
+        );
+        if proxies.len() == 1 && pw.bits() > tw.bits() {
+            let hi_w = Width::new((pw.bits() - tw.bits()).min(tw.bits()))?;
+            let hi_e = cx.extract(p, tw.bits(), hi_w)?;
+            leaf_exprs.push(cast_expr_to(cx, hi_e, tw)?);
+            var_rows.push(
+                samples
+                    .iter()
+                    .map(|(ins, _)| {
+                        ins[i]
+                            .extract(tw.bits(), hi_w)
+                            .ok()
+                            .and_then(|b| cast_bv_to(&b, tw).to_u64())
+                            .unwrap_or(0)
+                            & mask
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    let want: Vec<u64> = samples
+        .iter()
+        .map(|(_, out)| out.to_u64().unwrap_or(0) & mask)
+        .collect();
+
+    let mut consts = vec![
+        0u64,
+        1 & mask,
+        mask,
+        u64::from(w - 1) & mask,
+        (1u64 << (w - 1)) & mask,
+        2 & mask,
+    ];
+    for &c in extra_consts {
+        if !consts.contains(&c) {
+            consts.push(c);
+        }
+    }
+    consts.dedup();
+    consts.truncate(12);
+
+    let max_size: usize = if leaf_exprs.len() <= 2 { 6 } else { 5 };
+    let max_terms: usize = 25_000;
+
+    let mut terms: Vec<ObsTerm> = Vec::new();
+    let mut values: Vec<u64> = Vec::new();
+    let mut seen: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut by_size: Vec<Vec<u32>> = vec![Vec::new(); max_size + 1];
+
+    fn row_at(vals: &[u64], n: usize, k: u32) -> &[u64] {
+        &vals[k as usize * n..(k as usize + 1) * n]
+    }
+    let add_term = |t: ObsTerm,
+                    sz: usize,
+                    row: Vec<u64>,
+                    terms: &mut Vec<ObsTerm>,
+                    values: &mut Vec<u64>,
+                    seen: &mut HashMap<u64, Vec<u32>>,
+                    by_size: &mut [Vec<u32>]|
+     -> Option<u32> {
+        let matched = row == want;
+        let h = obs_hash(&row);
+        if let Some(bucket) = seen.get(&h)
+            && bucket
+                .iter()
+                .any(|&k| row_at(values, n, k) == row.as_slice())
+        {
+            return None;
+        }
+        let k = terms.len() as u32;
+        terms.push(t);
+        values.extend_from_slice(&row);
+        seen.entry(h).or_default().push(k);
+        by_size[sz].push(k);
+        matched.then_some(k)
+    };
+
+    for (v, r) in var_rows.into_iter().enumerate() {
+        if let Some(hit) = add_term(
+            ObsTerm::Var(v),
+            1,
+            r,
+            &mut terms,
+            &mut values,
+            &mut seen,
+            &mut by_size,
+        ) {
+            return build_obs_term(cx, tw, &leaf_exprs, &terms, hit).map(Some);
+        }
+    }
+    for &c in &consts {
+        if let Some(hit) = add_term(
+            ObsTerm::Const(c),
+            1,
+            vec![c; n],
+            &mut terms,
+            &mut values,
+            &mut seen,
+            &mut by_size,
+        ) {
+            return build_obs_term(cx, tw, &leaf_exprs, &terms, hit).map(Some);
+        }
+    }
+
+    let mut un_ops = vec![
+        UnOp::Not,
+        UnOp::Neg,
+        UnOp::Popcnt,
+        UnOp::Clz,
+        UnOp::Ctz,
+        UnOp::BitRev,
+    ];
+    if tw.bits().is_multiple_of(8) {
+        un_ops.push(UnOp::Bswap);
+    }
+    let bin_ops = [
+        BinOp::Add,
+        BinOp::Sub,
+        BinOp::Mul,
+        BinOp::And,
+        BinOp::Or,
+        BinOp::Xor,
+        BinOp::Shl,
+        BinOp::LShr,
+        BinOp::AShr,
+        BinOp::UDiv,
+        BinOp::URem,
+        BinOp::RotL,
+        BinOp::RotR,
+    ];
+    let cmp_ops = [CmpOp::Eq, CmpOp::Ne, CmpOp::Ult, CmpOp::Slt];
+
+    'outer: for sz in 2..=max_size {
+        let prev = by_size[sz - 1].clone();
+        for &op in &un_ops {
+            for &a in &prev {
+                let row: Vec<u64> = row_at(&values, n, a)
+                    .iter()
+                    .map(|&x| lanes.un(op, x))
+                    .collect();
+                if let Some(hit) = add_term(
+                    ObsTerm::Un(op, a),
+                    sz,
+                    row,
+                    &mut terms,
+                    &mut values,
+                    &mut seen,
+                    &mut by_size,
+                ) {
+                    return build_obs_term(cx, tw, &leaf_exprs, &terms, hit).map(Some);
+                }
+                if terms.len() >= max_terms {
+                    break 'outer;
+                }
+            }
+        }
+
+        for i in 1..sz - 1 {
+            let j = sz - 1 - i;
+            let left = by_size[i].clone();
+            let right = by_size[j].clone();
+            for &op in &bin_ops {
+                let comm = matches!(
+                    op,
+                    BinOp::Add | BinOp::Mul | BinOp::And | BinOp::Or | BinOp::Xor
+                );
+                if comm && i > j {
+                    continue;
+                }
+                for &a in &left {
+                    for &b in &right {
+                        if comm && i == j && b < a {
+                            continue;
+                        }
+                        let row: Vec<u64> = row_at(&values, n, a)
+                            .iter()
+                            .zip(row_at(&values, n, b))
+                            .map(|(&x, &y)| lanes.bin(op, x, y))
+                            .collect();
+                        if let Some(hit) = add_term(
+                            ObsTerm::Bin(op, a, b),
+                            sz,
+                            row,
+                            &mut terms,
+                            &mut values,
+                            &mut seen,
+                            &mut by_size,
+                        ) {
+                            return build_obs_term(cx, tw, &leaf_exprs, &terms, hit).map(Some);
+                        }
+                        if terms.len() >= max_terms {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            for &op in &cmp_ops {
+                let sym = matches!(op, CmpOp::Eq | CmpOp::Ne);
+                if sym && i > j {
+                    continue;
+                }
+                for &a in &left {
+                    for &b in &right {
+                        if sym && i == j && b < a {
+                            continue;
+                        }
+                        let row: Vec<u64> = row_at(&values, n, a)
+                            .iter()
+                            .zip(row_at(&values, n, b))
+                            .map(|(&x, &y)| lanes.cmp(op, x, y))
+                            .collect();
+                        if let Some(hit) = add_term(
+                            ObsTerm::Cmp(op, a, b),
+                            sz,
+                            row,
+                            &mut terms,
+                            &mut values,
+                            &mut seen,
+                            &mut by_size,
+                        ) {
+                            return build_obs_term(cx, tw, &leaf_exprs, &terms, hit).map(Some);
+                        }
+                        if terms.len() >= max_terms {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+
+        for ci in 2..sz.saturating_sub(2) {
+            let conds: Vec<u32> = by_size[ci]
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    let r = row_at(&values, n, c);
+                    r.iter().all(|&v| v <= 1) && r.iter().any(|&v| v != r[0])
+                })
+                .collect();
+            if conds.is_empty() {
+                continue;
+            }
+            let rest = sz - 1 - ci;
+            for j in 1..rest {
+                let left = by_size[j].clone();
+                let right = by_size[rest - j].clone();
+                for &c in &conds {
+                    for &a in &left {
+                        for &b in &right {
+                            if a == b {
+                                continue;
+                            }
+                            let (rc, ra, rb) = (
+                                row_at(&values, n, c),
+                                row_at(&values, n, a),
+                                row_at(&values, n, b),
+                            );
+                            let row: Vec<u64> = (0..n)
+                                .map(|p| if rc[p] != 0 { ra[p] } else { rb[p] })
+                                .collect();
+                            if let Some(hit) = add_term(
+                                ObsTerm::Sel(c, a, b),
+                                sz,
+                                row,
+                                &mut terms,
+                                &mut values,
+                                &mut seen,
+                                &mut by_size,
+                            ) {
+                                return build_obs_term(cx, tw, &leaf_exprs, &terms, hit).map(Some);
+                            }
+                            if terms.len() >= max_terms {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Meet-in-the-middle pair join (`t + c`, `t - c`, `c - t`, `t ^ c`) for effective depth 2x.
+    let count = terms.len() as u32;
+    let mut need = vec![0u64; n];
+    for t in 0..count {
+        for (op, flip) in [
+            (BinOp::Add, false),
+            (BinOp::Sub, false),
+            (BinOp::Sub, true),
+            (BinOp::Xor, false),
+        ] {
+            let rt = row_at(&values, n, t);
+            for (p, slot) in need.iter_mut().enumerate() {
+                *slot = match (op, flip) {
+                    (BinOp::Add, _) => lanes.bin(BinOp::Sub, want[p], rt[p]),
+                    (BinOp::Sub, false) => lanes.bin(BinOp::Sub, rt[p], want[p]),
+                    (BinOp::Sub, true) => lanes.bin(BinOp::Add, want[p], rt[p]),
+                    _ => want[p] ^ rt[p],
+                };
+            }
+            if let Some(bucket) = seen.get(&obs_hash(&need))
+                && let Some(&c) = bucket
+                    .iter()
+                    .find(|&&k| row_at(&values, n, k) == need.as_slice())
+            {
+                let (lhs, rhs) = if flip { (c, t) } else { (t, c) };
+                let e_lhs = build_obs_term(cx, tw, &leaf_exprs, &terms, lhs)?;
+                let e_rhs = build_obs_term(cx, tw, &leaf_exprs, &terms, rhs)?;
+                return cx.bin(op, e_lhs, e_rhs).map(Some);
+            }
+        }
+    }
+
+    // Meet-in-the-middle `select(c, a, b)` join over `{0, 1}` conditions and arms of size `<= 4`.
+    let arm_cap = 4.min(max_size);
+    let mut small_arms: Vec<u32> = Vec::new();
+    for slot in by_size.iter().take(arm_cap + 1).skip(1) {
+        small_arms.extend_from_slice(slot);
+        if small_arms.len() >= 2_048 {
+            small_arms.truncate(2_048);
+            break;
+        }
+    }
+    let mut small_conds: Vec<u32> = Vec::new();
+    for slot in by_size.iter().take(arm_cap + 1).skip(2) {
+        for &c in slot {
+            let r = row_at(&values, n, c);
+            if r.iter().all(|&v| v <= 1) && r.iter().any(|&v| v != r[0]) {
+                small_conds.push(c);
+            }
+        }
+    }
+    for c in small_conds {
+        let rc = row_at(&values, n, c);
+        let then_hit = small_arms.iter().copied().find(|&a| {
+            let ra = row_at(&values, n, a);
+            (0..n).all(|p| rc[p] == 0 || ra[p] == want[p])
+        });
+        let Some(a) = then_hit else { continue };
+        let else_hit = small_arms.iter().copied().find(|&b| {
+            let rb = row_at(&values, n, b);
+            (0..n).all(|p| rc[p] != 0 || rb[p] == want[p])
+        });
+        let Some(b) = else_hit else { continue };
+        let k = terms.len() as u32;
+        terms.push(ObsTerm::Sel(c, a, b));
+        return build_obs_term(cx, tw, &leaf_exprs, &terms, k).map(Some);
+    }
+    Ok(None)
+}
+
+fn build_obs_term(
+    cx: &mut Context,
+    tw: Width,
+    leaves: &[Expr],
+    terms: &[ObsTerm],
+    k: u32,
+) -> Result<Expr, Error> {
+    Ok(match terms[k as usize] {
+        ObsTerm::Var(v) => leaves[v],
+        ObsTerm::Const(c) => cx.constant(&BitVec::wrapping_from_u64(tw, c))?,
+        ObsTerm::Un(op, a) => {
+            let ea = build_obs_term(cx, tw, leaves, terms, a)?;
+            cx.un(op, ea)?
+        }
+        ObsTerm::Bin(op, a, b) => {
+            let ea = build_obs_term(cx, tw, leaves, terms, a)?;
+            let eb = build_obs_term(cx, tw, leaves, terms, b)?;
+            cx.bin(op, ea, eb)?
+        }
+        ObsTerm::Cmp(op, a, b) => {
+            let ea = build_obs_term(cx, tw, leaves, terms, a)?;
+            let eb = build_obs_term(cx, tw, leaves, terms, b)?;
+            let c = cx.cmp(op, ea, eb)?;
+            cx.zext(c, tw)?
+        }
+        ObsTerm::Sel(c, a, b) => {
+            let cond = match terms[c as usize] {
+                ObsTerm::Cmp(op, x, y) => {
+                    let ex = build_obs_term(cx, tw, leaves, terms, x)?;
+                    let ey = build_obs_term(cx, tw, leaves, terms, y)?;
+                    cx.cmp(op, ex, ey)?
+                }
+                _ => {
+                    let ec = build_obs_term(cx, tw, leaves, terms, c)?;
+                    let zero = cx.zero(tw)?;
+                    cx.cmp(CmpOp::Ne, ec, zero)?
+                }
+            };
+            let ea = build_obs_term(cx, tw, leaves, terms, a)?;
+            let eb = build_obs_term(cx, tw, leaves, terms, b)?;
+            cx.select(cond, ea, eb)?
+        }
+    })
+}
+
+fn build_select_lut(
+    cx: &mut Context,
+    proxies: &[Expr],
+    samples: &[(Vec<BitVec>, BitVec)],
+) -> Result<Expr, Error> {
+    // Pick the most frequent output value as the fallback `els` arm to minimize `select` nodes.
+    let mut best_default = &samples[0].1;
+    let mut best_count = 0usize;
+    for (_, out) in samples {
+        let count = samples.iter().filter(|(_, o)| o == out).count();
+        if count > best_count {
+            best_count = count;
+            best_default = out;
+        }
+    }
+    let mut acc = cx.constant(best_default)?;
+    for (ins, out) in samples.iter().rev() {
+        if out == best_default {
+            continue;
+        }
+        let mut cond = cx.bool(true)?;
+        for (&p, v) in proxies.iter().zip(ins) {
+            let kv = cx.constant(v)?;
+            let eq = cx.cmp(crate::CmpOpExt::Eq, p, kv)?;
+            cond = cx.bin(BinOp::And, cond, eq)?;
+        }
+        let then_e = cx.constant(out)?;
+        acc = cx.select(cond, then_e, acc)?;
+    }
+    Ok(acc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3545,5 +6025,64 @@ mod tests {
                 .unwrap(),
             Values::Exact(Vec::new())
         );
+    }
+
+    #[test]
+    fn optimize_and_tighten_facts_unit() {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W16);
+        let x = cx.parse("x", &o).unwrap();
+        let c = cx
+            .parse("(x >=u 12) & (x <=u 40) & ((x & 3) == 2)", &o)
+            .unwrap();
+        let mut s = Solver::default();
+        s.assert(&cx, c).unwrap();
+
+        assert_eq!(
+            s.minimize(&mut cx, x).unwrap(),
+            Optimum::Found(BitVec::wrapping_from_u64(Width::W16, 14))
+        );
+        assert_eq!(s.value(&mut cx, x).unwrap().unwrap().to_u64(), Some(14));
+
+        assert_eq!(
+            s.maximize(&mut cx, x).unwrap(),
+            Optimum::Found(BitVec::wrapping_from_u64(Width::W16, 38))
+        );
+        assert_eq!(s.value(&mut cx, x).unwrap().unwrap().to_u64(), Some(38));
+
+        let f = s.tighten_facts(&mut cx, x).unwrap().unwrap();
+        assert_eq!(f.urange().lo().to_u64(), Some(14));
+        assert_eq!(f.urange().hi().to_u64(), Some(38));
+        assert_eq!(f.known().known_zero().bit(0), Some(true));
+        assert_eq!(f.known().known_one().bit(1), Some(true));
+    }
+
+    #[test]
+    fn functional_dependency_and_synthesis_unit() {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W32);
+        let x = cx.parse("x", &o).unwrap();
+        let k = cx.parse("k", &o).unwrap();
+        let y = cx.parse("y", &o).unwrap();
+        let eq1 = cx.parse("t == (x ^ k)", &o).unwrap();
+        let eq2 = cx.parse("y + t == (x & k) * 2 + (x ^ k)", &o).unwrap();
+
+        let mut s = Solver::default();
+        s.assert(&cx, eq1).unwrap();
+        s.assert(&cx, eq2).unwrap();
+
+        assert_eq!(
+            s.is_determined_by(&mut cx, y, &[x, k]).unwrap(),
+            Truth::True
+        );
+        assert_eq!(s.is_determined_by(&mut cx, y, &[x]).unwrap(), Truth::False);
+
+        let def = s.functional_def(&mut cx, y, &[x, k]).unwrap().unwrap();
+        let allowed: HashSet<SymbolId> = cx.symbols_in(&[x, k]).unwrap().into_iter().collect();
+        for sym in cx.symbols_in(&[def]).unwrap() {
+            assert!(allowed.contains(&sym));
+        }
+        let ne = cx.cmp(crate::CmpOpExt::Ne, y, def).unwrap();
+        assert_eq!(s.check_assuming(&mut cx, &[ne]).unwrap(), Status::Unsat);
     }
 }

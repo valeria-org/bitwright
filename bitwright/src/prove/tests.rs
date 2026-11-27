@@ -1045,3 +1045,239 @@ fn questions_resume_and_say_why_they_are_undecided() {
         panic!("not refuted")
     };
 }
+
+fn aig_max_depth(g: &Aig, outputs: &[aig::L]) -> u32 {
+    let mut depths = vec![0u32; g.len()];
+    for n in 1..g.len() {
+        if let Some((a, b)) = g.gate(n) {
+            depths[n] = depths[(a >> 1) as usize].max(depths[(b >> 1) as usize]) + 1;
+        }
+    }
+    outputs
+        .iter()
+        .map(|&l| depths[(l >> 1) as usize])
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn wallace_sum_csa_and_mul_match_reference_and_have_logarithmic_depth() {
+    use bitwright_ref as reference;
+    let mut rng = Rng(0x32_c5a0);
+
+    // 1. Empty, 1-term, and 2-term (`cin_bits == 0`) delegate to `blast::add` identically.
+    assert!(blast::sum_csa(&mut Aig::new(), &[], 0).is_empty());
+    for w in [1usize, 8, 32, 65] {
+        let mut g1 = Aig::new();
+        let a1: Vec<_> = (0..w).map(|_| g1.input()).collect();
+        let b1: Vec<_> = (0..w).map(|_| g1.input()).collect();
+        let out_add = blast::add(&mut g1, &a1, &b1);
+
+        let mut g2 = Aig::new();
+        let a2: Vec<_> = (0..w).map(|_| g2.input()).collect();
+        let b2: Vec<_> = (0..w).map(|_| g2.input()).collect();
+        assert_eq!(blast::sum_csa(&mut g2, core::slice::from_ref(&a2), 0), a2);
+        let out_csa = blast::sum_csa(&mut g2, &[a2, b2], 0);
+        assert_eq!(g1.len(), g2.len());
+        assert_eq!(out_add, out_csa);
+    }
+
+    // 2. Equivalence of `blast::sum_csa` across term counts, carry-ins, and widths.
+    for width in [1u16, 3, 8, 16, 31, 64, 129] {
+        let w = usize::from(width);
+        for n_terms in [1usize, 2, 3, 4, 8, 16] {
+            for cin_bits in [0usize, 1, 3, 7] {
+                let mut g = Aig::new();
+                let terms: Vec<blast::Bits> = (0..n_terms)
+                    .map(|t| {
+                        (0..w)
+                            .map(|bit| {
+                                if t == n_terms - 1 && n_terms >= 4 && bit % 3 == 0 {
+                                    aig::FALSE
+                                } else {
+                                    g.input()
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let out = blast::sum_csa(&mut g, &terms, cin_bits);
+                let num_inputs = (1..g.len()).filter(|&n| g.is_input(n)).count();
+                let words: Vec<u64> = (0..num_inputs).map(|_| rng.next()).collect();
+                let evaluated = g.eval_words(|i| words[i as usize]);
+                for lane in 0..64 {
+                    let mut want = reference::Bits::from_u128(width, cin_bits as u128);
+                    for term in &terms {
+                        let mut limbs = vec![0u64; w.div_ceil(64)];
+                        for (i, &lit) in term.iter().enumerate() {
+                            limbs[i / 64] |= ((Aig::word(&evaluated, lit) >> lane) & 1) << (i % 64);
+                        }
+                        let tb = reference::Bits::from_limbs(width, &limbs);
+                        want = reference::bin(reference::BinOp::Add, &want, &tb);
+                    }
+                    for (bit, &lit) in out.iter().enumerate() {
+                        assert_eq!(
+                            (Aig::word(&evaluated, lit) >> lane) & 1 != 0,
+                            want.bit(bit as u16),
+                            "w={width}, n={n_terms}, cin={cin_bits}, lane={lane}, bit={bit}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Equivalence of Wallace `blast::mul` on dense and sparse factors across widths.
+    for width in [1u16, 5, 8, 16, 32, 65, 129] {
+        let w = usize::from(width);
+        for sparse in [false, true] {
+            let mut g = Aig::new();
+            let a: Vec<_> = (0..w)
+                .map(|i| {
+                    if sparse && i >= 2 && i + 1 < w {
+                        aig::FALSE
+                    } else {
+                        g.input()
+                    }
+                })
+                .collect();
+            let b: Vec<_> = (0..w).map(|_| g.input()).collect();
+            let prod = blast::mul(&mut g, &a, &b);
+            let num_inputs = (1..g.len()).filter(|&n| g.is_input(n)).count();
+            let words: Vec<u64> = (0..num_inputs).map(|_| rng.next()).collect();
+            let evaluated = g.eval_words(|i| words[i as usize]);
+            for lane in 0..64 {
+                let read = |bits: &[aig::L]| {
+                    let mut limbs = vec![0u64; w.div_ceil(64)];
+                    for (i, &lit) in bits.iter().enumerate() {
+                        limbs[i / 64] |= ((Aig::word(&evaluated, lit) >> lane) & 1) << (i % 64);
+                    }
+                    reference::Bits::from_limbs(width, &limbs)
+                };
+                let want = reference::bin(reference::BinOp::Mul, &read(&a), &read(&b));
+                for (bit, &lit) in prod.iter().enumerate() {
+                    assert_eq!(
+                        (Aig::word(&evaluated, lit) >> lane) & 1 != 0,
+                        want.bit(bit as u16),
+                        "mul w={width}, sparse={sparse}, bit={bit}"
+                    );
+                }
+            }
+        }
+    }
+
+    // 4. Logarithmic AIG depth on 8-term and 16-term sums (both `blast::sum_csa` and `Blaster`).
+    for w in [8usize, 16] {
+        let measure = |n_terms: usize| -> (u32, u32) {
+            let mut g_seq = Aig::new();
+            let t_seq: Vec<blast::Bits> = (0..n_terms)
+                .map(|_| (0..w).map(|_| g_seq.input()).collect())
+                .collect();
+            let mut acc = t_seq[0].clone();
+            for term in &t_seq[1..] {
+                acc = blast::add(&mut g_seq, &acc, term);
+            }
+            let seq_depth = aig_max_depth(&g_seq, &acc);
+
+            let mut g_csa = Aig::new();
+            let t_csa: Vec<blast::Bits> = (0..n_terms)
+                .map(|_| (0..w).map(|_| g_csa.input()).collect())
+                .collect();
+            let out_csa = blast::sum_csa(&mut g_csa, &t_csa, 0);
+            let csa_depth = aig_max_depth(&g_csa, &out_csa);
+            (seq_depth, csa_depth)
+        };
+        let (seq8, csa8) = measure(8);
+        let (seq16, csa16) = measure(16);
+        assert!(csa8 < seq8, "w={w}: csa8={csa8} vs seq8={seq8}");
+        assert!(csa16 < seq16, "w={w}: csa16={csa16} vs seq16={seq16}");
+        // Doubling from 8 to 16 terms adds O(1) Wallace levels (~8 AIG levels), whereas a
+        // sequential adder chain adds 8 full ripple stages (>= 24 AIG levels).
+        assert!(
+            csa16 - csa8 <= 10 && seq16 - seq8 >= 24,
+            "w={w}: csa {csa8}->{csa16}, seq {seq8}->{seq16}"
+        );
+    }
+
+    // `Blaster::blast` flattens single-use `Add`/`Sub`/`Neg` chains while keeping shared sub-sums.
+    let mut cx = Context::new();
+    let w16 = Width::W16;
+    let syms: Vec<Expr> = (0..16)
+        .map(|i| cx.symbol(format!("v{i}").as_str(), w16).unwrap())
+        .collect();
+    let mut expr = syms[0];
+    for (idx, &s) in syms[1..].iter().enumerate() {
+        expr = if idx % 3 == 1 {
+            cx.sub(expr, s).unwrap()
+        } else {
+            cx.add(expr, s).unwrap()
+        };
+    }
+    let root_id = cx.id(expr).unwrap();
+    let mut blaster = Blaster::new(&mut cx, usize::MAX);
+    let blasted = blaster.blast(root_id).unwrap();
+    let blasted_depth = aig_max_depth(&blaster.g, &blasted);
+    assert!(blasted_depth < 75, "blasted 16-term depth={blasted_depth}");
+}
+
+#[test]
+fn wallace_csa_and_mul_identities_produce_valid_drup_certificates() {
+    for sweeping in [false, true] {
+        let cfg = Config::default()
+            .with_simplify(false)
+            .with_samples(0)
+            .with_certificate(true)
+            .with_sweeping(sweeping);
+
+        let csa_bits = if sweeping { 24u16 } else { 8u16 };
+        let mul_bits = if sweeping { 6u16 } else { 5u16 };
+        // 1. Multi-term CSA and Wallace network identities vs `+` / `-`.
+        for (bits, lhs_src, rhs_src) in [
+            (
+                if sweeping { 32u16 } else { 12u16 },
+                "(a ^ b ^ c) + (((a & b) | ((a ^ b) & c)) << 1)",
+                "a + b + c",
+            ),
+            (
+                csa_bits,
+                "let s0 = x0 ^ x1 ^ x2; \
+                 let c0 = ((x0 & x1) | (x0 & x2) | (x1 & x2)) << 1; \
+                 let s1 = x3 ^ x4 ^ x5; \
+                 let c1 = (~((~x3 & ~x4) | (~x3 & ~x5) | (~x4 & ~x5))) << 1; \
+                 let s2 = s0 ^ c0 ^ s1; \
+                 let c2 = ((s0 & c0) ^ (s0 & s1) ^ (c0 & s1)) << 1; \
+                 (s2 ^ c2 ^ c1) + (((s2 & c2) | ((s2 ^ c2) & c1)) << 1)",
+                "x0 + x1 + x2 + x3 + x4 + x5",
+            ),
+            (
+                csa_bits,
+                "(a - b) + (c - d) + (-e + f)",
+                "(a + c + f) - b - d - e",
+            ),
+            // 2. Multiplication commutativity and distributivity with Wallace partial-product compression.
+            (mul_bits, "x * y", "y * x"),
+            (mul_bits, "x * (y + z)", "x * y + x * z"),
+            (4, "(a + b) * (c - d)", "a * c + b * c - a * d - b * d"),
+        ] {
+            let mut cx = Context::new();
+            let o = ParseOptions::width(Width::new(bits).unwrap());
+            let lhs = cx.parse(lhs_src, &o).unwrap();
+            let rhs = cx.parse(rhs_src, &o).unwrap();
+            let Outcome::Proved(Some(cert)) = equal(&mut cx, lhs, rhs, &cfg).unwrap() else {
+                panic!("not proved (sweeping={sweeping}, bits={bits}): {lhs_src} == {rhs_src}");
+            };
+            cert.check().unwrap();
+        }
+
+        // Near-miss refutation checks model evaluation.
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W8);
+        let lhs = cx.parse("x * (y + z)", &o).unwrap();
+        let bad = cx.parse("x * y + z", &o).unwrap();
+        let Outcome::Refuted(model) = equal(&mut cx, lhs, bad, &cfg).unwrap() else {
+            panic!("near-miss distributivity must be refuted");
+        };
+        let vals = cx.eval(&[lhs, bad], &model[..]).unwrap();
+        assert_ne!(vals[0], vals[1]);
+    }
+}

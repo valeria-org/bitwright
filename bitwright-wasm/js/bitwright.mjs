@@ -35,6 +35,7 @@ const OPS = {
   checkRules: 21,
   leanToRules: 22,
   runSmtlib: 23,
+  functionalDef: 24,
 };
 
 const FRONT_ENDS = { pcode: 0, vex: 1, llvm: 2 };
@@ -315,9 +316,16 @@ export async function instantiate(bytes) {
     // Reads a QF_BV script: the named definition (or the last one, or the assertions
     // conjoined) as expression text, the symbols' widths written (`x:64`).
     fromSmtlib: (script, definition = "") => call(OPS.fromSmtlib, script, definition, 0),
-    // Runs an SMT-LIB 2 session (`QF_BV`, `QF_BVFP`, `QF_ABV`, `QF_UFBV`) and returns the
-    // standard responses.
+    // Runs an SMT-LIB 2 session (`QF_BV`, `QF_BVFP`, `QF_ABV`, `QF_UFBV`, plus `minimize`,
+    // `maximize` and `get-objectives`) and returns the standard responses.
     runSmtlib: (script) => call(OPS.runSmtlib, script),
+    // Closed-form expression over `inputs` proved equal to `target` under `assertions` (an array
+    // of 1-bit predicate strings, or a newline-separated string), or null when none is found.
+    functionalDef: (assertions, target, inputs, width = 64) => {
+      const asrt = Array.isArray(assertions) ? assertions.join("\n") : String(assertions);
+      const out = call(OPS.functionalDef, asrt, [target, ...inputs].join("\0"), width);
+      return out === "" ? null : out;
+    },
     // `lhs = rhs` as a Lean 4 `example` over their symbols, proved by `bv_decide`; without
     // `rhs`, the Lean term of `lhs` alone. Throws for what Lean's core BitVec cannot state.
     toLean: (lhs, rhs = "", width = 64) => call(OPS.toLean, lhs, rhs, width),

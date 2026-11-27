@@ -833,19 +833,184 @@ impl<'c> Blaster<'c> {
 
     /// The bits of node `root`.
     pub(crate) fn blast(&mut self, root: u32) -> Result<Bits, Error> {
+        const MAX_SUM_TERMS: usize = 32;
         let bits = &self.bits;
         let order = self
             .cx
             .post_order_ids_pruned(&[root], |e| bits.contains_key(&e.index()));
+        if order.is_empty() {
+            return Ok(self.bits[&root].clone());
+        }
+        // Count local fanout within the un-memoized cone so single-parent `Add`/`Sub`/`Neg`
+        // chains of >= 3 operands lower through one logarithmic-depth `blast::sum_csa` tree
+        // without building dead intermediate ripple adders, while multi-parent sub-sums retain
+        // full DAG sharing.
+        let mut fanout: IdMap<u32, u32> = IdMap::default();
+        *fanout.entry(root).or_default() += 1;
+        for &i in &order {
+            for c in self.cx.node(i).children() {
+                *fanout.entry(c).or_default() += 1;
+            }
+        }
+        let mut sum_interior: IdMap<u32, ()> = IdMap::default();
+        let mut sum_plans: IdMap<u32, Vec<(bool, u32)>> = IdMap::default();
+        let mut stack: Vec<(bool, u32)> = Vec::new();
+        let mut claimed: Vec<u32> = Vec::new();
+        for &u in order.iter().rev() {
+            if sum_interior.contains_key(&u) {
+                continue;
+            }
+            let un = self.cx.node(u);
+            if !matches!(un.op, OpCode::Add | OpCode::Sub) {
+                continue;
+            }
+            stack.clear();
+            claimed.clear();
+            if un.op == OpCode::Add {
+                stack.push((false, un.b));
+                stack.push((false, un.a));
+            } else {
+                stack.push((true, un.b));
+                stack.push((false, un.a));
+            }
+            let mut items: Vec<(bool, u32)> = Vec::new();
+            while let Some((neg, x)) = stack.pop() {
+                let xn = self.cx.node(x);
+                let can_flatten = !self.bits.contains_key(&x)
+                    && fanout.get(&x).copied().unwrap_or(0) == 1
+                    && !sum_interior.contains_key(&x);
+                match xn.op {
+                    OpCode::Add
+                        if can_flatten && items.len() + stack.len() + 2 <= MAX_SUM_TERMS =>
+                    {
+                        sum_interior.insert(x, ());
+                        claimed.push(x);
+                        stack.push((neg, xn.b));
+                        stack.push((neg, xn.a));
+                    }
+                    OpCode::Sub
+                        if can_flatten && items.len() + stack.len() + 2 <= MAX_SUM_TERMS =>
+                    {
+                        sum_interior.insert(x, ());
+                        claimed.push(x);
+                        stack.push((!neg, xn.b));
+                        stack.push((neg, xn.a));
+                    }
+                    OpCode::Neg if can_flatten && items.len() + stack.len() < MAX_SUM_TERMS => {
+                        sum_interior.insert(x, ());
+                        claimed.push(x);
+                        stack.push((!neg, xn.a));
+                    }
+                    _ => items.push((neg, x)),
+                }
+            }
+            if items.len() >= 3 {
+                sum_plans.insert(u, items);
+            } else {
+                for x in claimed.drain(..) {
+                    sum_interior.remove(&x);
+                }
+            }
+        }
+        let mut sum_leaf_uses: IdMap<(bool, u32), u32> = IdMap::default();
+        if self.compact_adders && !sum_plans.is_empty() {
+            for items in sum_plans.values() {
+                for &item in items {
+                    *sum_leaf_uses.entry(item).or_default() += 1;
+                }
+            }
+            for &u in &order {
+                if sum_interior.contains_key(&u) || sum_plans.contains_key(&u) {
+                    continue;
+                }
+                let un = self.cx.node(u);
+                match un.op {
+                    OpCode::Add => {
+                        *sum_leaf_uses.entry((false, un.a)).or_default() += 1;
+                        *sum_leaf_uses.entry((false, un.b)).or_default() += 1;
+                    }
+                    OpCode::Sub => {
+                        *sum_leaf_uses.entry((false, un.a)).or_default() += 1;
+                        *sum_leaf_uses.entry((true, un.b)).or_default() += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let lower_signed_items =
+            |g: &mut Aig, bits: &IdMap<u32, Bits>, slice: &[(bool, u32)], compact: bool| -> Bits {
+                if let [(false, only)] = *slice {
+                    return bits[&only].clone();
+                }
+                if let [(true, only)] = *slice {
+                    let ob = &bits[&only];
+                    let zero = vec![aig::FALSE; ob.len()];
+                    return if compact {
+                        blast::sub_compact(g, &zero, ob)
+                    } else {
+                        blast::sub(g, &zero, ob)
+                    };
+                }
+                let mut terms = Vec::with_capacity(slice.len());
+                let mut cin_bits = 0usize;
+                for &(neg, leaf) in slice {
+                    let lb = &bits[&leaf];
+                    if neg {
+                        terms.push(blast::not(g, lb));
+                        cin_bits += 1;
+                    } else {
+                        terms.push(lb.clone());
+                    }
+                }
+                if compact {
+                    blast::sum_csa_compact(g, &terms, cin_bits)
+                } else {
+                    blast::sum_csa(g, &terms, cin_bits)
+                }
+            };
         for i in order {
-            if self.bits.contains_key(&i) {
+            if self.bits.contains_key(&i) || sum_interior.contains_key(&i) {
                 continue;
             }
             if self.g.len() > self.max_nodes {
                 self.too_large = true;
                 return Err(Error::Unsupported("the circuit is too large".into()));
             }
-            let b = self.node(i)?;
+            let b = if let Some(items) = sum_plans.remove(&i) {
+                if self.compact_adders {
+                    let mut shared = Vec::new();
+                    let mut priv_items = Vec::new();
+                    for item in items {
+                        if sum_leaf_uses.get(&item).copied().unwrap_or(0) > 1 {
+                            shared.push(item);
+                        } else {
+                            priv_items.push(item);
+                        }
+                    }
+                    shared.sort_by(|&(na, la), &(nb, lb)| {
+                        na.cmp(&nb).then_with(|| self.cx.order(la, lb))
+                    });
+                    if shared.is_empty() {
+                        lower_signed_items(&mut self.g, &self.bits, &priv_items, true)
+                    } else if priv_items.is_empty() {
+                        lower_signed_items(&mut self.g, &self.bits, &shared, true)
+                    } else if let [(true, px)] = *priv_items.as_slice() {
+                        let sb = lower_signed_items(&mut self.g, &self.bits, &shared, true);
+                        blast::sub_compact(&mut self.g, &sb, &self.bits[&px])
+                    } else if let [(true, sx)] = *shared.as_slice() {
+                        let pb = lower_signed_items(&mut self.g, &self.bits, &priv_items, true);
+                        blast::sub_compact(&mut self.g, &pb, &self.bits[&sx])
+                    } else {
+                        let sb = lower_signed_items(&mut self.g, &self.bits, &shared, true);
+                        let pb = lower_signed_items(&mut self.g, &self.bits, &priv_items, true);
+                        blast::add_compact(&mut self.g, &sb, &pb)
+                    }
+                } else {
+                    lower_signed_items(&mut self.g, &self.bits, &items, false)
+                }
+            } else {
+                self.node(i)?
+            };
             self.bits.insert(i, b);
         }
         Ok(self.bits[&root].clone())

@@ -2393,6 +2393,35 @@ fn solver_enumeration_memory_merge_site_queries_and_smtlib_session() {
             BW_OK
         );
         assert_eq!((count, exact, answer), (2, false, 1));
+        let mut opt = val(8, 0);
+        assert_eq!(
+            bw_solver_maximize(s, cx.0, x, false, &mut opt, &mut answer),
+            BW_OK
+        );
+        assert_eq!((answer, opt.limbs[0]), (1, 3));
+        assert_eq!(
+            bw_solver_minimize(s, cx.0, x, false, &mut opt, &mut answer),
+            BW_OK
+        );
+        assert_eq!((answer, opt.limbs[0]), (1, 0));
+        let mut tf = core::mem::zeroed::<BwFacts>();
+        let mut sat = false;
+        assert_eq!(
+            bw_solver_tighten_facts(s, cx.0, x, &mut tf, &mut sat),
+            BW_OK
+        );
+        assert!(sat);
+        assert_eq!((tf.umin.limbs[0], tf.umax.limbs[0]), (0, 3));
+        let y_rel = cx.parse("y == (x ^ 5)", 8);
+        let y_sym = cx.sym("y", 8);
+        assert_eq!(bw_solver_assert(s, cx.0, y_rel, null_mut()), BW_OK);
+        let (mut fdef, mut has_def) = (0u64, false);
+        assert_eq!(
+            bw_solver_functional_def(s, cx.0, y_sym, &x, 1, &mut fdef, &mut has_def),
+            BW_OK
+        );
+        assert!(has_def);
+        assert_eq!(cx.print(fdef), "x ^ 5");
         bw_solver_free(s);
 
         // 2. Memory snapshot / restore / merge / memset / memcpy
