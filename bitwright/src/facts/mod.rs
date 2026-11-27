@@ -1599,8 +1599,12 @@ impl Context {
                     },
                 };
             }
+            let (rep, rep_rel) = env.find(i);
+            let const_eq = env.const_diff(self, i);
             let tainted = env.assumed.contains_key(&i)
+                || (rep != i && env.assumed.contains_key(&rep))
                 || ordering.is_some()
+                || const_eq.is_some()
                 || kids[..n.op.arity()].iter().any(|(_, r)| !r.is_none());
             if !tainted {
                 let Some(f) = base(self, i) else {
@@ -1631,8 +1635,18 @@ impl Context {
                 f = Facts::constant(&v);
                 rel = r;
             }
+            if let Some((kv, krel)) = const_eq {
+                rel |= krel;
+                f = f.meet(&Facts::constant(&kv)).ok_or(rel)?;
+            }
             if let Some((a, r)) = env.assumed.get(&i) {
                 rel |= *r;
+                f = f.meet(a).ok_or(rel)?;
+            }
+            if rep != i
+                && let Some((a, r)) = env.assumed.get(&rep)
+            {
+                rel |= rep_rel | *r;
                 f = f.meet(a).ok_or(rel)?;
             }
             overlay.insert(i, (f, rel));
@@ -1748,6 +1762,14 @@ impl Context {
             let (x, y) = (self.id(x)?, self.id(y)?);
             if let Some((v, r)) = self.assumed_order(a, op, x, y) {
                 return Ok(proof(Truth::from_opt(Some(v)), r));
+            }
+            if op == CmpOp::Eq {
+                let w = self.width_of(x);
+                let (bx, ox, rx) = a.store.env.offset_of(x, w);
+                let (by, oy, ry) = a.store.env.offset_of(y, w);
+                if bx == by && !(rx | ry).is_none() {
+                    return Ok(proof(Truth::from_opt(Some(ox == oy)), rx | ry));
+                }
             }
         }
         // Facts of every involved expression (under the assumptions, if any).

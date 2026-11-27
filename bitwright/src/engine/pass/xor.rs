@@ -374,11 +374,9 @@ fn emit(r: &mut Runner<'_, '_>, cx: &mut Context, form: &Form) -> Result<u32, St
 pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> {
     let op = cx.node(n).op;
     let mut declined = Fin::FINAL;
-    // A linear map of one atom through shifts and rotations (see `gf2`).
-    if matches!(
-        op,
-        OpCode::Xor | OpCode::RotL | OpCode::RotR | OpCode::Shl | OpCode::LShr
-    ) {
+    // Multi-atom and cast-crossing GF(2)-affine maps through shifts, rotations, permutations,
+    // slices, and extensions (see `gf2`).
+    if super::gf2::can_root(cx, n) {
         match super::gf2::step(r, cx, n)? {
             Some(Step::Normal(f)) => declined = f,
             Some(step) => return Ok(step),

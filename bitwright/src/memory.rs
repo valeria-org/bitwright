@@ -213,9 +213,20 @@ impl Memory {
         loop {
             match cx.view(e)? {
                 View::Const(c) => return Ok((None, BitVec::apply_bin(BinOp::Add, &off, &c)?)),
-                View::Bin(BinOp::Add, a, b) => match cx.view(b)? {
-                    View::Const(c) => {
+                View::Bin(BinOp::Add, a, b) => match (cx.view(a)?, cx.view(b)?) {
+                    (_, View::Const(c)) => {
                         off = BitVec::apply_bin(BinOp::Add, &off, &c)?;
+                        e = a;
+                    }
+                    (View::Const(c), _) => {
+                        off = BitVec::apply_bin(BinOp::Add, &off, &c)?;
+                        e = b;
+                    }
+                    _ => return Ok((Some(e), off)),
+                },
+                View::Bin(BinOp::Sub, a, b) => match cx.view(b)? {
+                    View::Const(c) => {
+                        off = BitVec::apply_bin(BinOp::Sub, &off, &c)?;
                         e = a;
                     }
                     _ => return Ok((Some(e), off)),
@@ -355,12 +366,189 @@ impl Memory {
         Ok(v.expect("at least one cell"))
     }
 
+    /// Decides `a == b` algebraically when linear reassociation, disjoint bitwise offsets,
+    /// 2-adic stride alignment, bounded single-term ranges, or bit-provenance settle it without
+    /// introducing a symbolic `select`.
+    fn decide_linear_or_bits(cx: &mut Context, a: Expr, b: Expr) -> Result<Option<bool>, Error> {
+        let w = cx.width(a)?;
+        let one = BitVec::one(w);
+        let neg_one = BitVec::ones(w);
+        let mut konst = BitVec::zero(w);
+        let mut terms: Vec<(Expr, BitVec)> = Vec::new();
+        let mut todo: Vec<(Expr, BitVec)> = vec![(b, neg_one), (a, one)];
+        let mut steps = 0usize;
+        let mut exact = true;
+
+        while let Some((cur, scale)) = todo.pop() {
+            if scale.is_zero() {
+                continue;
+            }
+            steps += 1;
+            if steps > 64 {
+                exact = false;
+                break;
+            }
+            match cx.view(cur)? {
+                View::Const(c) => {
+                    let prod = BitVec::bin_unchecked(BinOp::Mul, &c, &scale);
+                    konst = BitVec::bin_unchecked(BinOp::Add, &konst, &prod);
+                }
+                View::Bin(BinOp::Add, u, v) => {
+                    todo.push((v, scale));
+                    todo.push((u, scale));
+                }
+                View::Bin(BinOp::Sub, u, v) => {
+                    todo.push((v, BitVec::un_unchecked(crate::UnOp::Neg, &scale)));
+                    todo.push((u, scale));
+                }
+                View::Un(crate::UnOp::Neg, u) => {
+                    todo.push((u, BitVec::un_unchecked(crate::UnOp::Neg, &scale)));
+                }
+                View::Un(crate::UnOp::Not, u) => {
+                    // `~u == -u - 1`
+                    konst = BitVec::bin_unchecked(BinOp::Sub, &konst, &scale);
+                    todo.push((u, BitVec::un_unchecked(crate::UnOp::Neg, &scale)));
+                }
+                View::Bin(BinOp::Mul, u, v) => match (cx.as_const(u)?, cx.as_const(v)?) {
+                    (_, Some(c)) => todo.push((u, BitVec::bin_unchecked(BinOp::Mul, &scale, &c))),
+                    (Some(c), _) => todo.push((v, BitVec::bin_unchecked(BinOp::Mul, &scale, &c))),
+                    _ => {
+                        if let Some(slot) = terms.iter_mut().find(|t| t.0 == cur) {
+                            slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale);
+                        } else if terms.len() < 16 {
+                            terms.push((cur, scale));
+                        } else {
+                            exact = false;
+                            break;
+                        }
+                    }
+                },
+                View::Bin(BinOp::Shl, u, v) => {
+                    if let Some(sv) = cx.as_const(v)? {
+                        let factor = BitVec::bin_unchecked(BinOp::Shl, &one, &sv);
+                        if !factor.is_zero() {
+                            todo.push((u, BitVec::bin_unchecked(BinOp::Mul, &scale, &factor)));
+                        }
+                    } else if let Some(slot) = terms.iter_mut().find(|t| t.0 == cur) {
+                        slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale);
+                    } else if terms.len() < 16 {
+                        terms.push((cur, scale));
+                    } else {
+                        exact = false;
+                        break;
+                    }
+                }
+                View::Bin(op @ (BinOp::Or | BinOp::Xor), u, v) => {
+                    let (fu, fv) = (cx.facts(u)?, cx.facts(v)?);
+                    let overlap = BitVec::bin_unchecked(
+                        BinOp::And,
+                        &fu.known().maybe_one(),
+                        &fv.known().maybe_one(),
+                    );
+                    if overlap.is_zero() {
+                        // Disjoint bit supports: `u | v == u + v` and `u ^ v == u + v`.
+                        todo.push((v, scale));
+                        todo.push((u, scale));
+                    } else {
+                        let _ = op;
+                        if let Some(slot) = terms.iter_mut().find(|t| t.0 == cur) {
+                            slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale);
+                        } else if terms.len() < 16 {
+                            terms.push((cur, scale));
+                        } else {
+                            exact = false;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(slot) = terms.iter_mut().find(|t| t.0 == cur) {
+                        slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale);
+                    } else if terms.len() < 16 {
+                        terms.push((cur, scale));
+                    } else {
+                        exact = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if exact {
+            terms.retain(|(_, c)| !c.is_zero());
+            if terms.is_empty() {
+                return Ok(Some(konst.is_zero()));
+            }
+            if !konst.is_zero() {
+                // 2-adic stride check: if every `coeff_i * atom_i` has more trailing zeros than
+                // `konst`, `sum coeff_i * atom_i + konst == 0 (mod 2^W)` has no solution.
+                let k_tz = crate::facts::known::trailing_zeros(&konst);
+                let mut min_tz = u32::from(w.bits());
+                for (atom, coeff) in &terms {
+                    let c_tz = crate::facts::known::trailing_zeros(coeff);
+                    let a_tz = cx.facts(*atom)?.known().trailing_known_zeros();
+                    min_tz = min_tz.min(c_tz.saturating_add(a_tz));
+                }
+                if k_tz < min_tz {
+                    return Ok(Some(false));
+                }
+                // Single residual term `t == target`: reject when outside `t`'s unsigned interval
+                // or incompatible with `t`'s known bits (e.g. `sp + zext(byte)` vs `sp + 300`).
+                if let [(atom, coeff)] = &terms[..] {
+                    let target = if *coeff == one {
+                        Some(BitVec::un_unchecked(crate::UnOp::Neg, &konst))
+                    } else if *coeff == neg_one {
+                        Some(konst)
+                    } else {
+                        None
+                    };
+                    if let Some(t) = target {
+                        let f = cx.facts(*atom)?;
+                        if !f.urange().contains(&t)
+                            || !BitVec::bin_unchecked(BinOp::And, &f.known().known_zero(), &t)
+                                .is_zero()
+                            || BitVec::bin_unchecked(BinOp::And, &f.known().known_one(), &t)
+                                != f.known().known_one()
+                        {
+                            return Ok(Some(false));
+                        }
+                    }
+                }
+            }
+        }
+
+        let (ia, ib) = (cx.id(a)?, cx.id(b)?);
+        if let Some(ans) = crate::engine::pass::shuffle::decide_eq_by_runs(cx, ia, ib, 32) {
+            return Ok(Some(ans));
+        }
+        Ok(None)
+    }
+
     /// Whether `a = b` is decided: `Ok(true)`, `Ok(false)`, or `Err` with the 1-bit equality
-    /// to select on. One base: the offsets decide; else the builder or the facts may.
+    /// to select on. One base: the offsets decide; else linear/stride/bit analysis, the builder,
+    /// or the facts may.
     fn same(cx: &mut Context, a: Expr, b: Expr) -> Result<Result<bool, Expr>, Error> {
         let ((ba, oa), (bb, ob)) = (Self::split(cx, a)?, Self::split(cx, b)?);
         if ba == bb {
             return Ok(Ok(oa == ob));
+        }
+        if let (Some(ea), Some(eb)) = (ba, bb) {
+            let (iba, ibb) = (cx.id(ea)?, cx.id(eb)?);
+            if oa == ob {
+                if let Some(ans) = crate::engine::pass::shuffle::decide_eq_by_runs(cx, iba, ibb, 32)
+                {
+                    return Ok(Ok(ans));
+                }
+            } else {
+                let delta = BitVec::bin_unchecked(BinOp::Sub, &oa, &ob);
+                let low_eq = crate::engine::pass::shuffle::common_low_bits(cx, iba, ibb, 32);
+                if crate::facts::known::trailing_zeros(&delta) < low_eq {
+                    return Ok(Ok(false));
+                }
+            }
+        }
+        if let Some(ans) = Self::decide_linear_or_bits(cx, a, b)? {
+            return Ok(Ok(ans));
         }
         let eq = cx.cmp(CmpOpExt::Eq, a, b)?;
         if let Some(v) = cx.as_const(eq)? {
@@ -935,5 +1123,104 @@ mod tests {
         let one = cx.one(Width::W32).unwrap();
         let e = cx.bin(BinOp::Add, back, one).unwrap();
         assert_eq!(cx.display(e).to_string(), "x + 1");
+    }
+
+    #[test]
+    fn linear_stride_and_bit_alias_disambiguation() {
+        for &bits in &[32u16, 64] {
+            let w = Width::new(bits).unwrap();
+            let o = ParseOptions::width(w);
+            let mut cx = Context::new();
+            let mut m = Memory::new("m", w, Width::W8, Endian::Little);
+
+            let val_a = cx.parse("a", &ParseOptions::width(Width::W32)).unwrap();
+            let val_b = cx.parse("b", &ParseOptions::width(Width::W32)).unwrap();
+
+            // 1. Reassociated multi-term sums: `(x + 4) + y` vs `(y + 8) + x` are disjoint,
+            //    while `(y + 4) + x` aliases `(x + 4) + y` exactly.
+            let p1 = cx.parse("(x + 4) + y", &o).unwrap();
+            let p2 = cx.parse("(y + 8) + x", &o).unwrap();
+            let p1_eq = cx.parse("(y + 4) + x", &o).unwrap();
+            let v1 = m.store(&mut cx, m.initial(), p1, val_a).unwrap();
+            let v2 = m.store(&mut cx, v1, p2, val_b).unwrap();
+            assert_eq!(m.load(&mut cx, v2, p1_eq, 4).unwrap(), val_a);
+            assert_eq!(m.load(&mut cx, v2, p2, 4).unwrap(), val_b);
+
+            // 2. Subtracted stack offsets: `(sp - 16) + 8` aliases `sp - 8` and not `sp - 16`.
+            let s16 = cx.parse("sp - 16", &o).unwrap();
+            let s8_alt = cx.parse("(sp - 16) + 8", &o).unwrap();
+            let s8 = cx.parse("sp - 8", &o).unwrap();
+            let vs1 = m.store(&mut cx, m.initial(), s16, val_a).unwrap();
+            let vs2 = m.store(&mut cx, vs1, s8_alt, val_b).unwrap();
+            assert_eq!(m.load(&mut cx, vs2, s16, 4).unwrap(), val_a);
+            assert_eq!(m.load(&mut cx, vs2, s8, 4).unwrap(), val_b);
+
+            // 3. Disjoint bitwise OR offset: `sp + (i << 3)` vs `sp + ((i << 3) | 4)`.
+            let b0 = cx.parse("sp + (i << 3)", &o).unwrap();
+            let b4 = cx.parse("sp + ((i << 3) | 4)", &o).unwrap();
+            let vb1 = m.store(&mut cx, m.initial(), b0, val_a).unwrap();
+            let vb2 = m.store(&mut cx, vb1, b4, val_b).unwrap();
+            assert_eq!(m.load(&mut cx, vb2, b0, 4).unwrap(), val_a);
+
+            // 4. 2-adic stride GCD mismatch: `sp + i * 12` vs `sp + j * 12 + 2` for 2-byte cells
+            //    (`12` has ctz 2, offsets `+0,+1` vs `+2,+3` differ by `1, 2, 3`, none divisible by 4).
+            let h_a = cx.parse("ha", &ParseOptions::width(Width::W16)).unwrap();
+            let h_b = cx.parse("hb", &ParseOptions::width(Width::W16)).unwrap();
+            let st1 = cx.parse("sp + i * 12", &o).unwrap();
+            let st2 = cx.parse("sp + j * 12 + 2", &o).unwrap();
+            let vst1 = m.store(&mut cx, m.initial(), st1, h_a).unwrap();
+            let vst2 = m.store(&mut cx, vst1, st2, h_b).unwrap();
+            assert_eq!(m.load(&mut cx, vst2, st1, 2).unwrap(), h_a);
+
+            // 5. Bounded zero-extended byte offset `sp + zext(idx8)` vs `sp + 300` (cannot alias).
+            let idx8 = cx.symbol("idx8", Width::W8).unwrap();
+            let z_idx = cx.zext(idx8, w).unwrap();
+            let sp = cx.parse("sp", &o).unwrap();
+            let z_addr = cx.bin(BinOp::Add, sp, z_idx).unwrap();
+            let far_addr = cx.parse("sp + 300", &o).unwrap();
+            let vz1 = m.store(&mut cx, m.initial(), z_addr, val_a).unwrap();
+            let vz2 = m.store(&mut cx, vz1, far_addr, h_b).unwrap();
+            // Even `z_addr + 3` is at most `sp + 258 < sp + 300`.
+            assert_eq!(m.load(&mut cx, vz2, z_addr, 4).unwrap(), val_a);
+
+            // 6. Bit-provenance complement: `p ^ 4` vs `p` (4-byte store never overlaps `p ^ 4`).
+            let px0 = cx.parse("p", &o).unwrap();
+            let px4 = cx.parse("p ^ 4", &o).unwrap();
+            let vpx1 = m.store(&mut cx, m.initial(), px0, h_a).unwrap();
+            let vpx2 = m.store(&mut cx, vpx1, px4, h_b).unwrap();
+            // Single-byte load at `p` vs `p ^ 4`: bit 2 is opposite, so `p != p ^ 4` unconditionally.
+            let b_at_p = m.load(&mut cx, vpx2, px0, 1).unwrap();
+            assert!(
+                !cx.display(b_at_p).to_string().contains("select"),
+                "{}",
+                cx.display(b_at_p)
+            );
+
+            // 7. Soundness guard: `sp + i * 4` vs `sp + j * 4 + 4` CAN alias when `j == i - 1`,
+            //    so `select` MUST be preserved and evaluate to `val_b` at `(i = 5, j = 4)`.
+            let ov1 = cx.parse("sp + i * 4", &o).unwrap();
+            let ov2 = cx.parse("sp + j * 4 + 4", &o).unwrap();
+            let vov1 = m.store(&mut cx, m.initial(), ov1, val_a).unwrap();
+            let vov2 = m.store(&mut cx, vov1, ov2, val_b).unwrap();
+            let loaded = m.load(&mut cx, vov2, ov1, 4).unwrap();
+            assert!(cx.display(loaded).to_string().contains("select"));
+            let env = [
+                (SymbolKey::from("sp"), BitVec::wrapping_from_u64(w, 0x1000)),
+                (SymbolKey::from("i"), BitVec::wrapping_from_u64(w, 5)),
+                (SymbolKey::from("j"), BitVec::wrapping_from_u64(w, 4)),
+                (
+                    SymbolKey::from("a"),
+                    BitVec::wrapping_from_u64(Width::W32, 0x11223344),
+                ),
+                (
+                    SymbolKey::from("b"),
+                    BitVec::wrapping_from_u64(Width::W32, 0x55667788),
+                ),
+            ];
+            assert_eq!(
+                cx.eval(&[loaded], &env[..]).unwrap()[0].to_u64(),
+                Some(0x55667788)
+            );
+        }
     }
 }

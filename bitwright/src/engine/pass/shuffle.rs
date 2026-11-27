@@ -467,6 +467,115 @@ pub(crate) fn bit_runs_of(cx: &Context, root: u32, max_nodes: usize) -> Option<V
     }
 }
 
+/// Pure `Context`-only bounded equality / disequality check via canonical bit-provenance runs
+/// (`1..=512` bits). Returns `Some(true)` when bit-for-bit identical, `Some(false)` when at least
+/// one bit position is provably opposite (`0` vs `1` or `bit_j` vs `~bit_j`), else `None`.
+pub(crate) fn decide_eq_by_runs(cx: &Context, a: u32, b: u32, max_nodes: usize) -> Option<bool> {
+    let w = cx.wid(a);
+    if w == 0 || w > MAX_WIDTH || cx.wid(b) != w {
+        return None;
+    }
+    let ra = bit_runs_of(cx, a, max_nodes)?;
+    let rb = bit_runs_of(cx, b, max_nodes)?;
+    if ra == rb {
+        return Some(true);
+    }
+    let (mut ia, mut ib) = (0usize, 0usize);
+    let mut ca = ra.first().copied()?;
+    let mut cb = rb.first().copied()?;
+    loop {
+        let step = run_len(ca).min(run_len(cb));
+        let (ha, next_a) = split_run(ca, step);
+        let (hb, next_b) = split_run(cb, step);
+        let opposite = match (ha, hb) {
+            (BitRun::Const { val: va, .. }, BitRun::Const { val: vb, .. }) => va != vb,
+            (
+                BitRun::Slice {
+                    src: sa,
+                    lo: la,
+                    inv: inv_a,
+                    ..
+                },
+                BitRun::Slice {
+                    src: sb,
+                    lo: lb,
+                    inv: inv_b,
+                    ..
+                },
+            ) => sa == sb && la == lb && inv_a != inv_b,
+            _ => false,
+        };
+        if opposite {
+            return Some(false);
+        }
+        ca = if run_len(next_a) == 0 {
+            ia += 1;
+            if ia == ra.len() {
+                break;
+            }
+            ra[ia]
+        } else {
+            next_a
+        };
+        cb = if run_len(next_b) == 0 {
+            ib += 1;
+            if ib == rb.len() {
+                break;
+            }
+            rb[ib]
+        } else {
+            next_b
+        };
+    }
+    None
+}
+
+/// Number of low bit positions `[0..k)` on which `a` and `b` have provably identical bit
+/// provenance (`a === b (mod 2^k)` for every input).
+pub(crate) fn common_low_bits(cx: &Context, a: u32, b: u32, max_nodes: usize) -> u32 {
+    let w = cx.wid(a);
+    if w == 0 || w > MAX_WIDTH || cx.wid(b) != w {
+        return 0;
+    }
+    let (Some(ra), Some(rb)) = (bit_runs_of(cx, a, max_nodes), bit_runs_of(cx, b, max_nodes))
+    else {
+        return 0;
+    };
+    let (mut ia, mut ib) = (0usize, 0usize);
+    let (Some(mut ca), Some(mut cb)) = (ra.first().copied(), rb.first().copied()) else {
+        return 0;
+    };
+    let mut matched = 0u32;
+    loop {
+        let step = run_len(ca).min(run_len(cb));
+        let (ha, next_a) = split_run(ca, step);
+        let (hb, next_b) = split_run(cb, step);
+        if ha != hb {
+            break;
+        }
+        matched += u32::from(step);
+        ca = if run_len(next_a) == 0 {
+            ia += 1;
+            if ia == ra.len() {
+                break;
+            }
+            ra[ia]
+        } else {
+            next_a
+        };
+        cb = if run_len(next_b) == 0 {
+            ib += 1;
+            if ib == rb.len() {
+                break;
+            }
+            rb[ib]
+        } else {
+            next_b
+        };
+    }
+    matched
+}
+
 /// Bitwise complement of a canonical run list.
 pub(crate) fn runs_invert(runs: &[BitRun]) -> Vec<BitRun> {
     runs.iter()

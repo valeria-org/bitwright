@@ -777,7 +777,7 @@ fn candidates(cx: &Context, top: u32, varies: &dyn Fn(u32) -> bool) -> (Vec<(u32
     let (doms, looked) = dominators(cx, top, varies);
     let out: Vec<(u32, Vec<u32>)> = doms
         .into_iter()
-        .filter(|&d| cx.wid(d) <= MAX_HOLE_BITS)
+        .filter(|&d| cx.wid(d) <= gf2::MAX_BITS)
         .filter_map(|d| between(cx, top, d, varies).map(|r| (d, r)))
         .collect();
     let work = looked + out.iter().map(|(_, r)| r.len() as u64).sum::<u64>();
@@ -956,7 +956,7 @@ fn region_solve<O: Oracle>(
                 .map(|k| c.bit(k) != f0.bit(k))
                 .collect();
             let x = match gf2::solve(rows, &y, u32::from(w.bits())) {
-                Some(Some(x)) => BitVec::wrapping_from_limbs(w, &[x as u64, (x >> 64) as u64]),
+                Some(Some(x)) => BitVec::wrapping_from_limbs(w, &x),
                 Some(None) => return Ok(Some(None)),
                 None => return Ok(None),
             };
@@ -1213,8 +1213,161 @@ impl Map {
 
 // ----- cancelling on both sides (R1) --------------------------------------------------------------
 
-/// If `n1` and `n2` are one injective layer applied to different operands, those operands:
-/// `n1 == n2` holds exactly when they are equal.
+/// Constant-parameter affine bijection `scale * inner + offset (mod 2^W)` with odd `scale`.
+#[derive(Clone, Debug)]
+pub(crate) struct ModAffine {
+    pub(crate) inner: u32,
+    pub(crate) scale: BitVec,
+    pub(crate) offset: BitVec,
+    pub(crate) depth: u32,
+}
+
+/// Peels a maximal chain of constant-parameter `Add`, `Sub`, `Neg`, `Not` (`-1 - v`), and
+/// odd-constant `Mul` layers at width `W >= 2` into `scale * inner + offset (mod 2^W)`.
+pub(crate) fn peel_mod_affine(cx: &Context, n: u32) -> Option<ModAffine> {
+    let w = cx.width_of(n);
+    if w.bits() < 2 {
+        return None;
+    }
+    let mut cur = n;
+    let mut scale = BitVec::one(w);
+    let mut offset = BitVec::zero(w);
+    let mut depth = 0u32;
+    while depth < 32 && cx.const_val(cur).is_none() {
+        let node = cx.node(cur);
+        if node.width != w.bits() {
+            break;
+        }
+        match node.op {
+            OpCode::Add => {
+                let (next, c) = if let Some(c) = cx.const_val(node.b) {
+                    (node.a, c)
+                } else if let Some(c) = cx.const_val(node.a) {
+                    (node.b, c)
+                } else {
+                    break;
+                };
+                let term = BitVec::bin_unchecked(BinOp::Mul, &scale, &c);
+                offset = BitVec::bin_unchecked(BinOp::Add, &offset, &term);
+                cur = next;
+                depth += 1;
+            }
+            OpCode::Sub => {
+                if let Some(c) = cx.const_val(node.b) {
+                    let term = BitVec::bin_unchecked(BinOp::Mul, &scale, &c);
+                    offset = BitVec::bin_unchecked(BinOp::Sub, &offset, &term);
+                    cur = node.a;
+                    depth += 1;
+                } else if let Some(c) = cx.const_val(node.a) {
+                    let term = BitVec::bin_unchecked(BinOp::Mul, &scale, &c);
+                    offset = BitVec::bin_unchecked(BinOp::Add, &offset, &term);
+                    scale = BitVec::un_unchecked(UnOp::Neg, &scale);
+                    cur = node.b;
+                    depth += 1;
+                } else {
+                    break;
+                }
+            }
+            OpCode::Neg => {
+                scale = BitVec::un_unchecked(UnOp::Neg, &scale);
+                cur = node.a;
+                depth += 1;
+            }
+            OpCode::Not => {
+                offset = BitVec::bin_unchecked(BinOp::Sub, &offset, &scale);
+                scale = BitVec::un_unchecked(UnOp::Neg, &scale);
+                cur = node.a;
+                depth += 1;
+            }
+            OpCode::Mul => {
+                let (next, c) = if let Some(c) = cx.const_val(node.b) {
+                    (node.a, c)
+                } else if let Some(c) = cx.const_val(node.a) {
+                    (node.b, c)
+                } else {
+                    break;
+                };
+                if c.bit(0) != Some(true) {
+                    break;
+                }
+                scale = BitVec::bin_unchecked(BinOp::Mul, &scale, &c);
+                cur = next;
+                depth += 1;
+            }
+            _ => break,
+        }
+    }
+    (depth > 0).then_some(ModAffine {
+        inner: cur,
+        scale,
+        offset,
+        depth,
+    })
+}
+
+/// Single-dominator injective GF(2)-affine decomposition `rows · inner ⊕ konst`.
+pub(crate) struct Gf2Side {
+    pub(crate) inner: u32,
+    pub(crate) rows: gf2::Rows,
+    pub(crate) konst: BitVec,
+}
+
+fn gf2_root_op(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::Xor
+            | OpCode::Not
+            | OpCode::And
+            | OpCode::Or
+            | OpCode::Shl
+            | OpCode::LShr
+            | OpCode::AShr
+            | OpCode::RotL
+            | OpCode::RotR
+            | OpCode::Bswap
+            | OpCode::BitRev
+            | OpCode::Extract
+            | OpCode::Zext
+            | OpCode::Sext
+            | OpCode::Concat
+    )
+}
+
+/// Collects injective single-dominator GF(2)-affine representations of `n` (`1..=512` bits).
+pub(crate) fn peel_gf2_injective<O: Oracle>(
+    cx: &Context,
+    o: &mut O,
+    n: u32,
+) -> Result<Option<Vec<Gf2Side>>, O::Err> {
+    let node = cx.node(n);
+    if node.width == 0 || node.width > gf2::MAX_BITS || !gf2_root_op(node.op) {
+        return Ok(None);
+    }
+    let (cands, work) = candidates(cx, n, &|c| cx.const_val(c).is_none());
+    o.charge(work)?;
+    let mut out = Vec::new();
+    for (d, nodes) in cands {
+        let wd = cx.wid(d);
+        if wd == 0 || wd > gf2::MAX_BITS || wd > node.width {
+            continue;
+        }
+        o.charge(nodes.len() as u64 * 2 + 1)?;
+        if let Some(aff) = gf2::affine(cx, &[d], &nodes)
+            && let Some(Some(rows)) = aff.mats.into_iter().next()
+            && gf2::full_rank(&rows, u32::from(wd))
+        {
+            out.push(Gf2Side {
+                inner: d,
+                rows,
+                konst: aff.konst,
+            });
+        }
+    }
+    Ok((!out.is_empty()).then_some(out))
+}
+
+/// If `n1` and `n2` are one injective layer (syntactic or semantically identical affine / GF(2)
+/// bijection) applied to different operands, those operands: `n1 == n2` holds iff they are equal.
 pub(crate) fn cancel_layer<O: Oracle>(
     cx: &mut Context,
     o: &mut O,
@@ -1222,67 +1375,96 @@ pub(crate) fn cancel_layer<O: Oracle>(
     n2: u32,
 ) -> Result<Option<(u32, u32)>, O::Err> {
     let (a, b) = (cx.node(n1), cx.node(n2));
-    if a.op != b.op || a.width != b.width || a.aux != b.aux || n1 == n2 {
+    if a.width != b.width || n1 == n2 {
         return Ok(None);
     }
-    let (ka, kb): (Vec<u32>, Vec<u32>) = (a.children().collect(), b.children().collect());
-    if ka.len() != kb.len() || ka.is_empty() {
-        return Ok(None);
-    }
-    // Pairings of positions: the direct one, and for a commutative operator the swapped one.
-    let swappable = a.op.as_bin().is_some_and(BinOp::is_commutative)
-        || (a.op.as_ext().is_some()
-            && ka.len() >= 2
-            && cx
-                .registry
-                .as_deref()
-                .and_then(|r| r.op_at(a.aux))
-                .is_some_and(|op| op.traits().commutative));
-    let mut pairings = vec![(0..ka.len()).collect::<Vec<usize>>()];
-    if swappable {
-        let mut s: Vec<usize> = (0..ka.len()).collect();
-        s.swap(0, 1);
-        pairings.push(s);
-    }
-    for pairing in &pairings {
-        // Positions where the operands differ (the rest must be shared parameters).
-        let diff: Vec<usize> = (0..ka.len()).filter(|&p| ka[p] != kb[pairing[p]]).collect();
-        let [p] = diff[..] else {
-            continue;
-        };
-        let (x, y) = (ka[p], kb[pairing[p]]);
-        if cx.wid(x) != cx.wid(y) {
-            continue;
-        }
-        if let Some((_, _, cond)) = primitive(cx, n1, p) {
-            if let Some(k) = cond
-                && !odd(cx, o, k)?
-            {
-                continue;
+    if a.op == b.op && a.aux == b.aux {
+        let (ka, kb): (Vec<u32>, Vec<u32>) = (a.children().collect(), b.children().collect());
+        if ka.len() == kb.len() && !ka.is_empty() {
+            // Pairings of positions: the direct one, and for a commutative operator the swapped one.
+            let swappable = a.op.as_bin().is_some_and(BinOp::is_commutative)
+                || (a.op.as_ext().is_some()
+                    && ka.len() >= 2
+                    && cx
+                        .registry
+                        .as_deref()
+                        .and_then(|r| r.op_at(a.aux))
+                        .is_some_and(|op| op.traits().commutative));
+            let mut pairings = vec![(0..ka.len()).collect::<Vec<usize>>()];
+            if swappable {
+                let mut s: Vec<usize> = (0..ka.len()).collect();
+                s.swap(0, 1);
+                pairings.push(s);
             }
-            // A primitive layer's map depends only on the operator and the shared operands;
-            // for a swapped pairing the operator is commutative, so the map is the same.
-            return Ok(Some((x, y)));
-        }
-        if a.op.as_ext().is_some() && pairing[p] == p && ext_kind(cx, o, n1, p)?.is_some() {
-            return Ok(Some((x, y)));
+            for pairing in &pairings {
+                // Positions where the operands differ (the rest must be shared parameters).
+                let diff: Vec<usize> = (0..ka.len()).filter(|&p| ka[p] != kb[pairing[p]]).collect();
+                let [p] = diff[..] else {
+                    continue;
+                };
+                let (x, y) = (ka[p], kb[pairing[p]]);
+                if cx.wid(x) != cx.wid(y) {
+                    continue;
+                }
+                if let Some((_, _, cond)) = primitive(cx, n1, p) {
+                    if let Some(k) = cond
+                        && !odd(cx, o, k)?
+                    {
+                        continue;
+                    }
+                    // A primitive layer's map depends only on the operator and the shared operands;
+                    // for a swapped pairing the operator is commutative, so the map is the same.
+                    return Ok(Some((x, y)));
+                }
+                if a.op.as_ext().is_some() && pairing[p] == p && ext_kind(cx, o, n1, p)?.is_some() {
+                    return Ok(Some((x, y)));
+                }
+            }
+            // Deepest pair of different subterms the sides are one syntactic function of.
+            let (found, steps) = anti_unify(cx, n1, n2);
+            o.charge(u64::from(steps))?;
+            if let Some(Unified { v1, map }) = found {
+                let (cands, work) =
+                    candidates(cx, n1, &|c| c == v1 || map.get(&c).is_some_and(|&p| p != c));
+                o.charge(work)?;
+                for (d1, nodes) in cands {
+                    let Some(&d2) = map.get(&d1) else {
+                        continue;
+                    };
+                    if cx.wid(d1) == cx.wid(d2) && recover(cx, o, n1, d1, &nodes)?.is_some() {
+                        return Ok(Some((d1, d2)));
+                    }
+                }
+            }
         }
     }
-    // Otherwise the deepest pair of different subterms the sides are one function of, and the
-    // nearest node above it (on side one) every path to it passes through: a region.
-    let (found, steps) = anti_unify(cx, n1, n2);
-    o.charge(u64::from(steps))?;
-    let Some(Unified { v1, map }) = found else {
-        return Ok(None);
-    };
-    let (cands, work) = candidates(cx, n1, &|c| c == v1 || map.get(&c).is_some_and(|&p| p != c));
-    o.charge(work)?;
-    for (d1, nodes) in cands {
-        let Some(&d2) = map.get(&d1) else {
-            continue;
-        };
-        if cx.wid(d1) == cx.wid(d2) && recover(cx, o, n1, d1, &nodes)?.is_some() {
-            return Ok(Some((d1, d2)));
+    // Semantically identical modular-affine outer bijections (e.g. `(a + 1) * 3` vs `b * 3 + 3`,
+    // `~(a * 5)` vs `-1 - b * 5`).
+    if let (Some(ma), Some(mb)) = (peel_mod_affine(cx, n1), peel_mod_affine(cx, n2))
+        && ma.scale == mb.scale
+        && ma.offset == mb.offset
+        && ma.inner != mb.inner
+    {
+        o.charge(u64::from(ma.depth + mb.depth))?;
+        return Ok(Some((ma.inner, mb.inner)));
+    }
+    // Semantically identical injective GF(2)-affine maps across widths `1..=512`
+    // (e.g. `a ^ rotl(a, 2) ^ rotl(a, 13)` vs `rotl(b ^ rotl(b, 11), 2) ^ b`, or
+    // `bswap(rotl(a, 8))` vs `rotr(bswap(b), 8)`).
+    if let (Some(ga), Some(gb)) = (
+        peel_gf2_injective(cx, o, n1)?,
+        peel_gf2_injective(cx, o, n2)?,
+    ) {
+        for g1 in ga.iter().rev() {
+            for g2 in gb.iter().rev() {
+                if cx.wid(g1.inner) == cx.wid(g2.inner)
+                    && g1.inner != g2.inner
+                    && g1.konst == g2.konst
+                    && g1.rows == g2.rows
+                {
+                    return Ok(Some((g1.inner, g2.inner)));
+                }
+            }
         }
     }
     Ok(None)

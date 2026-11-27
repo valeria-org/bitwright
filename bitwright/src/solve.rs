@@ -248,6 +248,21 @@ pub enum Status {
     Unknown(Unknown),
 }
 
+/// Distinct values an expression can take under a [`Solver`]'s assertions
+/// ([`Solver::enumerate_values`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Values {
+    /// Every value the expression can take under the assertions, in ascending unsigned order
+    /// (empty when the assertions are [`Status::Unsat`]).
+    Exact(Vec<BitVec>),
+    /// At least these `limit` distinct values exist (in ascending unsigned order); at least one
+    /// further value was still possible or undecided when the count limit was reached.
+    AtLeast(Vec<BitVec>),
+    /// Fewer than `limit` values had been found when a search stopped undecided.
+    Unknown(Unknown),
+}
+
 /// What decided a check: of what its slices needed, the last in this order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
@@ -798,7 +813,9 @@ impl Solver {
         // On the way to the prover (not before: rewriting an assertion each time a new
         // definition arrives would cost the kept circuit what it kept), the definitions are
         // solved and what is left is asked.
-        let (mut left, mut trail) = if self.cfg.solve_equations && es.len() > 1 {
+        let has_conjuncts = es.len() > 1
+            || (es.len() == 1 && matches!(cx.view(es[0])?, crate::View::Bin(BinOp::And, ..)));
+        let (mut left, mut trail) = if self.cfg.solve_equations && has_conjuncts {
             solve_equations(cx, es)?
         } else {
             (es.to_vec(), Vec::new())
@@ -1042,6 +1059,93 @@ impl Solver {
             return Ok(None);
         };
         Ok(Some(eval_in(cx, &[e], m)?.remove(0)))
+    }
+
+    /// Enumerates up to `limit` distinct values `expr` can take under the current assertions
+    /// (for recovering indirect jump targets, dispatch tables, or state-machine transitions).
+    ///
+    /// Returns [`Values::Exact`] (sorted ascending) when all reachable values are exhausted within
+    /// `limit`, [`Values::AtLeast`] when `limit` distinct values are confirmed and more may exist,
+    /// or [`Values::Unknown`] if a check stops undecided before reaching `limit`. Leaves the
+    /// assertion stack unchanged.
+    pub fn enumerate_values(
+        &mut self,
+        cx: &mut Context,
+        expr: Expr,
+        limit: usize,
+    ) -> Result<Values, Error> {
+        self.enumerate_values_within(cx, expr, limit, &[], None)
+    }
+
+    /// [`enumerate_values`](Self::enumerate_values) under temporary 1-bit `assumptions` and an
+    /// optional `deadline`.
+    pub fn enumerate_values_within(
+        &mut self,
+        cx: &mut Context,
+        expr: Expr,
+        limit: usize,
+        assumptions: &[Expr],
+        deadline: Option<Deadline<'_>>,
+    ) -> Result<Values, Error> {
+        let _w = cx.width(expr)?;
+        for &a in assumptions {
+            if cx.width(a)? != Width::W1 {
+                return Err(Error::Unsupported("an assumption must be 1 bit".into()));
+            }
+        }
+        if limit == 0 {
+            return Ok(match self.check_within(cx, assumptions, deadline)? {
+                Status::Unsat => Values::Exact(Vec::new()),
+                Status::Sat => Values::AtLeast(Vec::new()),
+                Status::Unknown(why) => Values::Unknown(why),
+            });
+        }
+        if let Some(c) = cx.as_const(expr)? {
+            return Ok(match self.check_within(cx, assumptions, deadline)? {
+                Status::Unsat => Values::Exact(Vec::new()),
+                Status::Sat => Values::Exact(vec![c]),
+                Status::Unknown(why) => Values::Unknown(why),
+            });
+        }
+        self.push();
+        let res = (|| -> Result<Values, Error> {
+            for &a in assumptions {
+                self.assert(cx, a)?;
+            }
+            let mut found: Vec<BitVec> = Vec::new();
+            loop {
+                match self.check_within(cx, &[], deadline)? {
+                    Status::Unsat => {
+                        found.sort();
+                        return Ok(Values::Exact(found));
+                    }
+                    Status::Unknown(why) => {
+                        if found.len() >= limit {
+                            found.sort();
+                            return Ok(Values::AtLeast(found));
+                        }
+                        return Ok(Values::Unknown(why));
+                    }
+                    Status::Sat => {
+                        if found.len() >= limit {
+                            found.sort();
+                            return Ok(Values::AtLeast(found));
+                        }
+                        let Some(v) = self.value(cx, expr)? else {
+                            return Ok(Values::Unknown(Unknown::Unsupported(
+                                "missing model value".into(),
+                            )));
+                        };
+                        found.push(v);
+                        let k = cx.constant(&v)?;
+                        let ne = cx.cmp(crate::CmpOpExt::Ne, expr, k)?;
+                        self.assert(cx, ne)?;
+                    }
+                }
+            }
+        })();
+        let _ = self.pop(1);
+        res
     }
 
     /// After a check answered [`Status::Unsat`]: assertions and assumptions of that check that
@@ -1591,11 +1695,10 @@ fn eliminate_unconstrained(
 /// solved for with what it equals.
 type Solved = (Vec<Expr>, Vec<(crate::SymbolKey, Expr)>);
 
-/// Solves the assertions that define a symbol and substitutes the solutions into the others:
-/// what is left of them (in order), and each symbol solved for with what it equals (over
-/// symbols not solved for). The assertions given hold together exactly when those left do,
-/// and a model of those extends to one of all by giving each solved symbol the value of what
-/// it equals.
+/// Solves the assertions that define a symbol (including through bijective arithmetic/bitwise
+/// spines, xorshifts, extensions, and split-register concatenations) and substitutes the
+/// solutions into the others: what is left of them (in order), and each symbol solved for with
+/// what it equals (over symbols not solved for).
 fn solve_equations(cx: &mut Context, es: &[Expr]) -> Result<Solved, Error> {
     struct Solution {
         key: crate::SymbolKey,
@@ -1603,57 +1706,154 @@ fn solve_equations(cx: &mut Context, es: &[Expr]) -> Result<Solved, Error> {
         /// The symbols `equals` reads.
         reads: Vec<SymbolId>,
     }
+    let mut flat: Vec<Expr> = Vec::with_capacity(es.len());
+    let mut stack: Vec<Expr> = es.iter().rev().copied().collect();
+    while let Some(e) = stack.pop() {
+        match cx.view(e)? {
+            crate::View::Bin(BinOp::And, a, b) => stack.extend([b, a]),
+            _ => flat.push(e),
+        }
+    }
+
     let mut solutions: Vec<Solution> = Vec::new();
     let mut map: Vec<(Expr, Expr)> = Vec::new();
-    let mut kept: Vec<Expr> = Vec::new();
-    for &e in es {
-        // Under the solutions so far, which read no solved symbol: neither does `now`.
-        let now = if map.is_empty() {
-            e
-        } else {
-            cx.substitute(&[e], &map)?[0]
-        };
-        let definition = if solutions.len() < SOLVED_SYMBOLS {
-            definition(cx, now)?
-        } else {
-            None
-        };
-        let Some((symbol, id, equals, reads)) = definition else {
-            kept.push(e);
-            continue;
-        };
-        let Some(key) = cx.symbol_key(id).cloned() else {
-            kept.push(e);
-            continue;
-        };
-        // The earlier solutions that read the symbol now read what it equals.
-        for (k, s) in solutions.iter_mut().enumerate() {
-            if s.reads.contains(&id) {
-                s.equals = cx.substitute(&[s.equals], &[(symbol, equals)])?[0];
-                s.reads = cx.symbols_in(&[s.equals])?;
-                map[k].1 = s.equals;
-            }
+    let mut current = flat;
+
+    for _round in 0..4 {
+        if solutions.len() >= SOLVED_SYMBOLS || current.is_empty() {
+            break;
         }
-        map.push((symbol, equals));
-        solutions.push(Solution { key, equals, reads });
-    }
-    if !map.is_empty() {
-        kept = cx.substitute(&kept, &map)?;
+        let prev_solved = solutions.len();
+        let mut kept: Vec<Expr> = Vec::with_capacity(current.len());
+        let mut queue: std::collections::VecDeque<Expr> = current.into_iter().collect();
+
+        while let Some(e) = queue.pop_front() {
+            let now = if map.is_empty() {
+                e
+            } else {
+                cx.substitute(&[e], &map)?[0]
+            };
+            if cx.as_const(now)? == Some(BitVec::from_bool(true)) {
+                continue;
+            }
+            if solutions.len() >= SOLVED_SYMBOLS {
+                kept.push(now);
+                continue;
+            }
+            // Split `concat(hi, lo) == rhs` into two slice equations so split-register pairs
+            // (`edx:eax`, `x0_hi:w0`) expose both halves to isolation.
+            if let Some((eq_hi, eq_lo)) = split_concat_eq(cx, now)? {
+                queue.push_front(eq_lo);
+                queue.push_front(eq_hi);
+                continue;
+            }
+            let Some((symbol, id, equals, reads, guard)) = definition(cx, now)? else {
+                kept.push(now);
+                continue;
+            };
+            let Some(key) = cx.symbol_key(id).cloned() else {
+                kept.push(now);
+                continue;
+            };
+            if let Some(g) = guard {
+                queue.push_front(g);
+            }
+            for (k, s) in solutions.iter_mut().enumerate() {
+                if s.reads.contains(&id) {
+                    s.equals = cx.substitute(&[s.equals], &[(symbol, equals)])?[0];
+                    s.reads = cx.symbols_in(&[s.equals])?;
+                    map[k].1 = s.equals;
+                }
+            }
+            map.push((symbol, equals));
+            solutions.push(Solution { key, equals, reads });
+        }
+        current = if map.is_empty() {
+            kept
+        } else {
+            cx.substitute(&kept, &map)?
+        };
+        if solutions.len() == prev_solved {
+            break;
+        }
     }
     Ok((
-        kept,
+        current,
         solutions.into_iter().map(|s| (s.key, s.equals)).collect(),
     ))
 }
 
-/// A symbol `p` defines and what it defines it as: `x == t` with `x` a symbol `t` does not
-/// read and nothing was declared of ([`Context::declare_known`]), or a 1-bit symbol asserted
-/// or denied. With the symbol's id and the symbols `t` reads.
-#[allow(clippy::type_complexity)]
-fn definition(
+fn split_concat_eq(cx: &mut Context, p: Expr) -> Result<Option<(Expr, Expr)>, Error> {
+    use crate::View;
+    let View::Cmp(crate::CmpOp::Eq, a, b) = cx.view(p)? else {
+        return Ok(None);
+    };
+    for (lhs, rhs) in [(a, b), (b, a)] {
+        if let View::Concat { hi, lo } = cx.view(lhs)? {
+            let (whi, wlo) = (cx.width(hi)?, cx.width(lo)?);
+            let rhs_lo = cx.extract(rhs, 0, wlo)?;
+            let rhs_hi = cx.extract(rhs, wlo.bits(), whi)?;
+            return Ok(Some((
+                cx.cmp(crate::CmpOpExt::Eq, hi, rhs_hi)?,
+                cx.cmp(crate::CmpOpExt::Eq, lo, rhs_lo)?,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// If `e` is a self-xorshift `u ^ (u >>u s)` or `u ^ (u << s)` (`1 <= s < W`), returns
+/// `(u, is_left, s)`.
+fn peel_xorshift(cx: &Context, e: Expr) -> Result<Option<(Expr, bool, u32)>, Error> {
+    use crate::View;
+    let w = u32::from(cx.width(e)?.bits());
+    let View::Bin(BinOp::Xor, a, b) = cx.view(e)? else {
+        return Ok(None);
+    };
+    for (u, shifted) in [(a, b), (b, a)] {
+        match cx.view(shifted)? {
+            View::Bin(op @ (BinOp::LShr | BinOp::Shl), src, cnt) if src == u => {
+                if let Some(cv) = cx.as_const(cnt)?
+                    && let Some(s) = cv.to_u64()
+                    && s > 0
+                    && s < u64::from(w)
+                {
+                    return Ok(Some((u, op == BinOp::Shl, s as u32)));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn invert_xorshift_expr(
     cx: &mut Context,
-    p: Expr,
-) -> Result<Option<(Expr, SymbolId, Expr, Vec<SymbolId>)>, Error> {
+    mut v: Expr,
+    is_left: bool,
+    mut step: u32,
+) -> Result<Expr, Error> {
+    let w = cx.width(v)?;
+    let wb = u32::from(w.bits());
+    let op = if is_left { BinOp::Shl } else { BinOp::LShr };
+    while step < wb {
+        let c = cx.constant_u64(w, u64::from(step))?;
+        let sh = cx.bin(op, v, c)?;
+        v = cx.bin(BinOp::Xor, v, sh)?;
+        step = step.saturating_mul(2);
+    }
+    Ok(v)
+}
+
+/// Attempts to isolate a free unconstrained symbol `x` from `lhs == rhs` by peeling bijective
+/// layers (and at most one outer `Zext`/`Sext`, emitting the corresponding range guard) around a
+/// single occurrence of `x`.
+#[allow(clippy::type_complexity)]
+fn isolate_from_eq(
+    cx: &mut Context,
+    mut lhs: Expr,
+    mut rhs: Expr,
+) -> Result<Option<(Expr, SymbolId, Expr, Vec<SymbolId>, Option<Expr>)>, Error> {
     use crate::View;
     let free = |cx: &Context, e: Expr| -> Result<Option<SymbolId>, Error> {
         Ok(match cx.view(e)? {
@@ -1661,18 +1861,140 @@ fn definition(
             _ => None,
         })
     };
-    let candidates: Vec<(Expr, Expr)> = match cx.view(p)? {
-        View::Cmp(crate::CmpOp::Eq, a, b) => vec![(a, b), (b, a)],
-        View::Sym(_) => vec![(p, cx.bool(true)?)],
-        View::Un(UnOp::Not, a) => vec![(a, cx.bool(false)?)],
-        _ => Vec::new(),
-    };
-    for (x, t) in candidates {
-        let Some(id) = free(cx, x)? else { continue };
-        let reads = cx.symbols_in(&[t])?;
-        if !reads.contains(&id) {
-            return Ok(Some((x, id, t, reads)));
+    let mut guard: Option<Expr> = None;
+    for _depth in 0..24 {
+        if let Some(id) = free(cx, lhs)? {
+            let mut reads = cx.symbols_in(&[rhs])?;
+            if let Some(g) = guard {
+                for gs in cx.symbols_in(&[g])? {
+                    if !reads.contains(&gs) {
+                        reads.push(gs);
+                    }
+                }
+            }
+            if !reads.contains(&id) {
+                return Ok(Some((lhs, id, rhs, reads, guard)));
+            }
+            return Ok(None);
         }
+        if let Some((u, is_left, step)) = peel_xorshift(cx, lhs)? {
+            rhs = invert_xorshift_expr(cx, rhs, is_left, step)?;
+            lhs = u;
+            continue;
+        }
+        match cx.view(lhs)? {
+            View::Un(op @ (UnOp::Not | UnOp::Neg | UnOp::Bswap | UnOp::BitRev), u) => {
+                rhs = cx.un(op, rhs)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::Add, a, b) => {
+                // Pick the side that still contains a free symbol; try `a` first unless `a` has
+                // no symbols or `b` is a direct free symbol.
+                let prefer_b = free(cx, b)?.is_some() || cx.symbols_in(&[a])?.is_empty();
+                let (u, other) = if prefer_b { (b, a) } else { (a, b) };
+                rhs = cx.bin(BinOp::Sub, rhs, other)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::Sub, a, b) => {
+                let prefer_b = free(cx, b)?.is_some() || cx.symbols_in(&[a])?.is_empty();
+                if prefer_b {
+                    rhs = cx.bin(BinOp::Sub, a, rhs)?;
+                    lhs = b;
+                } else {
+                    rhs = cx.bin(BinOp::Add, rhs, b)?;
+                    lhs = a;
+                }
+            }
+            View::Bin(BinOp::Xor, a, b) => {
+                let prefer_b = free(cx, b)?.is_some() || cx.symbols_in(&[a])?.is_empty();
+                let (u, other) = if prefer_b { (b, a) } else { (a, b) };
+                rhs = cx.bin(BinOp::Xor, rhs, other)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::Mul, a, b) => {
+                let (u, c) = match (cx.as_const(a)?, cx.as_const(b)?) {
+                    (None, Some(c)) => (a, c),
+                    (Some(c), None) => (b, c),
+                    _ => return Ok(None),
+                };
+                let Some(inv) = odd_inverse(&c) else {
+                    return Ok(None);
+                };
+                let inv_e = cx.constant(&inv)?;
+                rhs = cx.bin(BinOp::Mul, rhs, inv_e)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::RotL, u, cnt) => {
+                rhs = cx.bin(BinOp::RotR, rhs, cnt)?;
+                lhs = u;
+            }
+            View::Bin(BinOp::RotR, u, cnt) => {
+                rhs = cx.bin(BinOp::RotL, rhs, cnt)?;
+                lhs = u;
+            }
+            View::Zext(u) if guard.is_none() => {
+                let (w_out, w_in) = (cx.width(lhs)?, cx.width(u)?);
+                let hi_w = Width::new(w_out.bits() - w_in.bits())?;
+                let hi = cx.extract(rhs, w_in.bits(), hi_w)?;
+                let zero = cx.zero(hi_w)?;
+                guard = Some(cx.cmp(crate::CmpOpExt::Eq, hi, zero)?);
+                rhs = cx.extract(rhs, 0, w_in)?;
+                lhs = u;
+            }
+            View::Sext(u) if guard.is_none() => {
+                let (w_out, w_in) = (cx.width(lhs)?, cx.width(u)?);
+                let lo = cx.extract(rhs, 0, w_in)?;
+                let back = cx.sext(lo, w_out)?;
+                guard = Some(cx.cmp(crate::CmpOpExt::Eq, back, rhs)?);
+                rhs = lo;
+                lhs = u;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// A symbol `p` defines and what it defines it as, with any side guard required by narrowing an
+/// injective extension (`zext`/`sext`).
+#[allow(clippy::type_complexity)]
+fn definition(
+    cx: &mut Context,
+    p: Expr,
+) -> Result<Option<(Expr, SymbolId, Expr, Vec<SymbolId>, Option<Expr>)>, Error> {
+    use crate::View;
+    let free = |cx: &Context, e: Expr| -> Result<Option<SymbolId>, Error> {
+        Ok(match cx.view(e)? {
+            View::Sym(id) if cx.declared_known(e)?.is_none() => Some(id),
+            _ => None,
+        })
+    };
+    match cx.view(p)? {
+        View::Sym(_) => {
+            if let Some(id) = free(cx, p)? {
+                return Ok(Some((p, id, cx.bool(true)?, Vec::new(), None)));
+            }
+        }
+        View::Un(UnOp::Not, a) => {
+            if let Some(id) = free(cx, a)? {
+                return Ok(Some((a, id, cx.bool(false)?, Vec::new(), None)));
+            }
+            if let View::Cmp(crate::CmpOp::Ne, l, r) = cx.view(a)? {
+                for (lhs, rhs) in [(l, r), (r, l)] {
+                    if let Some(sol) = isolate_from_eq(cx, lhs, rhs)? {
+                        return Ok(Some(sol));
+                    }
+                }
+            }
+        }
+        View::Cmp(crate::CmpOp::Eq, a, b) => {
+            for (lhs, rhs) in [(a, b), (b, a)] {
+                if let Some(sol) = isolate_from_eq(cx, lhs, rhs)? {
+                    return Ok(Some(sol));
+                }
+            }
+        }
+        _ => {}
     }
     Ok(None)
 }
@@ -2978,5 +3300,154 @@ mod tests {
         s.assert(&cx, hard.unwrap()).unwrap();
         assert!(matches!(s.check(&mut cx).unwrap(), Status::Unknown(_)));
         assert!(s.model().is_none() && s.decided_by().is_none());
+    }
+
+    #[test]
+    fn bijective_and_split_register_equation_isolation() {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        // Zero SAT conflicts allowed: `solve_equations` + word-level simplifier must eliminate
+        // the entire CFF / handler chain before any SAT branching.
+        let zero_sat = Config::default()
+            .with_probes(0)
+            .with_quick(None)
+            .with_prove(
+                prove::Config::default()
+                    .with_max_conflicts(0)
+                    .with_samples(0),
+            );
+
+        // 1. Unsatisfiable 5-step obfuscated state chain ending in an MBA contradiction.
+        let mut s = Solver::new(zero_sat.clone());
+        let assertions = [
+            cx.parse("s1 ^ 0x5bd1e995 == s0 + 0x100", &o).unwrap(),
+            cx.parse("(s2 + 0x1337) * 0x9e3779b97f4a7c15 == rotl(s1, 13)", &o)
+                .unwrap(),
+            cx.parse("s3 ^ (s3 >>u 29) == bswap(s2)", &o).unwrap(),
+            cx.parse("rotl(s4, 19) == s3 - 77", &o).unwrap(),
+            cx.parse("(s4 ^ y) + 2 * (s4 & y) != s4 + y", &o).unwrap(),
+        ];
+        for &a in &assertions {
+            s.assert(&cx, a).unwrap();
+        }
+        assert_eq!(s.check(&mut cx).unwrap(), Status::Unsat);
+
+        // 2. Satisfiable chain reconstructs exact model values for every eliminated state symbol.
+        let mut s_sat = Solver::new(
+            Config::default()
+                .with_probes(0)
+                .with_quick(None)
+                .with_prove(prove::Config::default().with_max_conflicts(64)),
+        );
+        let sat_assertions = [
+            cx.parse("s0 == 0x123456789abcdef0", &o).unwrap(),
+            assertions[0],
+            assertions[1],
+            assertions[2],
+            assertions[3],
+        ];
+        for &a in &sat_assertions {
+            s_sat.assert(&cx, a).unwrap();
+        }
+        assert_eq!(s_sat.check(&mut cx).unwrap(), Status::Sat);
+        assert!(holds(&mut cx, &sat_assertions, s_sat.model().unwrap()).unwrap());
+
+        // 3. Split-register `concat(edx, eax) == prod` and `zext<64>(w0) == val`.
+        let edx = cx.symbol("edx", Width::W32).unwrap();
+        let eax = cx.symbol("eax", Width::W32).unwrap();
+        let w0 = cx.symbol("w0", Width::W32).unwrap();
+        let pair = cx.concat(edx, eax).unwrap();
+        let full = cx.constant_u64(Width::W64, 0xdead_beef_cafe_babe).unwrap();
+        let eq_pair = cx.cmp(crate::CmpOpExt::Eq, pair, full).unwrap();
+        let zw0 = cx.zext(w0, Width::W64).unwrap();
+        let small_64 = cx.constant_u64(Width::W64, 0x0000_0000_1122_3344).unwrap();
+        let eq_zext_ok = cx.cmp(crate::CmpOpExt::Eq, zw0, small_64).unwrap();
+
+        let mut s_split = Solver::new(
+            Config::default()
+                .with_probes(0)
+                .with_quick(None)
+                .with_prove(prove::Config::default().with_max_conflicts(16)),
+        );
+        s_split.assert(&cx, eq_pair).unwrap();
+        s_split.assert(&cx, eq_zext_ok).unwrap();
+        assert_eq!(s_split.check(&mut cx).unwrap(), Status::Sat);
+        assert_eq!(
+            s_split.value(&mut cx, edx).unwrap().unwrap().to_u64(),
+            Some(0xdead_beef)
+        );
+        assert_eq!(
+            s_split.value(&mut cx, eax).unwrap().unwrap().to_u64(),
+            Some(0xcafe_babe)
+        );
+        assert_eq!(
+            s_split.value(&mut cx, w0).unwrap().unwrap().to_u64(),
+            Some(0x1122_3344)
+        );
+
+        // `zext<64>(w0) == 0x1_0000_0005` has non-zero upper 32 bits -> `Unsat` at 0 conflicts.
+        let bad_64 = cx.constant_u64(Width::W64, 0x0000_0001_0000_0005).unwrap();
+        let eq_zext_bad = cx.cmp(crate::CmpOpExt::Eq, zw0, bad_64).unwrap();
+        let c1 = cx
+            .parse("w0 != 0", &ParseOptions::width(Width::W32))
+            .unwrap();
+        let mut s_bad = Solver::new(zero_sat);
+        s_bad.assert(&cx, eq_zext_bad).unwrap();
+        s_bad.assert(&cx, c1).unwrap();
+        assert_eq!(s_bad.check(&mut cx).unwrap(), Status::Unsat);
+    }
+
+    #[test]
+    fn enumerate_values_recovers_jump_tables_and_handles_limits() {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        // Obfuscated 4-way jump table: `0x401000 + ((idx + 2) * 16)` with `idx = tag & 3`
+        // disguised via MBA `(idx ^ 2) + 2 * (idx & 2)`.
+        let target = cx
+            .parse(
+                "let idx = tag & 3; 0x401000 + ((idx ^ 2) + 2 * (idx & 2)) * 16",
+                &o,
+            )
+            .unwrap();
+        let expected: Vec<BitVec> = [0x401020u64, 0x401030, 0x401040, 0x401050]
+            .into_iter()
+            .map(|v| BitVec::wrapping_from_u64(Width::W64, v))
+            .collect();
+
+        let mut s = Solver::default();
+        assert_eq!(
+            s.enumerate_values(&mut cx, target, 8).unwrap(),
+            Values::Exact(expected.clone())
+        );
+        // Exact boundary `limit == 4` still proves exhaustion (`Exact`) on the 5th check.
+        assert_eq!(
+            s.enumerate_values(&mut cx, target, 4).unwrap(),
+            Values::Exact(expected.clone())
+        );
+        // Below cardinality (`limit == 3`) reports `AtLeast` of 3 distinct values.
+        match s.enumerate_values(&mut cx, target, 3).unwrap() {
+            Values::AtLeast(vs) => {
+                assert_eq!(vs.len(), 3);
+                assert!(vs.iter().all(|v| expected.contains(v)));
+            }
+            other => panic!("expected AtLeast(3), got {other:?}"),
+        }
+
+        // Scoped path assumption `(tag & 3) <u 2` narrows to 2 targets and leaves stack clean.
+        let guard = cx.parse("(tag & 3) <u 2", &o).unwrap();
+        assert_eq!(
+            s.enumerate_values_within(&mut cx, target, 8, &[guard], None)
+                .unwrap(),
+            Values::Exact(expected[..2].to_vec())
+        );
+        assert!(s.assertions().is_empty() && s.depth() == 0);
+
+        // Infeasible assumption -> `Exact([])`.
+        let unsat_guard = cx.parse("(tag & 3) == 7", &o).unwrap();
+        assert_eq!(
+            s.enumerate_values_within(&mut cx, target, 8, &[unsat_guard], None)
+                .unwrap(),
+            Values::Exact(Vec::new())
+        );
     }
 }

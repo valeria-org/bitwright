@@ -1077,7 +1077,7 @@ fn gf2_maps_are_decided_by_rank() {
         let y: Vec<bool> = (0..w).map(|k| c.bit(k) != f0.bit(k)).collect();
         match gf2::solve(&rows, &y, u32::from(w)) {
             Some(Some(v)) => {
-                assert_eq!(eval(&mut cx, e, &[("x", val(w, v as u64))]), c);
+                assert_eq!(eval(&mut cx, e, &[("x", val(w, v[0]))]), c);
                 solved += 1;
             }
             Some(None) => {
@@ -1088,4 +1088,41 @@ fn gf2_maps_are_decided_by_rank() {
     }
     eprintln!("gf2: {yes} injective, {no} refuted, {solved} solved");
     assert!(yes > 50 && solved > 50, "{yes} {no} {solved}");
+}
+
+#[test]
+fn wide_gf2_bijection_and_preimage_up_to_512_bits() {
+    use crate::ParseOptions;
+    use crate::engine::Engine;
+    for &bits in &[160u16, 256, 384, 512] {
+        let w = Width::new(bits).unwrap();
+        let o = ParseOptions::width(w);
+        let mut cx = Context::new();
+        let s1 = bits / 3;
+        let s2 = bits / 5 + 7;
+        let r1 = bits / 7 + 3;
+        let src = format!(
+            "let y = x ^ (x >>u {s1}); let z = y ^ (y << {s2}); rotl(z, {r1}) ^ 0x13579bdf"
+        );
+        let e = cx.parse(&src, &o).unwrap();
+        let x = cx.parse("x", &o).unwrap();
+        assert_eq!(
+            cx.prove(Query::Bijective { e, of: x }).unwrap(),
+            Truth::True,
+            "width {bits}"
+        );
+        // Solve `e == target` at a concrete point and verify `e(preimage) == target`.
+        let mut limbs = [0u64; 8];
+        for (i, l) in limbs.iter_mut().enumerate() {
+            *l = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul((i as u64) + 1);
+        }
+        let secret = BitVec::wrapping_from_limbs(w, &limbs);
+        let target = eval(&mut cx, e, &[("x", secret)]);
+        let tc = cx.constant(&target).unwrap();
+        let eq = cx.cmp(crate::CmpOpExt::Eq, e, tc).unwrap();
+        let simp = Engine::standard().simplify(&mut cx, eq).unwrap().expr;
+        let sc = cx.constant(&secret).unwrap();
+        let want = cx.cmp(crate::CmpOpExt::Eq, x, sc).unwrap();
+        assert_eq!(simp, want, "width {bits}: {}", cx.display(simp));
+    }
 }

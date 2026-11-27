@@ -119,10 +119,10 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     }
                 }
             }
-            None => match cancel(cx, &mut o, op, node.a, node.b)? {
+            None => match cancel(cx, &mut o, op, n, node.a, node.b)? {
                 Some(e) => Some(e),
                 None => match (narrowed(cx, &mut o, node.a)?, narrowed(cx, &mut o, node.b)?) {
-                    (Some(a), Some(b)) => cancel(cx, &mut o, op, a, b)?,
+                    (Some(a), Some(b)) => cancel(cx, &mut o, op, n, a, b)?,
                     _ => None,
                 }
                 .filter(|&e| smaller(cx, e, n)),
@@ -546,12 +546,14 @@ fn relabelled(
     Ok((relabel(cx, o, a, &map)?, relabel(cx, o, b, &map)?))
 }
 
-/// `f(x) op f(y)` as `x op y`, through every common injective layer; then, when the sides are
+/// `f(x) op f(y)` as `x op y`, through every common injective layer; then semantic outer-affine /
+/// GF(2)-matrix reduction when it strictly shrinks the comparison tree; then, when the sides are
 /// `select` trees, their leaves peeled together through every common injective layer.
 fn cancel(
     cx: &mut Context,
     o: &mut Calls<'_, '_, '_>,
     op: CmpOp,
+    cmp_node: u32,
     a: u32,
     b: u32,
 ) -> Result<Option<u32>, Stop> {
@@ -561,6 +563,9 @@ fn cancel(
         o.charge(1)?;
         (x, y) = (p, q);
         peeled = true;
+    }
+    if let Some(sem) = cancel_semantic(cx, o, op, cmp_node, x, y)? {
+        return Ok(Some(sem));
     }
     if !peeled {
         while let Some((ls, true)) = leaves(cx, o, x, y)? {
@@ -575,6 +580,511 @@ fn cancel(
         return Ok(None);
     }
     Ok(Some(o.r.build(cx, |cx| cx.c_cmp(op, x, y))?))
+}
+
+/// Peels mismatched constant-parameter modular-affine bijections (`alpha_1 * d_1 + beta_1` vs
+/// `alpha_2 * d_2 + beta_2`) or full-rank GF(2) maps differing by a constant (`M·d_1 ⊕ c_1` vs
+/// `M·d_2 ⊕ c_2`), committing only when the comparison becomes a constant or strictly smaller tree.
+fn cancel_semantic(
+    cx: &mut Context,
+    o: &mut Calls<'_, '_, '_>,
+    op: CmpOp,
+    cmp_node: u32,
+    x: u32,
+    y: u32,
+) -> Result<Option<u32>, Stop> {
+    if x == y || cx.wid(x) != cx.wid(y) {
+        return Ok(None);
+    }
+    let w = cx.width_of(x);
+    if w.bits() >= 2 {
+        let ma = invert::peel_mod_affine(cx, x);
+        let mb = invert::peel_mod_affine(cx, y);
+        if ma.is_some() || mb.is_some() {
+            let id = |v: u32| invert::ModAffine {
+                inner: v,
+                scale: BitVec::one(w),
+                offset: BitVec::zero(w),
+                depth: 0,
+            };
+            let (m1, m2) = (ma.unwrap_or_else(|| id(x)), mb.unwrap_or_else(|| id(y)));
+            if m1.depth + m2.depth >= 2 && m1.inner != m2.inner {
+                o.charge(u64::from(m1.depth + m2.depth))?;
+                let mut best: Option<(u32, u32)> = None;
+                for (lhs, rhs) in [(&m1, &m2), (&m2, &m1)] {
+                    let Some(inv) = invert::mul_inverse(&lhs.scale) else {
+                        continue;
+                    };
+                    let gamma = BitVec::bin_unchecked(BinOp::Mul, &inv, &rhs.scale);
+                    let diff = BitVec::bin_unchecked(BinOp::Sub, &rhs.offset, &lhs.offset);
+                    let delta = BitVec::bin_unchecked(BinOp::Mul, &inv, &diff);
+                    let cand = o.r.build(cx, |cx| {
+                        let scaled = if gamma == BitVec::one(w) {
+                            rhs.inner
+                        } else if gamma.is_ones() {
+                            cx.c_un(crate::ops::UnOp::Neg, rhs.inner)?
+                        } else {
+                            let g = cx.mk_const(&gamma)?;
+                            cx.c_bin(BinOp::Mul, rhs.inner, g)?
+                        };
+                        let full_rhs = if delta.is_zero() {
+                            scaled
+                        } else {
+                            let d = cx.mk_const(&delta)?;
+                            cx.c_bin(BinOp::Add, scaled, d)?
+                        };
+                        cx.c_cmp(op, lhs.inner, full_rhs)
+                    })?;
+                    let sz = cx.tree_size(cx.handle(cand)).unwrap_or(u32::MAX);
+                    if best.is_none_or(|(_, bsz)| sz < bsz) {
+                        best = Some((cand, sz));
+                    }
+                }
+                if let Some((cand, _)) = best
+                    && smaller(cx, cand, cmp_node)
+                {
+                    return Ok(Some(cand));
+                }
+            }
+        }
+    }
+    if let (Some(ga), Some(gb)) = (
+        invert::peel_gf2_injective(cx, o, x)?,
+        invert::peel_gf2_injective(cx, o, y)?,
+    ) {
+        for g1 in ga.iter().rev() {
+            for g2 in gb.iter().rev() {
+                if cx.wid(g1.inner) != cx.wid(g2.inner) || g1.rows != g2.rows {
+                    continue;
+                }
+                let wd = cx.width_of(g1.inner);
+                if g1.konst == g2.konst {
+                    let cand = o.r.build(cx, |cx| cx.c_cmp(op, g1.inner, g2.inner))?;
+                    if smaller(cx, cand, cmp_node) {
+                        return Ok(Some(cand));
+                    }
+                    continue;
+                }
+                let rhs_bits: Vec<bool> = (0..g1.rows.len() as u16)
+                    .map(|k| g1.konst.bit(k) != g2.konst.bit(k))
+                    .collect();
+                match invert::gf2::solve(&g1.rows, &rhs_bits, u32::from(wd.bits())) {
+                    Some(None) => return Ok(Some(truth(o, cx, op == CmpOp::Ne)?)),
+                    Some(Some(row)) => {
+                        let delta = BitVec::wrapping_from_limbs(wd, &row);
+                        let cand = o.r.build(cx, |cx| {
+                            let k = cx.mk_const(&delta)?;
+                            let rx = cx.c_bin(BinOp::Xor, g2.inner, k)?;
+                            cx.c_cmp(op, g1.inner, rx)
+                        })?;
+                        if smaller(cx, cand, cmp_node) {
+                            return Ok(Some(cand));
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+// ----- value-level inverse composition (`g(f(x)) -> x / ~x / x + k / x ^ k`) ----------------------
+
+#[derive(Clone, Copy)]
+enum ComposedTarget {
+    Id,
+    Not,
+    Add(BitVec),
+    Xor(BitVec),
+}
+
+impl ComposedTarget {
+    fn eval(&self, x: &BitVec) -> BitVec {
+        match self {
+            ComposedTarget::Id => *x,
+            ComposedTarget::Not => BitVec::un_unchecked(crate::ops::UnOp::Not, x),
+            ComposedTarget::Add(k) => BitVec::bin_unchecked(BinOp::Add, x, k),
+            ComposedTarget::Xor(k) => BitVec::bin_unchecked(BinOp::Xor, x, k),
+        }
+    }
+
+    fn is_ring_poly(&self) -> bool {
+        matches!(
+            self,
+            ComposedTarget::Id | ComposedTarget::Not | ComposedTarget::Add(_)
+        )
+    }
+}
+
+fn sample_pattern(w: crate::Width, s0: u64, s1: u64) -> BitVec {
+    let mut limbs = [0u64; 8];
+    let mut z = s0;
+    for l in &mut limbs {
+        z = z.wrapping_add(s1);
+        let mut x = z;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        *l = x ^ (x >> 31);
+    }
+    BitVec::wrapping_from_limbs(w, &limbs)
+}
+
+/// Formal polynomial degree over `Z` of `nodes_asc.last()` in `hole` when every operation in
+/// `nodes_asc` is a ring operation at `w` (`Add`, `Sub`, `Neg`, `Not`, `Mul`, constant `Shl`),
+/// capped at `256`. By Newton's binomial interpolation over `Z[x]`, a degree-`D` integer
+/// polynomial vanishes modulo `2^W` at every input iff it vanishes at `0, 1, ..., D`.
+fn ring_poly_degree(cx: &Context, hole: u32, nodes_asc: &[u32], w: u16) -> Option<u64> {
+    const MAX_DEG: u64 = 256;
+    let mut deg: IdMap<u32, u64> = IdMap::default();
+    deg.insert(hole, 1);
+    for &i in nodes_asc {
+        let node = cx.node(i);
+        if node.width != w {
+            return None;
+        }
+        let d_of = |c: u32, map: &IdMap<u32, u64>| -> Option<u64> {
+            if let Some(&d) = map.get(&c) {
+                Some(d)
+            } else if cx.is_const(c) {
+                Some(0)
+            } else {
+                None
+            }
+        };
+        let d = match node.op {
+            OpCode::Add | OpCode::Sub => d_of(node.a, &deg)?.max(d_of(node.b, &deg)?),
+            OpCode::Neg | OpCode::Not => d_of(node.a, &deg)?,
+            OpCode::Shl if cx.is_const(node.b) => d_of(node.a, &deg)?,
+            OpCode::Mul => d_of(node.a, &deg)?.saturating_add(d_of(node.b, &deg)?),
+            _ => return None,
+        };
+        if d > MAX_DEG {
+            return None;
+        }
+        deg.insert(i, d);
+    }
+    nodes_asc.last().and_then(|t| deg.get(t)).copied()
+}
+
+#[cfg(feature = "prove")]
+fn prove_composed_circuit(
+    r: &mut Runner<'_, '_>,
+    cx: &Context,
+    hole: u32,
+    nodes_asc: &[u32],
+    target: &ComposedTarget,
+) -> Result<bool, Stop> {
+    use crate::engine::oracle::{EqualityCaps, EqualityVerdict};
+    let left = r.meter.left_in(|b| b.pass_work);
+    let cap = (left / 16).min(16_384);
+    if cap < 512 {
+        return Ok(false);
+    }
+    r.meter.deadline_now()?;
+    let w = cx.width_of(hole);
+    let mut scratch = Context::new();
+    let Ok(sym) = scratch.fresh_symbol(w) else {
+        return Ok(false);
+    };
+    let Ok(sym_id) = scratch.id(sym) else {
+        return Ok(false);
+    };
+    let mut map: IdMap<u32, u32> = IdMap::default();
+    map.insert(hole, sym_id);
+    for &i in nodes_asc {
+        let node = cx.node(i);
+        // Extension ops require the host registry; skip rather than mis-rebuilding.
+        if node.op.as_ext().is_some() || node.op.is_fp() {
+            return Ok(false);
+        }
+        let mut kids = [0u32; 3];
+        for (k, c) in node.children().enumerate() {
+            kids[k] = if let Some(&m) = map.get(&c) {
+                m
+            } else if let Some(cv) = cx.const_val(c) {
+                let Ok(mc) = scratch.mk_const(&cv) else {
+                    return Ok(false);
+                };
+                map.insert(c, mc);
+                mc
+            } else {
+                return Ok(false);
+            };
+        }
+        let Ok(rebuilt) = (match node.op {
+            OpCode::Extract => scratch.c_extract(kids[0], node.b as u16, node.width),
+            OpCode::Zext => scratch.c_zext(kids[0], node.width),
+            OpCode::Sext => scratch.c_sext(kids[0], node.width),
+            OpCode::Concat => {
+                let (ha, hb) = (scratch.handle(kids[0]), scratch.handle(kids[1]));
+                scratch.concat(ha, hb).and_then(|h| scratch.id(h))
+            }
+            OpCode::Select => scratch.c_select(kids[0], kids[1], kids[2]),
+            _ => {
+                if let Some(u) = node.op.as_un() {
+                    scratch.c_un(u, kids[0])
+                } else if let Some(b) = node.op.as_bin() {
+                    scratch.c_bin(b, kids[0], kids[1])
+                } else if let Some(c) = node.op.as_cmp() {
+                    scratch.c_cmp(c, kids[0], kids[1])
+                } else {
+                    return Ok(false);
+                }
+            }
+        }) else {
+            return Ok(false);
+        };
+        map.insert(i, rebuilt);
+    }
+    let Some(&root_id) = nodes_asc.last().and_then(|t| map.get(t)) else {
+        return Ok(false);
+    };
+    let Ok(rhs_id) = (match target {
+        ComposedTarget::Id => Ok(sym_id),
+        ComposedTarget::Not => scratch.c_un(crate::ops::UnOp::Not, sym_id),
+        ComposedTarget::Add(k) => scratch
+            .mk_const(k)
+            .and_then(|kc| scratch.c_bin(BinOp::Add, sym_id, kc)),
+        ComposedTarget::Xor(k) => scratch
+            .mk_const(k)
+            .and_then(|kc| scratch.c_bin(BinOp::Xor, sym_id, kc)),
+    }) else {
+        return Ok(false);
+    };
+    if root_id == rhs_id {
+        return Ok(true);
+    }
+    let caps = EqualityCaps {
+        samples: 0,
+        max_nodes: (cap as usize).min(8_192),
+        max_propagations: cap,
+    };
+    let (lhs_h, rhs_h) = (scratch.handle(root_id), scratch.handle(rhs_id));
+    let proof =
+        crate::circuit_equality()(&mut scratch, lhs_h, rhs_h, &caps).map_err(Stop::Error)?;
+    let cost = (proof.nodes as u64).saturating_add(proof.propagations);
+    r.meter.charge(Counter::PassWork, cost.min(left))?;
+    Ok(proof.verdict == EqualityVerdict::Proved)
+}
+
+/// Collapses single-dominator composed bijections `F(d)` (`unmix(mix(d))`, nonlinear T-function
+/// round + inverse `T⁻¹(T(d))`, Feistel round + unround, or high-degree permutation polynomial
+/// `P⁻¹(P(d))`) to `d`, `~d`, `d + k`, or `d ^ k` when nominated by 4 sample points and proved.
+pub(super) fn collapse_composed(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+    pass: PassKind,
+) -> Result<Option<Step>, Stop> {
+    const MAX_CONE: usize = 64;
+    const MAX_FRONTIER: usize = 16;
+    let w = cx.width_of(n);
+    if w.bits() < 2 || w.bits() > 512 {
+        return Ok(None);
+    }
+    let node = cx.node(n);
+    if !matches!(
+        node.op,
+        OpCode::Add
+            | OpCode::Sub
+            | OpCode::Neg
+            | OpCode::Mul
+            | OpCode::Xor
+            | OpCode::Not
+            | OpCode::And
+            | OpCode::Or
+            | OpCode::Shl
+            | OpCode::LShr
+            | OpCode::AShr
+            | OpCode::RotL
+            | OpCode::RotR
+            | OpCode::Bswap
+            | OpCode::BitRev
+            | OpCode::Extract
+            | OpCode::Concat
+    ) {
+        return Ok(None);
+    }
+    // Depth-1 expressions over symbols/constants have no composed inner layer.
+    if !node
+        .children()
+        .any(|c| !cx.is_const(c) && cx.node(c).op.arity() > 0)
+    {
+        return Ok(None);
+    }
+    let cap = MAX_CONE.min(r.inner.strategy.max_region as usize);
+    if cap < 3 {
+        return Ok(None);
+    }
+    let mut frontier = [0u32; MAX_FRONTIER];
+    let mut f_len = 1usize;
+    frontier[0] = n;
+    let mut cone = [0u32; MAX_CONE];
+    let mut c_len = 0usize;
+    let mut doms = [(0u32, 0usize); 4];
+    let mut d_len = 0usize;
+
+    while f_len > 0 {
+        let mut max_idx = 0usize;
+        for k in 1..f_len {
+            if frontier[k] > frontier[max_idx] {
+                max_idx = k;
+            }
+        }
+        let cur = frontier[max_idx];
+        f_len -= 1;
+        frontier[max_idx] = frontier[f_len];
+        if c_len >= cap {
+            break;
+        }
+        cone[c_len] = cur;
+        c_len += 1;
+
+        let cn = cx.node(cur);
+        let mut had_varying = false;
+        let mut overflow = false;
+        for child in cn.children() {
+            if cx.is_const(child) {
+                continue;
+            }
+            had_varying = true;
+            if !frontier[..f_len].contains(&child) {
+                if f_len >= MAX_FRONTIER {
+                    overflow = true;
+                    break;
+                }
+                frontier[f_len] = child;
+                f_len += 1;
+            }
+        }
+        if !had_varying || overflow {
+            break;
+        }
+        if f_len == 1 {
+            let d = frontier[0];
+            if c_len >= 3
+                && cx.wid(d) == w.bits()
+                && !r.bitwise.composed_tried.contains_key(&(n, d))
+            {
+                if d_len < doms.len() {
+                    doms[d_len] = (d, c_len);
+                    d_len += 1;
+                } else {
+                    doms[d_len - 1] = (d, c_len);
+                }
+            }
+        }
+    }
+    if d_len == 0 {
+        return Ok(None);
+    }
+
+    // Try deepest dominator first so `g(f(x))` collapses directly to `x`.
+    for &(d, sub_len) in doms[..d_len].iter().rev() {
+        let nodes_asc: Vec<u32> = cone[..sub_len].iter().rev().copied().collect();
+        r.meter.charge(Counter::PassWork, sub_len as u64 * 2)?;
+        let p0 = BitVec::zero(w);
+        let Some(y0) = invert::eval_region(cx, &nodes_asc, d, &p0) else {
+            continue;
+        };
+        let p1 = BitVec::one(w);
+        let Some(y1) = invert::eval_region(cx, &nodes_asc, d, &p1) else {
+            continue;
+        };
+        let mut add_ok = BitVec::bin_unchecked(BinOp::Sub, &y1, &p1) == y0;
+        let mut xor_ok = BitVec::bin_unchecked(BinOp::Xor, &y1, &p1) == y0;
+        if !add_ok && !xor_ok {
+            continue;
+        }
+        for (s0, s1) in [
+            (0x9E37_79B9_7F4A_7C15, 0xD1B5_4A32_D192_ED03),
+            (0xBF58_476D_1CE4_E5B9, 0x94D0_49BB_1331_11EB),
+        ] {
+            let pt = sample_pattern(w, s0, s1);
+            let Some(yt) = invert::eval_region(cx, &nodes_asc, d, &pt) else {
+                add_ok = false;
+                xor_ok = false;
+                break;
+            };
+            add_ok &= BitVec::bin_unchecked(BinOp::Sub, &yt, &pt) == y0;
+            xor_ok &= BitVec::bin_unchecked(BinOp::Xor, &yt, &pt) == y0;
+            if !add_ok && !xor_ok {
+                break;
+            }
+        }
+        if !add_ok && !xor_ok {
+            continue;
+        }
+
+        r.bitwise.composed_tried.insert((n, d), ());
+        let target = if y0.is_zero() {
+            ComposedTarget::Id
+        } else if xor_ok && y0.is_ones() {
+            ComposedTarget::Not
+        } else if add_ok {
+            ComposedTarget::Add(y0)
+        } else {
+            ComposedTarget::Xor(y0)
+        };
+
+        let mut proved = false;
+        // Tier 1: Exhaustive proof for widths `<= 10`.
+        if w.bits() <= 10 {
+            let total = 1u64 << w.bits();
+            r.meter
+                .charge(Counter::PassWork, total * (sub_len as u64 / 4 + 1))?;
+            proved = (2..total).all(|v| {
+                let bv = BitVec::wrapping_from_u64(w, v);
+                invert::eval_region(cx, &nodes_asc, d, &bv) == Some(target.eval(&bv))
+            });
+        }
+        // Tier 2: Exact Newton binomial interpolation for ring polynomials (`1..=512` bits).
+        if !proved
+            && target.is_ring_poly()
+            && let Some(deg) = ring_poly_degree(cx, d, &nodes_asc, w.bits())
+        {
+            r.meter
+                .charge(Counter::PassWork, deg * (sub_len as u64 / 2 + 1) + 1)?;
+            proved = (2..=deg).all(|v| {
+                let bv = BitVec::wrapping_from_u64(w, v);
+                invert::eval_region(cx, &nodes_asc, d, &bv) == Some(target.eval(&bv))
+            });
+        }
+        // Tier 3: Bounded single-variable circuit miter (`prove` feature, `1..=512` bits).
+        #[cfg(feature = "prove")]
+        if !proved {
+            proved = prove_composed_circuit(r, cx, d, &nodes_asc, &target)?;
+        }
+        if !proved {
+            continue;
+        }
+
+        let before = cx.len() as u32;
+        let e = r.build(cx, |cx| match &target {
+            ComposedTarget::Id => Ok(d),
+            ComposedTarget::Not => cx.c_un(crate::ops::UnOp::Not, d),
+            ComposedTarget::Add(k) => {
+                let kc = cx.mk_const(k)?;
+                cx.c_bin(BinOp::Add, d, kc)
+            }
+            ComposedTarget::Xor(k) => {
+                let kc = cx.mk_const(k)?;
+                cx.c_bin(BinOp::Xor, d, kc)
+            }
+        })?;
+        return Ok(Some(super::finish(
+            r,
+            cx,
+            pass,
+            n,
+            e,
+            before,
+            &[d],
+            Fin::FINAL,
+        )?));
+    }
+    Ok(None)
 }
 
 /// `f(x) op c` as `x op f⁻¹(c)`, or a constant.

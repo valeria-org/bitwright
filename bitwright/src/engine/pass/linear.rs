@@ -655,7 +655,7 @@ fn strip_annihilated_terms(
 /// [`MAX_TERMS`] that is an atom here (see [`Whole`](super::forms::Whole)). Those sums are
 /// then taken apart, so the terms cancel: `(v0 + … + v99) − v0` is the other 99 terms.
 fn sum_of(r: &mut Runner<'_, '_>, cx: &Context, a: &Form, b: &Form) -> Result<(Form, bool), Stop> {
-    let f = merge_masks(r, cx, merge(cx, a.add(b)));
+    let f = merge_assumed_offsets(r, merge_masks(r, cx, merge(cx, a.add(b))));
     let met = f.terms.len() < a.terms.len() + b.terms.len();
     let mut read = 0;
     let whole = r.linear.whole.meeting(a, b, &f, &mut read);
@@ -671,6 +671,63 @@ fn sum_of(r: &mut Runner<'_, '_>, cx: &Context, a: &Form, b: &Form) -> Result<(F
 /// `form` with the terms that read one value two ways moved to one reading, so they cancel.
 fn merge(cx: &Context, form: Form) -> Form {
     merge_fields(cx, merge_complements(cx, merge_signs(cx, form)))
+}
+
+/// Under path `Assumptions`, merges linear terms `(atom, coef)` where `atom == base + offset`
+/// whenever another term in `form` shares the same `base` (reducing term count without expanding
+/// standalone occurrences of `atom`), recording the relied-upon constraint IDs in `form.fin`.
+fn merge_assumed_offsets(r: &Runner<'_, '_>, form: Form) -> Form {
+    let Some(assump) = r.assumptions else {
+        return form;
+    };
+    let env = &assump.store.env;
+    if env.offset_rels.is_empty() && env.root.is_empty() {
+        return form;
+    }
+    if form.terms.len() < 2 {
+        return form;
+    }
+    let w = form.konst.width();
+    let mapped: Vec<(u32, BitVec, crate::Reliance)> = form
+        .terms
+        .iter()
+        .map(|&(atom, _)| env.offset_of(atom, w))
+        .collect();
+    // Only substitute atoms whose canonical `base` appears at least twice across `form.terms`.
+    let mut changed = false;
+    let mut out = Form {
+        konst: form.konst,
+        terms: Vec::with_capacity(form.terms.len()),
+        fin: form.fin,
+    };
+    for (idx, &(atom, ref coef)) in form.terms.iter().enumerate() {
+        let (base, ref off, rel) = mapped[idx];
+        let shared_base = mapped
+            .iter()
+            .enumerate()
+            .any(|(j, &(b2, ..))| j != idx && b2 == base);
+        if shared_base && (base != atom || !off.is_zero()) {
+            changed = true;
+            out.fin = out.fin.and(Fin::relying(rel));
+            let bias = BitVec::bin_unchecked(BinOp::Mul, coef, off);
+            out.konst = BitVec::bin_unchecked(BinOp::Add, &out.konst, &bias);
+            match out.terms.iter_mut().find(|t| t.0 == base) {
+                Some(slot) => slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, coef),
+                None => out.terms.push((base, *coef)),
+            }
+        } else {
+            match out.terms.iter_mut().find(|t| t.0 == atom) {
+                Some(slot) => slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, coef),
+                None => out.terms.push((atom, *coef)),
+            }
+        }
+    }
+    if !changed {
+        return form;
+    }
+    out.terms.retain(|(_, c)| !c.is_zero());
+    out.terms.sort_unstable_by_key(|t| t.0);
+    out
 }
 
 /// `form` with each term `k·2^j·(x >>u j)` moved to `k·x − k·(x & (2^j − 1))` when the form

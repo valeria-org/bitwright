@@ -2648,6 +2648,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         hoisted
     };
     let Some((atoms, tt)) = info_of(r, cx, n)? else {
+        if let Some(step) = super::invert::collapse_composed(r, cx, n, PassKind::Bitwise)? {
+            return Ok(match step {
+                Step::Normal(f) => Step::Normal(hoisted.and(f)),
+                done => done,
+            });
+        }
         return Ok(Step::Normal(hoisted));
     };
     // More than three atoms (constants included): `n` is an atom itself, read first by classes
@@ -2704,6 +2710,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                 Step::Normal(f) => fin = f,
                 done => return Ok(done),
             }
+        }
+    }
+    if let Some(step) = super::invert::collapse_composed(r, cx, n, PassKind::Bitwise)? {
+        match step {
+            Step::Normal(f) => fin = fin.and(f),
+            done => return Ok(done),
         }
     }
     // A chain of `&` or `|` no table reads whole, its operands in order (see `sort_chain`).
@@ -2790,4 +2802,6 @@ pub(crate) struct State {
     /// Nodes whose bitwise region is beyond the bitwise pass's reading with constants (see
     /// `pass::bitwise`): so is every region above them.
     pub(crate) beyond: crate::hash::IdMap<u32, ()>,
+    /// Candidate `(root, dominator)` pairs already tested for value-level inverse composition.
+    pub(crate) composed_tried: crate::hash::IdMap<(u32, u32), ()>,
 }

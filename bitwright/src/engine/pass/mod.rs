@@ -1045,7 +1045,9 @@ fn fold(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<Step, Stop> 
             && cx.meta[rep as usize].tree <= cx.meta[n as usize].tree
         {
             let before = cx.len() as u32;
-            let tie = cx.order(rep, n).is_lt();
+            // `merge` always chooses the smaller arena index `rep < n`, a strict well-founded
+            // order that cannot cycle even when `rep` and `n` are both 1-node symbols.
+            let tie = rep < n || cx.order(rep, n).is_lt();
             match finish_with(
                 r,
                 cx,

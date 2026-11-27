@@ -526,12 +526,15 @@ pub(crate) struct Env {
     entry_slot: IdMap<u32, usize>,
     /// Equality classes: each member (never a representative) with its representative and the
     /// constraints the equality rests on.
-    root: IdMap<u32, (u32, Reliance)>,
+    pub(crate) root: IdMap<u32, (u32, Reliance)>,
     /// The members of each class, by representative.
     members: IdMap<u32, Vec<u32>>,
     /// Projected bit-slice congruences `(hi, lo, mask, xor_diff, rel)` (`(hi ^ lo) & mask == xor_diff`)
     /// derived from assumed slice/masked equalities.
     pub(crate) slice_rels: Vec<(u32, u32, BitVec, BitVec, Reliance)>,
+    /// Assumed modular-offset relations `(member, base, offset, rel)` (`member == base + offset`)
+    /// with `base < member` and non-zero `offset`.
+    pub(crate) offset_rels: Vec<(u32, u32, BitVec, Reliance)>,
 }
 
 impl Default for Env {
@@ -543,6 +546,7 @@ impl Default for Env {
             root: IdMap::default(),
             members: IdMap::default(),
             slice_rels: Vec::new(),
+            offset_rels: Vec::new(),
             min: u32::MAX,
             infeasible: None,
         }
@@ -551,12 +555,135 @@ impl Default for Env {
 
 impl Env {
     pub(crate) fn is_empty(&self) -> bool {
-        self.assumed.is_empty() && self.relations.is_empty()
+        self.assumed.is_empty()
+            && self.relations.is_empty()
+            && self.root.is_empty()
+            && self.offset_rels.is_empty()
     }
 
     /// The representative of `a`'s equality class, and what the equality rests on.
     pub(crate) fn find(&self, a: u32) -> (u32, Reliance) {
         self.root.get(&a).copied().unwrap_or((a, Reliance::NONE))
+    }
+
+    /// Canonical `(base, offset, rel)` with `a == base + offset (mod 2^W)`, resolving both
+    /// equality classes and `offset_rels`.
+    pub(crate) fn offset_of(&self, a: u32, w: Width) -> (u32, BitVec, Reliance) {
+        let (rep, r1) = self.find(a);
+        if let Some(&(_, base, ref off, r2)) = self.offset_rels.iter().find(|&&(m, ..)| m == rep)
+            && off.width() == w
+        {
+            let (brep, r3) = self.find(base);
+            return (brep, *off, r1 | r2 | r3);
+        }
+        (rep, BitVec::zero(w), r1)
+    }
+
+    /// Evaluates `root` to a constant `(val, rel)` when assumed equalities and constant-offset
+    /// relations cancel all symbolic terms within a bounded linear/xor cone.
+    pub(crate) fn const_diff(&self, cx: &Context, root: u32) -> Option<(BitVec, Reliance)> {
+        use crate::expr::OpCode;
+        use crate::ops::{BinOp, UnOp};
+        if self.root.is_empty() && self.offset_rels.is_empty() {
+            return None;
+        }
+        let n0 = cx.node(root);
+        let w = Width::new(n0.width).ok()?;
+        if n0.op == OpCode::Xor {
+            let ((ra, xa), (rb, xb)) = (self.find(n0.a), self.find(n0.b));
+            if ra == rb && !(xa | xb).is_none() {
+                return Some((BitVec::zero(w), xa | xb));
+            }
+        }
+        if !matches!(
+            n0.op,
+            OpCode::Add | OpCode::Sub | OpCode::Neg | OpCode::Not | OpCode::Mul | OpCode::Shl
+        ) {
+            return None;
+        }
+        let one = BitVec::one(w);
+        let mut konst = BitVec::zero(w);
+        let mut rel = Reliance::NONE;
+        let mut terms: Vec<(u32, BitVec)> = Vec::new();
+        let mut todo: Vec<(u32, BitVec)> = vec![(root, one)];
+        let mut steps = 0usize;
+        while let Some((cur, scale)) = todo.pop() {
+            if scale.is_zero() {
+                continue;
+            }
+            steps += 1;
+            if steps > 24 {
+                return None;
+            }
+            if let Some(cv) = cx.const_val(cur) {
+                let prod = BitVec::bin_unchecked(BinOp::Mul, &cv, &scale);
+                konst = BitVec::bin_unchecked(BinOp::Add, &konst, &prod);
+                continue;
+            }
+            if cur != root {
+                let (rep, r_eq) = self.find(cur);
+                if rep != cur {
+                    rel |= r_eq;
+                    todo.push((rep, scale));
+                    continue;
+                }
+                if let Some(&(_, base, ref off, r_off)) =
+                    self.offset_rels.iter().find(|&&(m, ..)| m == cur)
+                    && off.width() == w
+                {
+                    rel |= r_off;
+                    let prod = BitVec::bin_unchecked(BinOp::Mul, off, &scale);
+                    konst = BitVec::bin_unchecked(BinOp::Add, &konst, &prod);
+                    todo.push((base, scale));
+                    continue;
+                }
+            }
+            let nd = cx.node(cur);
+            match nd.op {
+                OpCode::Add => {
+                    todo.push((nd.b, scale));
+                    todo.push((nd.a, scale));
+                }
+                OpCode::Sub => {
+                    todo.push((nd.b, BitVec::un_unchecked(UnOp::Neg, &scale)));
+                    todo.push((nd.a, scale));
+                }
+                OpCode::Neg => todo.push((nd.a, BitVec::un_unchecked(UnOp::Neg, &scale))),
+                OpCode::Not => {
+                    konst = BitVec::bin_unchecked(BinOp::Sub, &konst, &scale);
+                    todo.push((nd.a, BitVec::un_unchecked(UnOp::Neg, &scale)));
+                }
+                OpCode::Mul if cx.is_const(nd.a) || cx.is_const(nd.b) => {
+                    let (u, cid) = if cx.is_const(nd.b) {
+                        (nd.a, nd.b)
+                    } else {
+                        (nd.b, nd.a)
+                    };
+                    let cv = cx.const_val(cid)?;
+                    todo.push((u, BitVec::bin_unchecked(BinOp::Mul, &scale, &cv)));
+                }
+                OpCode::Shl if cx.is_const(nd.b) => {
+                    let sv = cx.const_val(nd.b)?;
+                    let factor = BitVec::bin_unchecked(BinOp::Shl, &one, &sv);
+                    if !factor.is_zero() {
+                        todo.push((nd.a, BitVec::bin_unchecked(BinOp::Mul, &scale, &factor)));
+                    }
+                }
+                _ => match terms.iter_mut().find(|t| t.0 == cur) {
+                    Some(slot) => slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale),
+                    None => {
+                        if terms.len() >= 8 {
+                            return None;
+                        }
+                        terms.push((cur, scale));
+                    }
+                },
+            }
+        }
+        if terms.iter().any(|(_, c)| !c.is_zero()) || rel.is_none() {
+            return None;
+        }
+        Some((konst, rel))
     }
 
     /// The orderings assumed between `a` and `b`, seen from `(a, b)`.
@@ -703,6 +830,33 @@ impl Propagation<'_> {
             if !self.relate(cmp, kids[0], kids[1], holds, all) {
                 return Ok(false);
             }
+            if matches!(cmp, CmpOp::Eq | CmpOp::Ne) {
+                let is_eq = (cmp == CmpOp::Eq) == holds;
+                let (mut px, mut py) = (kids[0], kids[1]);
+                struct PureOracle;
+                impl crate::invert::Oracle for PureOracle {
+                    type Err = ();
+                    fn facts(&mut self, _: &mut Context, _: u32) -> Result<Option<Facts>, ()> {
+                        Ok(None)
+                    }
+                    fn charge(&mut self, _: u64) -> Result<(), ()> {
+                        Ok(())
+                    }
+                }
+                while let Ok(Some((nx, ny))) =
+                    crate::invert::cancel_layer(cx, &mut PureOracle, px, py)
+                {
+                    (px, py) = (nx, ny);
+                }
+                if (px, py) != (kids[0], kids[1])
+                    && !self.relate(if is_eq { CmpOp::Eq } else { CmpOp::Ne }, px, py, true, all)
+                {
+                    return Ok(false);
+                }
+                if is_eq && !self.record_linear_eq(cx, px, py, all) {
+                    return Ok(false);
+                }
+            }
             if (cmp == CmpOp::Eq && holds) || (cmp == CmpOp::Ne && !holds) {
                 match crate::engine::pass::context::extract_slice_congruence(cx, kids[0], kids[1]) {
                     crate::engine::pass::context::SliceCheck::Conflict => {
@@ -810,10 +964,147 @@ impl Propagation<'_> {
         }
     }
 
+    /// Extracts `u == v + offset (mod 2^W)` (or `u == v` when `offset == 0`) from an assumed
+    /// equality `lhs == rhs` such as `a - b == 0`, `(a ^ b) == 0`, or `idx == base + 4`.
+    fn record_linear_eq(&mut self, cx: &Context, lhs: u32, rhs: u32, rel: Reliance) -> bool {
+        use crate::expr::OpCode;
+        use crate::ops::{BinOp, UnOp};
+        let w = cx.width_of(lhs);
+        if w.bits() == 0 {
+            return true;
+        }
+        // `(a ^ b) == 0` => `a == b`.
+        let (nl, nr) = (cx.node(lhs), cx.node(rhs));
+        if cx.const_val(rhs).is_some_and(|v| v.is_zero()) && nl.op == OpCode::Xor {
+            return self.relate(CmpOp::Eq, nl.a, nl.b, true, rel);
+        }
+        if cx.const_val(lhs).is_some_and(|v| v.is_zero()) && nr.op == OpCode::Xor {
+            return self.relate(CmpOp::Eq, nr.a, nr.b, true, rel);
+        }
+        // Flatten `lhs - rhs == 0` into `konst + sum coeff_i * atom_i == 0`.
+        let one = BitVec::one(w);
+        let neg_one = BitVec::ones(w);
+        let mut konst = BitVec::zero(w);
+        let mut terms: Vec<(u32, BitVec)> = Vec::new();
+        let mut todo: Vec<(u32, BitVec)> = vec![(rhs, neg_one), (lhs, one)];
+        let mut steps = 0usize;
+        while let Some((cur, scale)) = todo.pop() {
+            if scale.is_zero() {
+                continue;
+            }
+            steps += 1;
+            if steps > 16 {
+                return true;
+            }
+            if let Some(cv) = cx.const_val(cur) {
+                let prod = BitVec::bin_unchecked(BinOp::Mul, &cv, &scale);
+                konst = BitVec::bin_unchecked(BinOp::Add, &konst, &prod);
+                continue;
+            }
+            let nd = cx.node(cur);
+            match nd.op {
+                OpCode::Add => {
+                    todo.push((nd.b, scale));
+                    todo.push((nd.a, scale));
+                }
+                OpCode::Sub => {
+                    todo.push((nd.b, BitVec::un_unchecked(UnOp::Neg, &scale)));
+                    todo.push((nd.a, scale));
+                }
+                OpCode::Neg => todo.push((nd.a, BitVec::un_unchecked(UnOp::Neg, &scale))),
+                OpCode::Not => {
+                    konst = BitVec::bin_unchecked(BinOp::Sub, &konst, &scale);
+                    todo.push((nd.a, BitVec::un_unchecked(UnOp::Neg, &scale)));
+                }
+                _ => match terms.iter_mut().find(|t| t.0 == cur) {
+                    Some(slot) => slot.1 = BitVec::bin_unchecked(BinOp::Add, &slot.1, &scale),
+                    None => {
+                        if terms.len() >= 4 {
+                            return true;
+                        }
+                        terms.push((cur, scale));
+                    }
+                },
+            }
+        }
+        terms.retain(|(_, c)| !c.is_zero());
+        if terms.is_empty() {
+            if !konst.is_zero() {
+                self.infeasible(rel);
+                return false;
+            }
+            return true;
+        }
+        // Look for `1 * u + (-1) * v + konst == 0` => `u == v - konst`.
+        if let [(t0, c0), (t1, c1)] = &terms[..] {
+            let pair = if *c0 == one && *c1 == neg_one {
+                Some((*t0, *t1, BitVec::un_unchecked(UnOp::Neg, &konst)))
+            } else if *c0 == neg_one && *c1 == one {
+                Some((*t1, *t0, BitVec::un_unchecked(UnOp::Neg, &konst)))
+            } else {
+                None
+            };
+            if let Some((u, v, off)) = pair {
+                return self.add_offset_rel(u, v, off, rel);
+            }
+        }
+        true
+    }
+
+    /// Records `u == v + off (mod 2^W)`.
+    fn add_offset_rel(&mut self, u: u32, v: u32, off: BitVec, rel: Reliance) -> bool {
+        use crate::ops::{BinOp, UnOp};
+        let w = off.width();
+        let (bu, ou, ru) = self.store.env.offset_of(u, w);
+        let (bv, ov, rv) = self.store.env.offset_of(v, w);
+        let all = rel | ru | rv;
+        // `bu + ou == bv + ov + off` => `bu - bv == ov + off - ou`.
+        let net = BitVec::bin_unchecked(
+            BinOp::Sub,
+            &BitVec::bin_unchecked(BinOp::Add, &ov, &off),
+            &ou,
+        );
+        if bu == bv {
+            if !net.is_zero() {
+                self.infeasible(all);
+                return false;
+            }
+            return true;
+        }
+        if net.is_zero() {
+            return self.relate(CmpOp::Eq, bu, bv, true, all);
+        }
+        let (hi, lo, hi_off) = if bu > bv {
+            // `bu == bv + net`
+            (bu, bv, net)
+        } else {
+            // `bv == bu - net`
+            (bv, bu, BitVec::un_unchecked(UnOp::Neg, &net))
+        };
+        self.store.env.min = self.store.env.min.min(lo);
+        self.invalidate_from(lo);
+        // Rewrite any existing entry whose base was `hi` so all offsets point directly to `lo`.
+        for entry in &mut self.store.env.offset_rels {
+            if entry.1 == hi && entry.2.width() == w {
+                entry.1 = lo;
+                entry.2 = BitVec::bin_unchecked(BinOp::Add, &entry.2, &hi_off);
+                entry.3 |= all;
+            }
+        }
+        self.store.env.offset_rels.push((hi, lo, hi_off, all));
+        true
+    }
+
     /// Merges the class of `hi` into the class of `lo` (both representatives), because they
     /// are equal by `rel`. `false` if that is infeasible.
     fn merge(&mut self, lo: u32, hi: u32, rel: Reliance) -> bool {
         let env = &mut self.store.env;
+        if let Some(&(f_hi, r_hi)) = env.assumed.get(&hi) {
+            self.work.push((lo, f_hi, rel | r_hi));
+        }
+        if let Some(&(f_lo, r_lo)) = env.assumed.get(&lo) {
+            self.work.push((hi, f_lo, rel | r_lo));
+        }
         let mut moved = env.members.remove(&hi).unwrap_or_default();
         moved.push(hi);
         for &x in &moved {

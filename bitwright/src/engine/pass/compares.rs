@@ -2794,6 +2794,9 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
                     return finish(r, cx, PassKind::Compares, n, e, before, &stops, spec_fin);
                 }
             }
+            if let Some(step) = recover_signed_flags(r, cx, n)? {
+                return Ok(step);
+            }
             if let Some(step) = packed_zero_or(r, cx, n)? {
                 return Ok(step);
             }
@@ -2847,6 +2850,12 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
     let Step::Normal(fin) = step else {
         return Ok(step);
     };
+    if let Some(step) = recover_signed_flags(r, cx, n)? {
+        return Ok(match step {
+            Step::Normal(f) => Step::Normal(f.and(fin)),
+            to => to,
+        });
+    }
     // Not smaller (`0 <=s x·x` as `x·x <=u smax`): residues may still show it constant.
     if let Some(b) = super::predicate::decide(r, cx, n)? {
         let before = cx.len() as u32;
@@ -2859,6 +2868,351 @@ pub(super) fn step(r: &mut Runner<'_, '_>, cx: &mut Context, n: u32) -> Result<S
         );
     }
     Ok(Step::Normal(fin))
+}
+
+/// Recognizes lifted native x86-64 (`EFLAGS`: `SF != OF`) and AArch64 (`NZCV`: `N != V`) signed
+/// ordering predicates — whether written as an MSB extract / sign test of a `W`-bit bitwise
+/// expression (`msb((a - b) ^ ((a ^ b) & (a ^ (a - b))))`) or as a 1-bit Boolean combination of
+/// sign tests — and rewrites them to canonical `a <s b` or `b <=s a` across widths `2..=512`.
+fn recover_signed_flags(
+    r: &mut Runner<'_, '_>,
+    cx: &mut Context,
+    n: u32,
+) -> Result<Option<Step>, Stop> {
+    if cx.wid(n) != 1 || cx.is_const(n) {
+        return Ok(None);
+    }
+    // Unwrap a 1-bit node that tests the MSB of a `W`-bit word (`W >= 2`), returning `(word, inv)`.
+    fn msb_word(cx: &Context, id: u32) -> Option<(u32, bool)> {
+        let nd = cx.node(id);
+        match nd.op {
+            OpCode::Extract if nd.width == 1 => {
+                let w = cx.wid(nd.a);
+                (w >= 2 && nd.b == u32::from(w - 1)).then_some((nd.a, false))
+            }
+            OpCode::Slt => {
+                if cx.const_val(nd.b).is_some_and(|v| v.is_zero()) && cx.wid(nd.a) >= 2 {
+                    Some((nd.a, false))
+                } else if cx.const_val(nd.a).is_some_and(|v| v.is_ones()) && cx.wid(nd.b) >= 2 {
+                    Some((nd.b, true))
+                } else {
+                    None
+                }
+            }
+            OpCode::Sle => {
+                if cx.const_val(nd.a).is_some_and(|v| v.is_zero()) && cx.wid(nd.b) >= 2 {
+                    Some((nd.b, true))
+                } else if cx.const_val(nd.b).is_some_and(|v| v.is_ones()) && cx.wid(nd.a) >= 2 {
+                    Some((nd.a, false))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // Build a tiny bytecode DAG of MSB truth-table operations from `n`:
+    // `Gate`: Const(bool), Atom(usize), Not(g), Bin(op, g1, g2), Select(gc, gt, gf).
+    #[derive(Clone, Copy)]
+    enum Gate {
+        Const(bool),
+        Atom(usize),
+        Not(usize),
+        And(usize, usize),
+        Or(usize, usize),
+        Xor(usize, usize),
+        Select(usize, usize, usize),
+    }
+
+    struct Builder<'a> {
+        cx: &'a Context,
+        word_w: Option<u16>,
+        atoms: Vec<u32>,
+        gates: Vec<Gate>,
+        memo_bit: crate::hash::IdMap<u32, usize>,
+        memo_msb: crate::hash::IdMap<u32, usize>,
+        steps: usize,
+    }
+
+    impl Builder<'_> {
+        fn push(&mut self, g: Gate) -> Option<usize> {
+            if self.gates.len() >= 48 {
+                return None;
+            }
+            let idx = self.gates.len();
+            self.gates.push(g);
+            Some(idx)
+        }
+
+        fn build_msb(&mut self, id: u32) -> Option<usize> {
+            if let Some(&g) = self.memo_msb.get(&id) {
+                return Some(g);
+            }
+            self.steps += 1;
+            if self.steps > 32 {
+                return None;
+            }
+            let w = self.cx.wid(id);
+            if w < 2 {
+                return None;
+            }
+            match self.word_w {
+                None => self.word_w = Some(w),
+                Some(prev) if prev != w => return None,
+                Some(_) => {}
+            }
+            if let Some(cv) = self.cx.const_val(id) {
+                let g = self.push(Gate::Const(cv.msb()))?;
+                self.memo_msb.insert(id, g);
+                return Some(g);
+            }
+            let nd = self.cx.node(id);
+            let g = match nd.op {
+                OpCode::Not => {
+                    let a = self.build_msb(nd.a)?;
+                    self.push(Gate::Not(a))?
+                }
+                OpCode::And => {
+                    let (a, b) = (self.build_msb(nd.a)?, self.build_msb(nd.b)?);
+                    self.push(Gate::And(a, b))?
+                }
+                OpCode::Or => {
+                    let (a, b) = (self.build_msb(nd.a)?, self.build_msb(nd.b)?);
+                    self.push(Gate::Or(a, b))?
+                }
+                OpCode::Xor => {
+                    let (a, b) = (self.build_msb(nd.a)?, self.build_msb(nd.b)?);
+                    self.push(Gate::Xor(a, b))?
+                }
+                _ => {
+                    let idx = match self.atoms.iter().position(|&x| x == id) {
+                        Some(p) => p,
+                        None => {
+                            if self.atoms.len() >= 3 {
+                                return None;
+                            }
+                            self.atoms.push(id);
+                            self.atoms.len() - 1
+                        }
+                    };
+                    self.push(Gate::Atom(idx))?
+                }
+            };
+            self.memo_msb.insert(id, g);
+            Some(g)
+        }
+
+        fn build_bit(&mut self, id: u32) -> Option<usize> {
+            if let Some(&g) = self.memo_bit.get(&id) {
+                return Some(g);
+            }
+            self.steps += 1;
+            if self.steps > 32 {
+                return None;
+            }
+            if let Some(cv) = self.cx.const_val(id) {
+                let g = self.push(Gate::Const(!cv.is_zero()))?;
+                self.memo_bit.insert(id, g);
+                return Some(g);
+            }
+            if let Some((word, inv)) = msb_word(self.cx, id) {
+                let mut g = self.build_msb(word)?;
+                if inv {
+                    g = self.push(Gate::Not(g))?;
+                }
+                self.memo_bit.insert(id, g);
+                return Some(g);
+            }
+            let nd = self.cx.node(id);
+            if nd.width != 1 {
+                return None;
+            }
+            let g = match nd.op {
+                OpCode::Not => {
+                    let a = self.build_bit(nd.a)?;
+                    self.push(Gate::Not(a))?
+                }
+                OpCode::And => {
+                    let (a, b) = (self.build_bit(nd.a)?, self.build_bit(nd.b)?);
+                    self.push(Gate::And(a, b))?
+                }
+                OpCode::Or => {
+                    let (a, b) = (self.build_bit(nd.a)?, self.build_bit(nd.b)?);
+                    self.push(Gate::Or(a, b))?
+                }
+                OpCode::Xor | OpCode::Ne => {
+                    let (a, b) = (self.build_bit(nd.a)?, self.build_bit(nd.b)?);
+                    self.push(Gate::Xor(a, b))?
+                }
+                OpCode::Eq => {
+                    let (a, b) = (self.build_bit(nd.a)?, self.build_bit(nd.b)?);
+                    let x = self.push(Gate::Xor(a, b))?;
+                    self.push(Gate::Not(x))?
+                }
+                OpCode::Select => {
+                    let c = self.build_bit(nd.a)?;
+                    let t = self.build_bit(nd.b)?;
+                    let f = self.build_bit(nd.c)?;
+                    self.push(Gate::Select(c, t, f))?
+                }
+                _ => return None,
+            };
+            self.memo_bit.insert(id, g);
+            Some(g)
+        }
+    }
+
+    let mut b = Builder {
+        cx,
+        word_w: None,
+        atoms: Vec::new(),
+        gates: Vec::new(),
+        memo_bit: crate::hash::IdMap::default(),
+        memo_msb: crate::hash::IdMap::default(),
+        steps: 0,
+    };
+    let Some(root_g) = b.build_bit(n) else {
+        return Ok(None);
+    };
+    if b.atoms.len() < 2 {
+        return Ok(None);
+    }
+
+    let eval_gates = |gates: &[Gate], vals: &[bool]| -> bool {
+        let mut out = [false; 48];
+        for (i, &g) in gates.iter().enumerate() {
+            out[i] = match g {
+                Gate::Const(v) => v,
+                Gate::Atom(k) => vals[k],
+                Gate::Not(x) => !out[x],
+                Gate::And(x, y) => out[x] && out[y],
+                Gate::Or(x, y) => out[x] || out[y],
+                Gate::Xor(x, y) => out[x] ^ out[y],
+                Gate::Select(c, t, f) => {
+                    if out[c] {
+                        out[t]
+                    } else {
+                        out[f]
+                    }
+                }
+            };
+        }
+        out[root_g]
+    };
+
+    r.meter.charge(Counter::PassWork, b.steps as u64)?;
+    let mut matched_cmp: Option<(CmpOp, u32, u32)> = None;
+
+    if b.atoms.len() == 3 {
+        // Identify which of the 3 atoms is `Sub(lhs, rhs)`.
+        for d_idx in 0..3 {
+            let d_node = cx.node(b.atoms[d_idx]);
+            if d_node.op != OpCode::Sub {
+                continue;
+            }
+            let (Some(a_idx), Some(b_idx)) = (
+                b.atoms.iter().position(|&x| x == d_node.a),
+                b.atoms.iter().position(|&x| x == d_node.b),
+            ) else {
+                continue;
+            };
+            if a_idx == d_idx || b_idx == d_idx || a_idx == b_idx {
+                continue;
+            }
+            let mut all_slt = true;
+            let mut all_sge = true;
+            let mut vals = [false; 3];
+            for a_neg in [false, true] {
+                for b_neg in [false, true] {
+                    for d_neg in [false, true] {
+                        vals[a_idx] = a_neg;
+                        vals[b_idx] = b_neg;
+                        vals[d_idx] = d_neg;
+                        let got = eval_gates(&b.gates, &vals);
+                        let want_slt = (a_neg && !b_neg) || (a_neg == b_neg && d_neg);
+                        all_slt &= got == want_slt;
+                        all_sge &= got == !want_slt;
+                    }
+                }
+            }
+            if all_slt {
+                matched_cmp = Some((CmpOp::Slt, d_node.a, d_node.b));
+                break;
+            }
+            if all_sge {
+                matched_cmp = Some((CmpOp::Sle, d_node.b, d_node.a));
+                break;
+            }
+        }
+    } else if b.atoms.len() == 2 {
+        // Constant subtrahend / minuend (`d = a - k`, `d = a + (-k)`, or `d = k - a`).
+        for d_idx in 0..2 {
+            let other_idx = 1 - d_idx;
+            let a_id = b.atoms[other_idx];
+            let d_node = cx.node(b.atoms[d_idx]);
+            let pair: Option<(bool, BitVec)> = match d_node.op {
+                OpCode::Sub if d_node.a == a_id => cx.const_val(d_node.b).map(|k| (true, k)),
+                OpCode::Sub if d_node.b == a_id => cx.const_val(d_node.a).map(|k| (false, k)),
+                OpCode::Add if d_node.a == a_id => cx
+                    .const_val(d_node.b)
+                    .map(|c| (true, BitVec::un_unchecked(UnOp::Neg, &c))),
+                OpCode::Add if d_node.b == a_id => cx
+                    .const_val(d_node.a)
+                    .map(|c| (true, BitVec::un_unchecked(UnOp::Neg, &c))),
+                _ => None,
+            };
+            let Some((a_minus_k, k_bv)) = pair else {
+                continue;
+            };
+            let k_neg = k_bv.msb();
+            let mut all_lt = true;
+            let mut all_ge = true;
+            let mut vals = [false; 2];
+            for a_neg in [false, true] {
+                for d_neg in [false, true] {
+                    vals[other_idx] = a_neg;
+                    vals[d_idx] = d_neg;
+                    let got = eval_gates(&b.gates, &vals);
+                    let want = if a_minus_k {
+                        (a_neg && !k_neg) || (a_neg == k_neg && d_neg)
+                    } else {
+                        (k_neg && !a_neg) || (k_neg == a_neg && d_neg)
+                    };
+                    all_lt &= got == want;
+                    all_ge &= got == !want;
+                }
+            }
+            if all_lt || all_ge {
+                let before = cx.len() as u32;
+                let k_id = r.build(cx, |cx| cx.mk_const(&k_bv))?;
+                let (op, lhs, rhs) = match (a_minus_k, all_lt) {
+                    (true, true) => (CmpOp::Slt, a_id, k_id),
+                    (true, false) => (CmpOp::Sle, k_id, a_id),
+                    (false, true) => (CmpOp::Slt, k_id, a_id),
+                    (false, false) => (CmpOp::Sle, a_id, k_id),
+                };
+                let e = r.build(cx, |cx| cx.c_cmp(op, lhs, rhs))?;
+                return match finish(r, cx, PassKind::Compares, n, e, before, &[a_id], Fin::FINAL)? {
+                    Step::Normal(_) => Ok(None),
+                    step => Ok(Some(step)),
+                };
+            }
+        }
+    }
+
+    let Some((op, lhs, rhs)) = matched_cmp else {
+        return Ok(None);
+    };
+    let before = cx.len() as u32;
+    let e = r.build(cx, |cx| cx.c_cmp(op, lhs, rhs))?;
+    let mut stops = vec![lhs, rhs];
+    stops.sort_unstable();
+    stops.dedup();
+    match finish(r, cx, PassKind::Compares, n, e, before, &stops, Fin::FINAL)? {
+        Step::Normal(_) => Ok(None),
+        step => Ok(Some(step)),
+    }
 }
 
 /// Decompose packed zero-OR equalities `((x1 ^ c1) | (x2 ^ c2) | ...) == 0` into

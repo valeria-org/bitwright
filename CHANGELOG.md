@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.32.27
+
+- Generalized `invert::gf2` and `pass::gf2` across widths `1..=512` (`[u64; 8]` rows) and up to 8 mixed-width atoms (`gf2::affine`), canonicalizing multi-atom and cast-crossing (`Extract`, `Zext`, `Sext`, `Concat`, `Bswap`, `BitRev`, `AShr`) GF(2)-affine expressions with `O(1)` per-node Bloom/movement prefiltering and zero-extended upper-bit mask elision, and lifting `Query::Injective`, `Query::Bijective`, and GF(2) preimage solving to `512` bits.
+- Extended `invert::cancel_layer` and `pass::invert` with semantic modular-affine (`scale * inner + offset`) and full-rank GF(2)-matrix outer-bijection cancellation, constant-offset solving, and parity-violating unsatisfiability detection across `1..=512` bits; added value-level composed bijection collapsing (`collapse_composed`) proved via exhaustive small-width evaluation, Newton binomial interpolation over `Z[x] mod 2^W`, or bounded single-variable circuit miters.
+- Upgraded `Memory::split` and `Memory::same` with linear address reassociation (`Add`/`Sub`/`Neg`/`Not`/constant `Mul`/`Shl` and disjoint `|`/`^`), 2-adic stride GCD disambiguation, bounded single-term unsigned range checks, and bit-provenance run alignment (`decide_eq_by_runs`, `common_low_bits`).
+- Upgraded `Solver` (`solve_equations`) to isolate unconstrained symbols through bijective arithmetic/bitwise spines, self-xorshifts, extensions (`zext`/`sext` with range guards), and split-register `concat` equations across top-level `And` conjunctions; added `Solver::enumerate_values` / `Solver::enumerate_values_within` (`Values`) for exact multi-target jump-table and state-machine enumeration.
+- Propagated bijection-peeled congruence classes and transitive constant-offset relations (`offset_rels`, `const_diff`) through `Assumptions`, `overlay_facts`, `Context::prove_under`, `FactFold`, and `linear` with full `Reliance` tracking, and added lifted signed CPU flag recovery (`EFLAGS` `SF != OF` / `NZCV` `N != V` to canonical `Slt`/`Sle`) in `compares` across widths `2..=512`.
+
 ## 0.32.26
 
 - Generalized bit-provenance canonicalization (`shuffle`) across widths `1..=512`: added complement-aware canonical bit-provenance runs (`BitRun`, `bit_runs_of`, `runs_invert`, `runs_xor_diff`, `runs_masked_sub`, `runs_is_or`, `decide_cmp_by_bits`), `BitRev` tracing, `Source::NotBit` explanations, and `8..=512` variable-count rotation recognition; extended `linear_mba` rotation-union and complement atom merging and `mba::lower` peer atom deduplication across `1..=512`.

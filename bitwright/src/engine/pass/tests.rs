@@ -9745,3 +9745,393 @@ fn an_equality_of_linear_mbas_is_decided_by_the_signature_of_their_difference() 
         assert!(e.contains("=="), "{e}");
     }
 }
+
+#[test]
+fn multi_atom_and_wide_gf2_homomorphisms_canonicalize() {
+    let eng = Engine::standard();
+    // 1. Multi-atom shift, arithmetic shift, rotation, bswap, and bitrev homomorphisms across widths.
+    for &bits in &[16u16, 32, 64, 128, 256, 512] {
+        let k = bits / 4 + 1;
+        check_to(
+            &eng,
+            &format!("((x ^ y) >>u {k}) ^ (x >>u {k})"),
+            &format!("y >>u {k}"),
+            bits,
+        );
+        check_to(
+            &eng,
+            &format!("((x ^ y) << {k}) ^ (y << {k})"),
+            &format!("x << {k}"),
+            bits,
+        );
+        check_to(
+            &eng,
+            &format!("((x ^ y) >>s {k}) ^ (x >>s {k})"),
+            &format!("y >>s {k}"),
+            bits,
+        );
+        let bswap_want = if bits == 16 { "rotl(y, 8)" } else { "bswap(y)" };
+        check_to(&eng, "bswap(x ^ y) ^ bswap(x)", bswap_want, bits);
+        check_to(&eng, "bitrev(x ^ y) ^ bitrev(x)", "bitrev(y)", bits);
+        // 3-rotation SPN/SHA-style linear layer cancels `x`.
+        let (r1, r2, r3) = (2, bits / 5 + 1, bits / 3 + 3);
+        let src = format!(
+            "(rotl(x ^ y, {r1}) ^ rotl(x ^ y, {r2}) ^ rotl(x ^ y, {r3})) \
+             ^ (rotl(x, {r1}) ^ rotl(x, {r2}) ^ rotl(x, {r3}))"
+        );
+        let want = format!("rotl(y, {r1}) ^ rotl(y, {r2}) ^ rotl(y, {r3})");
+        check_to(&eng, &src, &want, bits);
+    }
+
+    // 2. Non-byte odd widths (`7`, `31`, `257`) for shifts, rotations, and bitrev.
+    for &bits in &[7u16, 31, 257] {
+        check_to(&eng, "bitrev(x << 2) ^ (bitrev(x) >>u 2)", "0", bits);
+        check_to(&eng, "((x ^ y) >>s 3) ^ (y >>s 3)", "x >>s 3", bits);
+    }
+
+    // 3. Wide (> 128-bit) xorshift involutions collapse to `x`.
+    check_to(&eng, "let y = x ^ (x >>u 137); y ^ (y >>u 137)", "x", 256);
+    check_to(
+        &eng,
+        "let y = x ^ (x << 193); let u = y ^ (y << 193); u ^ (u << 386)",
+        "x",
+        512,
+    );
+
+    // 4. Cast-crossing (`concat`, `zext`, `extract`) GF(2) identities.
+    {
+        let mut cx = Context::new();
+        let x = cx.symbol("x", Width::W32).unwrap();
+        let y = cx.symbol("y", Width::W32).unwrap();
+        let xy = cx.concat(x, y).unwrap();
+        let yx = cx.concat(y, x).unwrap();
+        let r32 = cx.constant_u64(Width::W64, 32).unwrap();
+        let rot = cx.bin(BinOp::RotL, xy, r32).unwrap();
+        let diff = cx.bin(BinOp::Xor, rot, yx).unwrap();
+        let out = eng.simplify(&mut cx, diff).unwrap().expr;
+        assert_eq!(out, cx.zero(Width::W64).unwrap());
+
+        // `extract<0, 32>((zext<64>(x) << 11) ^ (zext<64>(y) << 11)) ^ (x << 11) -> y << 11`
+        let zx = cx.zext(x, Width::W64).unwrap();
+        let zy = cx.zext(y, Width::W64).unwrap();
+        let c11_64 = cx.constant_u64(Width::W64, 11).unwrap();
+        let c11_32 = cx.constant_u64(Width::W32, 11).unwrap();
+        let zx_shl = cx.bin(BinOp::Shl, zx, c11_64).unwrap();
+        let zy_shl = cx.bin(BinOp::Shl, zy, c11_64).unwrap();
+        let lhs64 = cx.bin(BinOp::Xor, zx_shl, zy_shl).unwrap();
+        let lo32 = cx.extract(lhs64, 0, Width::W32).unwrap();
+        let x_shl = cx.bin(BinOp::Shl, x, c11_32).unwrap();
+        let y_shl = cx.bin(BinOp::Shl, y, c11_32).unwrap();
+        let expr = cx.bin(BinOp::Xor, lo32, x_shl).unwrap();
+        let simp = eng.simplify(&mut cx, expr).unwrap().expr;
+        assert_eq!(simp, y_shl);
+    }
+}
+
+#[test]
+fn semantic_outer_bijections_cancel_in_equalities() {
+    let eng = Engine::standard();
+    let mut rng = Rng(0x5e3a_0001);
+    for &bits in &[8u16, 32, 64, 256] {
+        // Syntactically distinct modular-affine bijections with identical `(scale, offset)`.
+        check_to(&eng, "(a + 1) * 3 == b * 3 + 3", "a == b", bits);
+        check_to(&eng, "(a + 1) * 3 != b * 3 + 3", "a != b", bits);
+        check_to(&eng, "~(a * 5) == -1 - b * 5", "a == b", bits);
+
+        // Syntactically distinct GF(2)-affine bijections with identical full-rank matrix.
+        if bits >= 16 {
+            check_to(
+                &eng,
+                "a ^ rotl(a, 2) ^ rotl(a, 13) == rotl(b ^ rotl(b, 11), 2) ^ b",
+                "a == b",
+                bits,
+            );
+            check_to(
+                &eng,
+                "bswap(rotl(a, 8)) == rotr(bswap(b), 8)",
+                "a == b",
+                bits,
+            );
+        }
+
+        // Mismatched odd multipliers reduce to a strictly smaller single-multiplier equality.
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::new(bits).unwrap());
+        let orig = cx.parse("(a * 3 + 7) == (b * 9 + 1)", &o).unwrap();
+        let simp = eng.simplify(&mut cx, orig).unwrap().expr;
+        assert!(cx.tree_size(simp).unwrap() < cx.tree_size(orig).unwrap());
+        assert!(equivalent(&mut cx, orig, simp, &mut rng));
+    }
+
+    // Injective wide GF(2) encoding (`32 -> 64`) with a parity-violating constant offset folds
+    // to `false` even though every bit `0..49` is individually unconstrained in `KnownBits`:
+    // `bit_1(fa) ^ bit_18(fa) ^ bit_35(fa) == a_1 ^ (a_18 ^ a_1) ^ a_18 == 0` for all `a`.
+    {
+        let mut cx = Context::new();
+        let a = cx.symbol("a", Width::W32).unwrap();
+        let b = cx.symbol("b", Width::W32).unwrap();
+        let za = cx.zext(a, Width::W64).unwrap();
+        let zb = cx.zext(b, Width::W64).unwrap();
+        let c17 = cx.constant_u64(Width::W64, 17).unwrap();
+        let za_shl = cx.bin(BinOp::Shl, za, c17).unwrap();
+        let zb_shl = cx.bin(BinOp::Shl, zb, c17).unwrap();
+        let fa = cx.bin(BinOp::Xor, za, za_shl).unwrap();
+        let fb = cx.bin(BinOp::Xor, zb, zb_shl).unwrap();
+        let two = cx.constant_u64(Width::W64, 2).unwrap();
+        let fb_bad = cx.bin(BinOp::Xor, fb, two).unwrap();
+        let eq = cx.cmp(CmpOpExt::Eq, fa, fb_bad).unwrap();
+        assert_eq!(
+            eng.simplify(&mut cx, eq).unwrap().expr,
+            cx.zero(Width::W1).unwrap()
+        );
+    }
+}
+
+#[test]
+fn composed_value_bijections_collapse_and_near_misses_stay_sound() {
+    let eng = Engine::standard();
+    let mut rng = Rng(0xc095_0002);
+
+    // 1. High-degree (`deg = 64 > poly::MAX_DEGREE`) permutation polynomial + exact inverse
+    //    proved via Newton binomial interpolation across 16, 64, and 256 bits (works in all feature sets).
+    for &(bits, half) in &[(16u16, 8u16), (64, 32), (256, 128)] {
+        let src = format!(
+            "let x2 = x * x; let x4 = x2 * x2; let x8 = x4 * x4; \
+             let y = x + ((x8 + x4 * 3 + x * 5) << {half}); \
+             let y2 = y * y; let y4 = y2 * y2; let y8 = y4 * y4; \
+             y - ((y8 + y4 * 3 + y * 5) << {half})"
+        );
+        check_to(&eng, &src, "x", bits);
+    }
+
+    // 2. SplitMix64 round + exact inverse collapses `unmix(mix(d))` to `d` (both for `d = x`
+    //    and compound `d = x + z`).
+    for d_src in ["x", "x + z"] {
+        let src = format!(
+            "let d = {d_src}; \
+             let m1 = (d ^ (d >>u 30)) * 0xbf58476d1ce4e5b9; \
+             let m2 = (m1 ^ (m1 >>u 27)) * 0x94d049bb133111eb; \
+             let h = m2 ^ (m2 >>u 31); \
+             let u1 = (h ^ (h >>u 31) ^ (h >>u 62)) * 0x319642b2d24d8ec3; \
+             let u2 = (u1 ^ (u1 >>u 27) ^ (u1 >>u 54)) * 0x96de1b173f119089; \
+             u2 ^ (u2 >>u 30) ^ (u2 >>u 60)"
+        );
+        check_to(&eng, &src, d_src, 64);
+    }
+
+    // 3. Adversarial near-miss: perturbing one bit of an unmix multiplier MUST NOT collapse to `x`.
+    {
+        let mut cx = Context::new();
+        let o = ParseOptions::width(Width::W64);
+        let bad = cx
+            .parse(
+                "let m1 = (x ^ (x >>u 30)) * 0xbf58476d1ce4e5b9; \
+                 let m2 = (m1 ^ (m1 >>u 27)) * 0x94d049bb133111eb; \
+                 let h = m2 ^ (m2 >>u 31); \
+                 let u1 = (h ^ (h >>u 31) ^ (h >>u 62)) * 0x319642b2d24d8ec1; \
+                 let u2 = (u1 ^ (u1 >>u 27) ^ (u1 >>u 54)) * 0x96de1b173f119089; \
+                 u2 ^ (u2 >>u 30) ^ (u2 >>u 60)",
+                &o,
+            )
+            .unwrap();
+        let simp = eng.simplify(&mut cx, bad).unwrap().expr;
+        let x = cx.parse("x", &o).unwrap();
+        assert_ne!(simp, x);
+        assert!(equivalent(&mut cx, bad, simp, &mut rng));
+    }
+
+    // 4. Nonlinear T-function (`y = x + (((x * x) | 5) << shift)`) + 3-step Hensel inverse:
+    //    8-bit proved exhaustively in all feature sets; 32-bit and 64-bit proved by circuit miter.
+    check_to(
+        &eng,
+        "let y = x + (((x * x) | 5) << 2); \
+         let u1 = y - (((y * y) | 5) << 2); \
+         let u2 = y - (((u1 * u1) | 5) << 2); \
+         y - (((u2 * u2) | 5) << 2)",
+        "x",
+        8,
+    );
+    #[cfg(feature = "prove")]
+    for &(bits, sh) in &[(32u16, 8u16), (64, 16)] {
+        let src = format!(
+            "let y = x + (((x * x) | 5) << {sh}); \
+             let u1 = y - (((y * y) | 5) << {sh}); \
+             let u2 = y - (((u1 * u1) | 5) << {sh}); \
+             y - (((u2 * u2) | 5) << {sh})"
+        );
+        check_to(&eng, &src, "x", bits);
+    }
+}
+
+#[test]
+fn assumptions_propagate_congruence_bijections_and_offsets_with_reliance() {
+    let eng = Engine::standard();
+    let o = ParseOptions::width(Width::W64);
+
+    // 1. Relational equality folds both linear (`x - a`, `x ^ a`) and nonlinear (`f(x) - f(a)`)
+    //    expressions regardless of symbol creation / alphabetical order, without polluting memo.
+    let mut cx = Context::new();
+    let x = cx.symbol("x", Width::W64).unwrap();
+    let a = cx.symbol("a", Width::W64).unwrap();
+    let eq_xa = cx.cmp(CmpOpExt::Eq, x, a).unwrap();
+    let mut assump = Assumptions::new();
+    let cid = assump.assume_true(&mut cx, eq_xa).unwrap();
+
+    let lin_expr = cx.parse("(x - a) * (z * z + 7)", &o).unwrap();
+    let xor_expr = cx.parse("x ^ a", &o).unwrap();
+    let nonlin_expr = cx
+        .parse("((x * x + 3) ^ 0xdead) - ((a * a + 3) ^ 0xdead)", &o)
+        .unwrap();
+
+    for expr in [lin_expr, xor_expr, nonlin_expr] {
+        let out = eng
+            .run(&mut cx, &[expr], Run::default().with_assumptions(&assump))
+            .unwrap()
+            .roots[0];
+        assert_eq!(
+            out.expr,
+            cx.zero(Width::W64).unwrap(),
+            "{}",
+            cx.display(out.expr)
+        );
+        assert!(out.relies_on.may_use(cid));
+        // Without assumptions, must NOT fold to 0 (global context memo stayed clean).
+        let unassumed = eng.simplify(&mut cx, expr).unwrap();
+        assert_ne!(unassumed.expr, cx.zero(Width::W64).unwrap());
+        assert!(unassumed.relies_on.is_none());
+    }
+
+    let x_sub_a = cx.bin(BinOp::Sub, x, a).unwrap();
+    let prf = cx
+        .prove_under(crate::Query::IsZero(x_sub_a), &assump)
+        .unwrap();
+    assert_eq!(prf.truth, crate::Truth::True);
+    assert!(prf.relies_on.may_use(cid));
+
+    // 2. Obfuscated bijective branch guard `((p ^ k) + 1) * 3 == (q ^ k) * 3 + 3` merges `p` and `q`
+    //    and transfers bounds (`p <u 10` => `q <u 10`).
+    let guard_bij = cx
+        .parse("((p ^ 0x5bd1e995) + 1) * 3 == (q ^ 0x5bd1e995) * 3 + 3", &o)
+        .unwrap();
+    let p_lt_10 = cx.parse("p <u 10", &o).unwrap();
+    let q_lt_10 = cx.parse("q <u 10", &o).unwrap();
+    let pq_diff = cx.parse("p - q", &o).unwrap();
+    let mut assump2 = Assumptions::new();
+    let c_bij = assump2.assume_true(&mut cx, guard_bij).unwrap();
+    let c_bnd = assump2.assume_true(&mut cx, p_lt_10).unwrap();
+    let diff_out = eng
+        .run(
+            &mut cx,
+            &[pq_diff],
+            Run::default().with_assumptions(&assump2),
+        )
+        .unwrap()
+        .roots[0];
+    assert_eq!(diff_out.expr, cx.zero(Width::W64).unwrap());
+    assert!(diff_out.relies_on.may_use(c_bij));
+    let q_prf = cx
+        .prove_under(crate::Query::IsNonZero(q_lt_10), &assump2)
+        .unwrap();
+    assert_eq!(q_prf.truth, crate::Truth::True);
+    assert!(q_prf.relies_on.may_use(c_bij) && q_prf.relies_on.may_use(c_bnd));
+
+    // 3. Constant-offset path relation `idx == base + 16` folds `(ptr + idx * 4) - (ptr + base * 4)`
+    //    to `64`, while standalone `idx + 1` does not bloat and conflicting offsets become infeasible.
+    let off_guard = cx.parse("idx == base + 16", &o).unwrap();
+    let stride_diff = cx.parse("(ptr + idx * 4) - (ptr + base * 4)", &o).unwrap();
+    let idx_plus_1 = cx.parse("idx + 1", &o).unwrap();
+    let mut assump3 = Assumptions::new();
+    let c_off = assump3.assume_true(&mut cx, off_guard).unwrap();
+    let sd_out = eng
+        .run(
+            &mut cx,
+            &[stride_diff, idx_plus_1],
+            Run::default().with_assumptions(&assump3),
+        )
+        .unwrap();
+    assert_eq!(
+        sd_out.roots[0].expr,
+        cx.constant_u64(Width::W64, 64).unwrap()
+    );
+    assert!(sd_out.roots[0].relies_on.may_use(c_off));
+    assert_eq!(cx.display(sd_out.roots[1].expr).to_string(), "idx + 1");
+
+    let conflict = cx.parse("idx == base + 20", &o).unwrap();
+    assump3.assume_true(&mut cx, conflict).unwrap();
+    assert!(assump3.is_infeasible());
+}
+
+#[test]
+fn lifted_cpu_signed_flag_idioms_recover_canonical_comparisons() {
+    let eng = Engine::standard();
+    let mut rng = Rng(0xf1a6_55aa);
+
+    for &bits in &[8u16, 16, 32, 64, 128, 256] {
+        let msb = bits - 1;
+        // 1. Word-level MSB `extract` of `SF ^ OF` (`jl` / `b.lt`).
+        check_to(
+            &eng,
+            &format!("extract<{msb}, 1>((a - b) ^ ((a ^ b) & (a ^ (a - b))))"),
+            "a <s b",
+            bits,
+        );
+        // 2. `<s 0` and `0 <=s` spellings (`jl` and `jge`).
+        check_to(
+            &eng,
+            "((a - b) ^ ((a ^ b) & (a ^ (a - b)))) <s 0",
+            "a <s b",
+            bits,
+        );
+        check_to(
+            &eng,
+            "0 <=s ((a - b) ^ ((a ^ b) & (a ^ (a - b))))",
+            "b <=s a",
+            bits,
+        );
+        // 3. Split 1-bit `SF != OF` boolean formula.
+        check_to(
+            &eng,
+            "((a - b) <s 0) != (((a <s 0) != (b <s 0)) & (((a - b) <s 0) != (a <s 0)))",
+            "a <s b",
+            bits,
+        );
+        // 4. `JLE` (`ZF | (SF != OF)`) and `JG` (`~ZF & ~(SF != OF)`) combine in `Compares`.
+        check_to(
+            &eng,
+            &format!("(a == b) | extract<{msb}, 1>((a - b) ^ ((a ^ b) & (a ^ (a - b))))"),
+            "a <=s b",
+            bits,
+        );
+        check_to(
+            &eng,
+            &format!("(a != b) & ~extract<{msb}, 1>((a - b) ^ ((a ^ b) & (a ^ (a - b))))"),
+            "b <s a",
+            bits,
+        );
+        // 5. Constant subtrahend (`cmp a, 42; jl`), even when `a - 42` normalizes to `a + (-42)`.
+        check_to(
+            &eng,
+            "((a - 42) ^ ((a ^ 42) & (a ^ (a - 42)))) <s 0",
+            "a <s 42",
+            bits,
+        );
+        // 6. Opaque predicate built from lifted signed flags + explicit `<=s` folds to `0:1`.
+        check_to(
+            &eng,
+            &format!("extract<{msb}, 1>((a - b) ^ ((a ^ b) & (a ^ (a - b)))) & (b <=s a)"),
+            "0:1",
+            bits,
+        );
+    }
+
+    // 7. Adversarial near-miss (`a | b` in place of `a ^ b`) must NOT rewrite to `a <s b`.
+    let mut cx = Context::new();
+    let o = ParseOptions::width(Width::W64);
+    let near_miss = cx
+        .parse("extract<63, 1>((a - b) ^ ((a | b) & (a ^ (a - b))))", &o)
+        .unwrap();
+    let slt = cx.parse("a <s b", &o).unwrap();
+    let simp = eng.simplify(&mut cx, near_miss).unwrap().expr;
+    assert_ne!(simp, slt);
+    assert!(equivalent(&mut cx, near_miss, simp, &mut rng));
+}
